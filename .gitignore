@@ -1,0 +1,41 @@
+# --- Segredos: NUNCA versionar ---
+# Chaves privadas, CSRs e certificados de usuarios RBAC (etapa 4.4)
+*.key
+*.csr
+*.pem
+*.crt
+# Kubeconfigs gerados para os perfis RBAC e dos clusters
+*.kubeconfig
+kubeconfig*
+evidencias/kubeconfigs/
+# Chaves Cosign (a publica cosign.pub pode ir; a privada nunca)
+cosign.key
+# htpasswd do Basic Auth do Ingress
+auth
+*.htpasswd
+# Variaveis de ambiente / credenciais locais
+.env
+.env.*
+
+# --- Terraform / eksctl (se usados para EC2/EKS) ---
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+
+# --- Helm ---
+helm/**/charts/*.tgz
+*.tgz
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+
+# --- Editor / SO ---
+.DS_Store
+*.swp
+*:Zone.Identifier
+.vscode/
+.idea/
