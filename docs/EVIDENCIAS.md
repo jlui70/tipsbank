@@ -908,3 +908,159 @@ O `Image ID` (o que o nó realmente baixou) tem o mesmo digest da imagem assinad
 | Transferência via `port-forward` da `api-transacoes` | ✅ HTTP 201, saldos 9900/600 |
 | SPA via `port-forward` do `web` com login | ✅ 200 / 401 pelo proxy |
 | `imagePullSecrets` (registry privado) | N/A: pacotes públicos |
+
+---
+
+## Etapa 1.5 — ConfigMap, Secret e pod multicontainer
+
+**Data**: 2026-11-03 · **Arquivos**: [`k8s/transacoes/configmap-log.yaml`](../k8s/transacoes/configmap-log.yaml) (novo) e [`k8s/transacoes/api-transacoes.yaml`](../k8s/transacoes/api-transacoes.yaml) (sidecar)
+
+### Como a app passou a gravar em arquivo, sem rebuild da imagem
+
+O manual aceita "um handler de log em arquivo no `main.py`" ou "`tee` via command override". O `tee` não funciona aqui porque a imagem é Distroless e não tem shell. Mudar o `main.py` exigiria uma imagem nova, com novo scan e nova assinatura. Usei uma terceira via, que mantém a imagem `v1.0.0` assinada intacta:
+
+- O ENTRYPOINT da imagem é `python3 -m uvicorn main:app ...`, e o uvicorn aceita `--log-config <arquivo>` (um `dictConfig` do Python em JSON).
+- O Deployment passa `args: [--log-config, /etc/app/log-config.json]`. Em Kubernetes, `args` substitui o `CMD` e é somado ao `ENTRYPOINT`.
+- O arquivo vem do ConfigMap `transacoes-log-config` e define dois handlers: `console` (stdout, como antes) e `file` (`RotatingFileHandler` em `/var/log/app/app.log`, 10 MB, 1 backup).
+- O uvicorn aplica essa configuração **antes** de importar o `main.py`. Quando o `logging.basicConfig()` do app roda, o logger raiz já tem handlers e o `basicConfig` não faz nada. Os logs da app (logger `api-transacoes`) passam a sair no console **e** no arquivo, no mesmo formato JSON do app, agora com o campo `logger`.
+- O access log do uvicorn (inclusive o das probes, a cada 5 s) continua só no stdout, para não poluir o arquivo. O logger `httpx` foi para `WARNING`, porque a mensagem dele tem aspas (`"HTTP/1.1 200 OK"`) que quebrariam o JSON da linha. A informação útil (origem, destino, valor) já está no log da transferência.
+
+Antes de aplicar no cluster, testei localmente com `docker run --read-only -u 65532 ... --log-config /etc/app/log-config.json`: o log `bootstrap versao=v1` foi gravado em JSON no arquivo.
+
+### Sidecar `log-forwarder`
+
+```yaml
+        - name: log-forwarder
+          image: busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+          command: [sh, -c, 'exec tail -n +1 -F /var/log/app/app.log']
+          securityContext: {runAsUser: 65532, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          livenessProbe:
+            exec: {command: [pidof, tail]}
+          resources: {requests: {cpu: 5m, memory: 8Mi}, limits: {cpu: 50m, memory: 32Mi}}
+          volumeMounts:
+            - {name: app-logs, mountPath: /var/log/app, readOnly: true}
+      volumes:
+        - name: app-logs
+          emptyDir: {sizeLimit: 50Mi}
+```
+
+- **`emptyDir` compartilhado**: o container `app` monta `/var/log/app` com escrita e o sidecar monta somente leitura. O volume vive enquanto o pod existir; `sizeLimit` evita que o log encha o disco do nó.
+- **`tail -F`** (maiúsculo) segue o **nome** do arquivo: espera o arquivo aparecer e continua funcionando depois da rotação do `RotatingFileHandler`. `-n +1` lê desde a primeira linha. O `exec` faz o `tail` virar o PID 1 do container, e a `livenessProbe` verifica se ele continua rodando.
+- O sidecar também tem `runAsUser` explícito, `livenessProbe` e `resources.limits`, porque os comandos de compliance #2, #3 e #4 olham **todos** os containers do pod.
+- `busybox:1.37` (Trivy: 0 HIGH/CRITICAL) fixado por digest. Ele vem do Docker Hub e, como as outras imagens de terceiros, será espelhado no `ghcr.io/jlui70` antes do teste de compliance da etapa 4.6.
+
+### Aplicação
+
+```console
+$ kubectl diff -f k8s/transacoes/api-transacoes.yaml        # revisa a mudança antes de aplicar
+$ kubectl apply -f k8s/transacoes/configmap-log.yaml -f k8s/transacoes/api-transacoes.yaml
+configmap/transacoes-log-config created
+deployment.apps/api-transacoes configured
+$ kubectl -n tipsbank-transacoes rollout status deploy/api-transacoes
+deployment "api-transacoes" successfully rolled out
+$ kubectl get pods -n tipsbank-transacoes
+NAME                              READY   STATUS    RESTARTS   AGE
+api-transacoes-7bdfb68566-2sr6v   2/2     Running   0          45s
+api-transacoes-7bdfb68566-frk47   2/2     Running   0          39s
+```
+
+`READY 2/2` agora significa 2 containers prontos no pod.
+
+### Critério 1 — O pod tem 2 containers
+
+```console
+$ kubectl get pod api-transacoes-7bdfb68566-2sr6v -n tipsbank-transacoes -o yaml | grep -E '^  - (args|command):|^    name: (app|log-forwarder)$|^    image: (ghcr|busybox)'
+  - args:
+    image: ghcr.io/jlui70/tipsbank-api-transacoes:v1.0.0@sha256:415945fea3f0cd8e69fb4e736e6f071bde7ad948783a22b09c30aac7c12a2c6e
+    name: app
+  - command:
+    image: busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+    name: log-forwarder
+
+$ kubectl get pod api-transacoes-7bdfb68566-2sr6v -n tipsbank-transacoes -o jsonpath='{range .spec.containers[*]}{.name}{"\t"}{.image}{"\n"}{end}'
+app	ghcr.io/jlui70/tipsbank-api-transacoes:v1.0.0@sha256:415945fea3f0cd8e69fb4e736e6f071bde7ad948783a22b09c30aac7c12a2c6e
+log-forwarder	busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+```
+
+### Critério 2 — `kubectl logs -c log-forwarder` mostra o log estruturado da app
+
+4 transferências via `kubectl port-forward -n tipsbank-transacoes svc/api-transacoes 8080:8080` (todas HTTP 201):
+
+```console
+$ kubectl logs -n tipsbank-transacoes api-transacoes-7bdfb68566-2sr6v -c log-forwarder | jq -c 'select(.logger=="api-transacoes") | {ts,level,msg}'
+{"ts":"2026-11-03 21:30:26,009","level":"INFO","msg":"bootstrap versao=v1"}
+{"ts":"2026-11-03 21:31:06,534","level":"INFO","msg":"transferencia id=0ca5e795-066a-48cf-8298-4f01bd8b4bee origem=11111111-1111-1111-1111-111111111111 destino=22222222-2222-2222-2222-222222222222 valor=10.00"}
+{"ts":"2026-11-03 21:31:06,641","level":"INFO","msg":"transferencia id=8d2cca61-b787-4c47-bcf1-676caf8ce603 origem=11111111-1111-1111-1111-111111111111 destino=22222222-2222-2222-2222-222222222222 valor=10.00"}
+{"ts":"2026-11-03 21:31:06,724","level":"INFO","msg":"transferencia id=8103db69-5599-424b-858f-418a3cb3a5aa origem=11111111-1111-1111-1111-111111111111 destino=22222222-2222-2222-2222-222222222222 valor=10.00"}
+{"ts":"2026-11-03 21:31:06,804","level":"INFO","msg":"transferencia id=88df1d94-d038-414f-bfab-b4e0df051e5a origem=11111111-1111-1111-1111-111111111111 destino=22222222-2222-2222-2222-222222222222 valor=10.00"}
+```
+
+Linha completa, como o sidecar publica:
+
+```console
+$ kubectl logs -n tipsbank-transacoes api-transacoes-7bdfb68566-2sr6v -c log-forwarder | grep '^{' | head -4
+{"ts":"2026-11-03 21:30:26,008","level":"INFO","service":"api-transacoes","logger":"uvicorn.error","msg":"Started server process [1]"}
+{"ts":"2026-11-03 21:30:26,008","level":"INFO","service":"api-transacoes","logger":"uvicorn.error","msg":"Waiting for application startup."}
+{"ts":"2026-11-03 21:30:26,009","level":"INFO","service":"api-transacoes","logger":"api-transacoes","msg":"bootstrap versao=v1"}
+{"ts":"2026-11-03 21:30:26,103","level":"INFO","service":"api-transacoes","logger":"uvicorn.error","msg":"Application startup complete."}
+```
+
+Todas as linhas são JSON válido. Conferido com `jq -e` linha a linha nos 2 pods: 9 e 5 linhas, 0 inválidas. O segundo pod só tem logs de inicialização porque o `port-forward` para um Service se conecta a **um único pod**, sem balanceamento: as 4 transferências foram para o mesmo pod.
+
+### Critério 3 — Nenhuma variável sensível direto no Deployment
+
+Todas as variáveis de todos os workloads do TipsBank:
+
+```console
+$ kubectl get deploy,sts -A -l app.kubernetes.io/part-of=tipsbank -o json | jq -r '.items[] | ... | (.env // [])[] | ...' | column -t
+tipsbank-auditoria/auditoria/app           DATA_DIR           configMapKeyRef:auditoria-config
+tipsbank-auditoria/auditoria/app           LOG_LEVEL          configMapKeyRef:auditoria-config
+tipsbank-contas/api-contas/app             DB_URL             secretKeyRef:contas-db
+tipsbank-contas/api-contas/app             LOG_LEVEL          configMapKeyRef:contas-config
+tipsbank-transacoes/api-transacoes/app     DB_URL             secretKeyRef:transacoes-db
+tipsbank-transacoes/api-transacoes/app     CONTAS_URL         configMapKeyRef:transacoes-config
+tipsbank-transacoes/api-transacoes/app     AUDITORIA_URL      configMapKeyRef:transacoes-config
+tipsbank-transacoes/api-transacoes/app     APP_VERSION        configMapKeyRef:transacoes-config
+tipsbank-transacoes/api-transacoes/app     LOG_LEVEL          configMapKeyRef:transacoes-config
+tipsbank-contas/postgres-primary/postgres  POSTGRES_USER      secretKeyRef:postgres-credentials
+tipsbank-contas/postgres-primary/postgres  POSTGRES_PASSWORD  secretKeyRef:postgres-credentials
+tipsbank-contas/postgres-primary/postgres  POSTGRES_DB        secretKeyRef:postgres-credentials
+tipsbank-contas/postgres-primary/postgres  PGDATA             value=/var/lib/postgresql/data/pgdata
+```
+
+- Credenciais (`DB_URL`, `POSTGRES_*`) vêm de `secretKeyRef`; URLs e parâmetros vêm de `configMapKeyRef`. O único `value` literal é o `PGDATA`, um caminho de diretório sem informação sensível.
+- Os nomes são diferentes em cada namespace e nada é compartilhado entre namespaces:
+
+```console
+$ kubectl get cm,secret -A -l app.kubernetes.io/part-of=tipsbank --no-headers | awk '{print $1, $2}'
+tipsbank-auditoria configmap/auditoria-config
+tipsbank-contas configmap/contas-config
+tipsbank-transacoes configmap/transacoes-config
+tipsbank-transacoes configmap/transacoes-log-config
+tipsbank-contas secret/contas-db
+tipsbank-contas secret/postgres-credentials
+tipsbank-transacoes secret/transacoes-db
+```
+
+Os itens 4 e 5 do passo a passo (credenciais em Secret, URLs em ConfigMap, nomes distintos por namespace) já tinham sido feitos na etapa 1.4. A senha continua fora do Git: os Secrets são gerados por `k8s/gerar-secrets.sh`.
+
+### Prévia dos comandos de compliance #2, #3 e #4 (workloads do TipsBank)
+
+```console
+$ kubectl get pods -A -l app.kubernetes.io/part-of=tipsbank -o json | jq -c '[.items[] | select(.spec.securityContext.runAsUser == 0 or (.spec.containers[].securityContext.runAsUser // 0) == 0) | .metadata.name]'
+[]
+$ kubectl get deploy,sts -A -l app.kubernetes.io/part-of=tipsbank -o json | jq -c '[.items[] | select(.spec.template.spec.containers[].livenessProbe == null) | .metadata.name]'
+[]
+$ kubectl get deploy,sts -A -l app.kubernetes.io/part-of=tipsbank -o json | jq -c '[.items[] | select(.spec.template.spec.containers[].resources.limits == null) | .metadata.name]'
+[]
+```
+
+O sidecar novo já entra limpo nos três.
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| Pod da `api-transacoes` com 2 containers | ✅ `app` + `log-forwarder` (2/2) |
+| `kubectl logs -c log-forwarder` com o log estruturado | ✅ JSON válido, transferências visíveis |
+| Sem variável sensível no Deployment (`secretKeyRef`/`configMapKeyRef`) | ✅ |

@@ -1,0 +1,31 @@
+# Configuração de logging do uvicorn/app da api-transacoes (etapa 1.5).
+# Passada via args: --log-config /etc/app/log-config.json (o ENTRYPOINT da imagem é python3 -m uvicorn).
+# root e uvicorn.error -> stdout + /var/log/app/app.log (JSON); access log -> só stdout.
+# httpx em WARNING: a msg dele traz aspas ("HTTP/1.1 200 OK") e quebraria o JSON da linha.
+apiVersion: v1
+data:
+  log-config.json: |
+    {
+      "version": 1,
+      "disable_existing_loggers": false,
+      "formatters": {
+        "json": {"format": "{\"ts\":\"%(asctime)s\",\"level\":\"%(levelname)s\",\"service\":\"api-transacoes\",\"logger\":\"%(name)s\",\"msg\":\"%(message)s\"}"},
+        "access": {"()": "uvicorn.logging.AccessFormatter", "fmt": "%(levelprefix)s %(client_addr)s - \"%(request_line)s\" %(status_code)s", "use_colors": false}
+      },
+      "handlers": {
+        "console": {"class": "logging.StreamHandler", "formatter": "json", "stream": "ext://sys.stdout"},
+        "file": {"class": "logging.handlers.RotatingFileHandler", "formatter": "json", "filename": "/var/log/app/app.log", "maxBytes": 10485760, "backupCount": 1},
+        "access": {"class": "logging.StreamHandler", "formatter": "access", "stream": "ext://sys.stdout"}
+      },
+      "loggers": {
+        "uvicorn.error": {"level": "INFO", "handlers": ["console", "file"], "propagate": false},
+        "uvicorn.access": {"level": "INFO", "handlers": ["access"], "propagate": false},
+        "httpx": {"level": "WARNING"}
+      },
+      "root": {"level": "INFO", "handlers": ["console", "file"]}
+    }
+kind: ConfigMap
+metadata:
+  labels: {app.kubernetes.io/part-of: tipsbank}
+  name: transacoes-log-config
+  namespace: tipsbank-transacoes

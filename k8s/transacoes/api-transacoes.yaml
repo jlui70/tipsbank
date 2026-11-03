@@ -1,4 +1,5 @@
 # api-transacoes: chama api-contas e auditoria (outros namespaces) e grava no Postgres.
+# Pod multicontainer (1.5): app grava /var/log/app/app.log; sidecar log-forwarder faz tail -F do arquivo.
 apiVersion: v1
 kind: Service
 metadata:
@@ -24,6 +25,8 @@ spec:
   template:
     metadata:
       labels: {app.kubernetes.io/name: api-transacoes, app.kubernetes.io/part-of: tipsbank, role: app}
+      annotations:
+        tipsbank.io/log-config-sha: "7ec289c99786"   # muda com o configmap-log.yaml -> força rollout
     spec:
       securityContext:
         runAsNonRoot: true
@@ -34,6 +37,7 @@ spec:
       containers:
         - name: app              # nome fixo: o HPA ContainerResource (Semana 3) referencia "app"
           image: ghcr.io/jlui70/tipsbank-api-transacoes:v1.0.0@sha256:415945fea3f0cd8e69fb4e736e6f071bde7ad948783a22b09c30aac7c12a2c6e
+          args: [--log-config, /etc/app/log-config.json]   # somado ao ENTRYPOINT (python3 -m uvicorn ...)
           ports:
             - {name: http, containerPort: 8080}
           env:
@@ -65,5 +69,29 @@ spec:
           resources:
             requests: {cpu: 50m, memory: 128Mi}
             limits: {cpu: 500m, memory: 256Mi}
-
-
+          volumeMounts:
+            - {name: app-logs, mountPath: /var/log/app}
+            - {name: log-config, mountPath: /etc/app, readOnly: true}
+        # Sidecar: lê o log que a app grava no volume compartilhado e publica no stdout dele
+        # (kubectl logs -c log-forwarder). Mesmo padrão de um agente de logs (Fluent Bit etc.).
+        - name: log-forwarder
+          image: busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+          command: [sh, -c, 'exec tail -n +1 -F /var/log/app/app.log']
+          securityContext:
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          livenessProbe:
+            exec: {command: [pidof, tail]}
+            periodSeconds: 30
+          resources:
+            requests: {cpu: 5m, memory: 8Mi}
+            limits: {cpu: 50m, memory: 32Mi}
+          volumeMounts:
+            - {name: app-logs, mountPath: /var/log/app, readOnly: true}
+      volumes:
+        - name: app-logs
+          emptyDir: {sizeLimit: 50Mi}   # compartilhado pelos 2 containers; some com o pod
+        - name: log-config
+          configMap: {name: transacoes-log-config}
