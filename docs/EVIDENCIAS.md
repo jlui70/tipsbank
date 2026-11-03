@@ -685,3 +685,226 @@ Address: 10.96.0.1
 | 3 nodes `Ready` | ✅ |
 | Todos os pods do `kube-system` em `Running` | ✅ 13/13 |
 | `kubectl run nginx` agendado em worker, sem remover o taint | ✅ `tipsbank-w1` |
+
+---
+
+## Etapa 1.4 — Namespaces, Deployments iniciais e Services
+
+**Data**: 2026-11-03 · **Cluster**: kubeadm da etapa 1.3 · **Manifests**: [`k8s/`](../k8s/) · **Imagens**: `ghcr.io/jlui70/tipsbank-*:v1.0.0`, fixadas por digest (as mesmas assinadas na 1.2)
+
+### Estrutura dos manifests
+
+```
+k8s/
+├── 00-namespaces.yaml                 # tipsbank-contas, -transacoes, -auditoria, -web
+├── gerar-secrets.sh                   # gera os secret-db.yaml a partir dos templates (senha via openssl rand)
+├── contas/
+│   ├── secret-db.yaml.example         # TEMPLATE: postgres-credentials (USER/PASSWORD/DB) + contas-db (DB_URL)
+│   ├── configmap-app.yaml             # contas-config
+│   ├── configmap-postgres-init.yaml   # init.sql (gerado de sql/init.sql)
+│   ├── postgres.yaml                  # Headless Service + StatefulSet postgres-primary (PVC 2Gi)
+│   └── api-contas.yaml                # Deployment (2 réplicas) + Service ClusterIP
+├── transacoes/
+│   ├── secret-db.yaml.example         # TEMPLATE: transacoes-db (DB_URL)
+│   ├── configmap-app.yaml             # transacoes-config (CONTAS_URL, AUDITORIA_URL em FQDN)
+│   └── api-transacoes.yaml            # Deployment (2) + Service
+├── auditoria/
+│   ├── configmap-app.yaml             # auditoria-config (DATA_DIR)
+│   └── auditoria.yaml                 # Deployment (2) + Service; /data em emptyDir (vira NFS na 1.6)
+└── web/
+    ├── configmap-nginx.yaml           # nginx.conf com upstreams FQDN inter-namespace
+    └── web.yaml                       # Deployment (2) + Service
+```
+
+### StorageClass default (pré-requisito do PVC)
+
+O cluster kubeadm não vem com nenhuma StorageClass, então o PVC do Postgres ficaria `Pending`. Conforme a ARQUITETURA (§6, "local-path no kubeadm"), instalei o **local-path-provisioner v0.0.37** e o marquei como default (script [`infra/kubeadm/install-local-path.sh`](../infra/kubeadm/install-local-path.sh)). Ele não instala CRDs.
+
+```console
+$ kubectl get storageclass
+NAME                   PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE
+local-path (default)   rancher.io/local-path   Delete          WaitForFirstConsumer   false                  11s
+```
+
+`WaitForFirstConsumer`: o volume só é criado quando o pod é agendado, no mesmo nó do pod.
+
+### Decisões
+
+- **Nomes da ARQUITETURA**: `postgres-primary` (Headless Service + StatefulSet) e label `role=app` nas APIs (`role=db` no Postgres). As NetworkPolicies da Semana 2 vão selecionar por esses labels.
+- **Senha fora do Git**: os `secret-db.yaml` reais estão no `.gitignore`. O repositório guarda só os templates `secret-db.yaml.example`, com o placeholder `__POSTGRES_PASSWORD__`, e o script `k8s/gerar-secrets.sh`, que gera uma senha aleatória de 20 caracteres (`openssl rand`) e escreve os 2 arquivos com permissão `600`. Motivos:
+  - o repositório é público, e um Secret só codifica o valor em base64, que não é criptografia (`base64 -d` revela a senha);
+  - o `.gitignore` original do desafio já traz a seção "Segredos: NUNCA versionar", e o manual (4.4) pede para não commitar chaves privadas;
+  - Vault, External Secrets e afins são proibidos no desafio, então a solução tem que ser nativa: template versionado + geração local.
+  Rodar o script de novo reaproveita a senha existente (o Postgres já foi inicializado com ela no PVC); `--force` gera outra.
+- **Secret x ConfigMap**: tudo que contém senha (incluindo a `DB_URL`) fica em Secret; URLs e parâmetros ficam em ConfigMap. Cada namespace tem os seus, com nomes diferentes, porque Secrets e ConfigMaps não são compartilhados entre namespaces. As variáveis entram por `secretKeyRef`/`configMapKeyRef`, uma a uma.
+- **nginx.conf por ConfigMap** (o manual aceita as duas abordagens): a imagem `web:v1.0.0` assinada fica intacta. Os upstreams passaram a ser FQDN, por exemplo `api-contas.tipsbank-contas.svc.cluster.local:8080`. Uma anotação com o hash do ConfigMap no template força o rollout quando a configuração muda, porque o nginx só lê o arquivo no start.
+- **Imagem por digest** (`:v1.0.0@sha256:...`): o pod roda exatamente a imagem escaneada e assinada na 1.2.
+- **Hardening já aplicado**, para não refazer depois: `runAsNonRoot` com `runAsUser` explícito em todos os containers (65532 nas APIs, 101 no web, 70 no Postgres), `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`, `seccompProfile: RuntimeDefault`, `resources` e as 3 probes nas APIs (`/health/startup`, `/health/ready`, `/health/live`). O container principal se chama `app` (o HPA `ContainerResource` da Semana 3 referencia pelo nome).
+- **Postgres não-root**: a imagem `postgres:16-alpine` normalmente inicia como root e troca para o UID 70. Aqui ela já sobe como 70, com `PGDATA` num subdiretório do volume e `emptyDir` em `/var/run/postgresql` e `/tmp` (a raiz é read-only).
+
+### Aplicação
+
+```console
+$ ./k8s/gerar-secrets.sh                            # cria k8s/contas/secret-db.yaml e k8s/transacoes/secret-db.yaml
+gerado: contas/secret-db.yaml
+gerado: transacoes/secret-db.yaml
+$ git check-ignore k8s/contas/secret-db.yaml k8s/transacoes/secret-db.yaml   # confirma: fora do Git
+k8s/contas/secret-db.yaml
+k8s/transacoes/secret-db.yaml
+$ kubectl apply -f k8s/00-namespaces.yaml
+$ kubectl apply --dry-run=server -R -f k8s/          # valida tudo no API server antes de criar
+$ kubectl apply -f k8s/contas/secret-db.yaml -f k8s/contas/configmap-app.yaml \
+    -f k8s/contas/configmap-postgres-init.yaml -f k8s/contas/postgres.yaml
+$ kubectl -n tipsbank-contas rollout status sts/postgres-primary
+partitioned roll out complete: 1 new pods have been updated...
+$ kubectl -n tipsbank-contas logs postgres-primary-0 | grep init.sql
+/usr/local/bin/docker-entrypoint.sh: running /docker-entrypoint-initdb.d/init.sql
+$ kubectl apply -f k8s/contas/api-contas.yaml -f k8s/auditoria/ -f k8s/transacoes/
+$ kubectl apply -f k8s/web/                          # por último: o nginx resolve os upstreams no start
+```
+
+### Critério 1 — Todos os workloads `Running`
+
+```console
+$ kubectl get pods -A | grep tipsbank
+tipsbank-auditoria    auditoria-55758d6846-2gsd6                 1/1     Running   0          80s
+tipsbank-auditoria    auditoria-55758d6846-vlcxr                 1/1     Running   0          80s
+tipsbank-contas       api-contas-f48dbdf6-hvh4v                  1/1     Running   0          80s
+tipsbank-contas       api-contas-f48dbdf6-tgr2t                  1/1     Running   0          80s
+tipsbank-contas       postgres-primary-0                         1/1     Running   0          2m1s
+tipsbank-transacoes   api-transacoes-79844ff98b-tgs22            1/1     Running   0          80s
+tipsbank-transacoes   api-transacoes-79844ff98b-zq2jg            1/1     Running   0          80s
+tipsbank-web          web-7856889856-jhnck                       1/1     Running   0          47s
+tipsbank-web          web-7856889856-swz4r                       1/1     Running   0          47s
+
+$ kubectl get deploy,sts -A -l app.kubernetes.io/part-of=tipsbank
+NAMESPACE             NAME                             READY   UP-TO-DATE   AVAILABLE   AGE
+tipsbank-auditoria    deployment.apps/auditoria        2/2     2            2           80s
+tipsbank-contas       deployment.apps/api-contas       2/2     2            2           80s
+tipsbank-transacoes   deployment.apps/api-transacoes   2/2     2            2           80s
+tipsbank-web          deployment.apps/web              2/2     2            2           47s
+
+NAMESPACE         NAME                                READY   AGE
+tipsbank-contas   statefulset.apps/postgres-primary   1/1     2m1s
+```
+
+O "2/2" do critério aparece no `READY` dos Deployments (réplicas prontas / desejadas); cada pod tem 1 container (`1/1`). Os 2 pods de cada Deployment ficaram em workers diferentes (`tipsbank-w1` e `tipsbank-w2`).
+
+Services, PVC, ConfigMaps e Secrets:
+
+```console
+$ kubectl get svc -A -l app.kubernetes.io/part-of=tipsbank
+NAMESPACE             NAME               TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)    AGE
+tipsbank-auditoria    auditoria          ClusterIP   10.99.16.121    <none>        8080/TCP   80s
+tipsbank-contas       api-contas         ClusterIP   10.100.19.37    <none>        8080/TCP   80s
+tipsbank-contas       postgres-primary   ClusterIP   None            <none>        5432/TCP   2m1s
+tipsbank-transacoes   api-transacoes     ClusterIP   10.100.53.36    <none>        8080/TCP   80s
+tipsbank-web          web                ClusterIP   10.101.118.39   <none>        8080/TCP   47s
+
+$ kubectl get pvc -A
+NAMESPACE         NAME                      STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS
+tipsbank-contas   data-postgres-primary-0   Bound    pvc-6cce5c49-8d70-446a-9ccf-0781e3270a06   2Gi        RWO            local-path
+
+$ kubectl get cm,secret -A -l app.kubernetes.io/part-of=tipsbank
+NAMESPACE             NAME                          DATA   AGE
+tipsbank-auditoria    configmap/auditoria-config    2      80s
+tipsbank-contas       configmap/contas-config       1      2m1s
+tipsbank-transacoes   configmap/transacoes-config   4      80s
+NAMESPACE             NAME                          TYPE     DATA   AGE
+tipsbank-contas       secret/contas-db              Opaque   1      2m1s
+tipsbank-contas       secret/postgres-credentials   Opaque   3      2m1s
+tipsbank-transacoes   secret/transacoes-db          Opaque   1      80s
+```
+
+`postgres-primary` com `CLUSTER-IP None` = Headless Service. O DNS devolve direto o IP do pod do StatefulSet.
+
+DNS inter-namespace, testado de um pod no `tipsbank-web`:
+
+```console
+$ kubectl run dnstest -n tipsbank-web --image=busybox:1.37 --restart=Never --rm -i --quiet -- \
+    nslookup api-contas.tipsbank-contas.svc.cluster.local
+Name:	api-contas.tipsbank-contas.svc.cluster.local
+Address: 10.100.19.37
+```
+
+### Critério 2 — Transferência via `port-forward` da `api-transacoes`
+
+```console
+$ kubectl port-forward -n tipsbank-transacoes svc/api-transacoes 8080:8080 &
+$ kubectl port-forward -n tipsbank-contas svc/api-contas 8081:8080 &      # só para conferir os saldos
+
+$ curl -s localhost:8081/contas | jq -r '.[] | "\(.titular): \(.saldo)"'     # antes (banco novo)
+Jeferson Fernando: 10000.00
+LinuxTips SA: 500.00
+
+$ curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8080/transferencias -H 'content-type: application/json' \
+    -d '{"origem_id":"11111111-1111-1111-1111-111111111111","destino_id":"22222222-2222-2222-2222-222222222222","valor":"100.00"}'
+{"id":"c004de1e-75f8-4502-9c8f-2dfd884d67ec","origem_id":"11111111-1111-1111-1111-111111111111","destino_id":"22222222-2222-2222-2222-222222222222","valor":"100.00","status":"concluida"}
+HTTP 201
+
+$ curl -s localhost:8081/contas | jq -r '.[] | "\(.titular): \(.saldo)"'     # depois
+Jeferson Fernando: 9900.00
+LinuxTips SA: 600.00
+```
+
+A transferência atravessou os 3 namespaces: `api-transacoes` → `api-contas` (débito/crédito) → Postgres → `auditoria`. O evento chegou numa das réplicas da auditoria:
+
+```console
+$ kubectl logs -n tipsbank-auditoria -l app.kubernetes.io/name=auditoria --prefix | grep evento
+[pod/auditoria-55758d6846-vlcxr/app] {"ts":"2026-11-03 21:02:53,461","level":"INFO","service":"auditoria","msg":"evento registrado id=01ec6c93-... tipo=transferencia"}
+[pod/auditoria-55758d6846-vlcxr/app] INFO:     10.244.41.71:44120 - "POST /eventos HTTP/1.1" 201 Created
+```
+
+Com `emptyDir`, cada réplica da auditoria tem o seu próprio `/data`: o evento fica só no pod que recebeu a requisição. Isso é esperado nesta etapa e é exatamente o que a etapa 1.6 (NFS RWX) resolve.
+
+### Critério 3 — SPA via `port-forward` do `web`, com login
+
+```console
+$ kubectl port-forward -n tipsbank-web svc/web 8080:8080 &
+$ curl -s -o /dev/null -w "GET / -> %{http_code}\n" localhost:8080/
+GET / -> 200
+$ curl -s -w ' HTTP %{http_code}\n' -X POST localhost:8080/api/contas/login -H 'content-type: application/json' \
+    -d '{"documento":"12345678901","senha":"giropops"}'
+{"id":"11111111-1111-1111-1111-111111111111","titular":"Jeferson Fernando","documento":"12345678901","saldo":"9900.00"} HTTP 200
+$ curl -s -o /dev/null -w "senha errada -> HTTP %{http_code}\n" -X POST localhost:8080/api/contas/login ... -d '{"documento":"12345678901","senha":"x"}'
+senha errada -> HTTP 401
+$ curl -s localhost:8080/api/transacoes/extrato/22222222-2222-2222-2222-222222222222 | jq length
+1
+$ curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/api/auditoria/eventos
+200
+```
+
+O proxy do nginx alcança as 3 APIs pelos FQDN inter-namespace.
+
+Teste no navegador, com `kubectl port-forward -n tipsbank-web svc/web 8080:8080` ativo:
+
+**1. Login** (`localhost:8080/#/entrar`) com a conta seed (CPF `123.456.789-01`, senha `giropops`):
+
+![Login via port-forward](img/1.4-01-login.png)
+
+**2. Dashboard** (`#/conta`): saldo de R$ 9.900,00, que é o saldo inicial de R$ 10.000,00 menos a transferência de R$ 100,00 do critério 2. A SPA lê do mesmo Postgres do cluster.
+
+![Dashboard com saldo](img/1.4-02-saldo.png)
+
+### Critério 4 — `imagePullSecrets`
+
+Os 4 pacotes no ghcr.io são **públicos** (pull anônimo comprovado na 1.2), então o critério "se o registry for privado" não se aplica e os pods não precisam de `imagePullSecrets`:
+
+```console
+$ kubectl describe pod -n tipsbank-transacoes -l app.kubernetes.io/name=api-transacoes | grep -m2 Image
+    Image:          ghcr.io/jlui70/tipsbank-api-transacoes:v1.0.0@sha256:415945fea3f0cd8e69fb4e736e6f071bde7ad948783a22b09c30aac7c12a2c6e
+    Image ID:       ghcr.io/jlui70/tipsbank-api-transacoes@sha256:415945fea3f0cd8e69fb4e736e6f071bde7ad948783a22b09c30aac7c12a2c6e
+$ kubectl get pod -n tipsbank-transacoes -l app.kubernetes.io/name=api-transacoes -o jsonpath='{.items[0].spec.imagePullSecrets}'
+(vazio)
+```
+
+O `Image ID` (o que o nó realmente baixou) tem o mesmo digest da imagem assinada.
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| Todos os pods `Running`; Deployments 2/2, STS 1/1 | ✅ |
+| Transferência via `port-forward` da `api-transacoes` | ✅ HTTP 201, saldos 9900/600 |
+| SPA via `port-forward` do `web` com login | ✅ 200 / 401 pelo proxy |
+| `imagePullSecrets` (registry privado) | N/A: pacotes públicos |

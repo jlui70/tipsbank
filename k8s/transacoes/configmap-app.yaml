@@ -1,0 +1,12 @@
+# URLs dos serviços chamados pela api-transacoes (FQDN: <svc>.<ns>.svc.cluster.local)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: transacoes-config
+  namespace: tipsbank-transacoes
+  labels: {app.kubernetes.io/part-of: tipsbank}
+data:
+  CONTAS_URL: http://api-contas.tipsbank-contas.svc.cluster.local:8080
+  AUDITORIA_URL: http://auditoria.tipsbank-auditoria.svc.cluster.local:8080
+  APP_VERSION: v1
+  LOG_LEVEL: INFO

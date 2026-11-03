@@ -1,0 +1,69 @@
+# api-transacoes: chama api-contas e auditoria (outros namespaces) e grava no Postgres.
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-transacoes
+  namespace: tipsbank-transacoes
+  labels: {app.kubernetes.io/name: api-transacoes, app.kubernetes.io/part-of: tipsbank}
+spec:
+  type: ClusterIP
+  selector: {app.kubernetes.io/name: api-transacoes}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-transacoes
+  namespace: tipsbank-transacoes
+  labels: {app.kubernetes.io/name: api-transacoes, app.kubernetes.io/part-of: tipsbank, role: app}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app.kubernetes.io/name: api-transacoes}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: api-transacoes, app.kubernetes.io/part-of: tipsbank, role: app}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532         # nonroot do Distroless
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: app              # nome fixo: o HPA ContainerResource (Semana 3) referencia "app"
+          image: ghcr.io/jlui70/tipsbank-api-transacoes:v1.0.0@sha256:415945fea3f0cd8e69fb4e736e6f071bde7ad948783a22b09c30aac7c12a2c6e
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - name: DB_URL
+              valueFrom: {secretKeyRef: {name: transacoes-db, key: DB_URL}}
+            - name: CONTAS_URL
+              valueFrom: {configMapKeyRef: {name: transacoes-config, key: CONTAS_URL}}
+            - name: AUDITORIA_URL
+              valueFrom: {configMapKeyRef: {name: transacoes-config, key: AUDITORIA_URL}}
+            - name: APP_VERSION
+              valueFrom: {configMapKeyRef: {name: transacoes-config, key: APP_VERSION}}
+            - name: LOG_LEVEL
+              valueFrom: {configMapKeyRef: {name: transacoes-config, key: LOG_LEVEL}}
+          securityContext:
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          startupProbe:
+            httpGet: {path: /health/startup, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: {path: /health/ready, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health/live, port: http}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+
+

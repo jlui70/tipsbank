@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auditoria-config
+  namespace: tipsbank-auditoria
+  labels: {app.kubernetes.io/part-of: tipsbank}
+data:
+  DATA_DIR: /data
+  LOG_LEVEL: INFO

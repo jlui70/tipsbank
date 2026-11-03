@@ -16,6 +16,8 @@ auth
 # Variaveis de ambiente / credenciais locais
 .env
 .env.*
+# Secrets do Postgres gerados por k8s/gerar-secrets.sh (versionar so o *.example)
+k8s/**/secret-db.yaml
 
 # --- Terraform / eksctl (se usados para EC2/EKS) ---
 .terraform/
@@ -42,3 +44,6 @@ __pycache__/
 
 # --- Notas pessoais (roteiro do video, nao entregavel) ---
 notas-video.md
+
+# --- Roteiros de aula (teste de docência, não entregável) ---
+roteiros/

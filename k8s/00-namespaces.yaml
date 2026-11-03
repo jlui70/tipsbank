@@ -1,0 +1,25 @@
+# Um namespace por área da empresa (ARQUITETURA §3).
+# tipsbank-web = nome do MANUAL-ALUNO 1.4 (a ARQUITETURA não lista o frontend).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tipsbank-contas
+  labels: {app.kubernetes.io/part-of: tipsbank, tipsbank.io/area: contas}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tipsbank-transacoes
+  labels: {app.kubernetes.io/part-of: tipsbank, tipsbank.io/area: transacoes}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tipsbank-auditoria
+  labels: {app.kubernetes.io/part-of: tipsbank, tipsbank.io/area: auditoria}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tipsbank-web
+  labels: {app.kubernetes.io/part-of: tipsbank, tipsbank.io/area: web}
