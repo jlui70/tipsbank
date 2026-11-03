@@ -533,3 +533,155 @@ O `web` usa `nginx-unprivileged` (Alpine). Ele é **não-root (UID 101) e minima
 | `cosign verify` (compliance #7 e rigoroso) | ✅ | ✅ | ✅ | ✅ |
 | Usuário não-root | ✅ 65532 | ✅ 65532 | ✅ 65532 | ✅ 101 |
 | Tamanho (Python < 150 MB, web < 30 MB) | ✅ 46,0 MB | ✅ 46,2 MB | ✅ 35,6 MB | ✅ 28,7 MB |
+
+---
+
+## Etapa 1.3 — Cluster kubeadm multi-node
+
+**Data**: 2026-11-03 · **Infra**: 3 VMs KVM/libvirt no host local (Ubuntu 24.04.5 cloud image, 2 vCPU / 4 GiB / 30 GiB cada) · **Versões**: Kubernetes v1.36.6, containerd 2.4.2, Calico v3.33.0
+
+Todos os scripts estão em [`infra/kubeadm/`](../infra/kubeadm/) e reproduzem o cluster do zero.
+
+### Topologia
+
+| Nó | Papel | IP (reserva DHCP por MAC) |
+|---|---|---|
+| `tipsbank-cp` | control-plane | 192.168.122.10 |
+| `tipsbank-w1` | worker | 192.168.122.11 |
+| `tipsbank-w2` | worker | 192.168.122.12 |
+
+| Faixa | CIDR | Observação |
+|---|---|---|
+| Nós | 192.168.122.0/24 | rede `default` do libvirt |
+| Pods | 10.244.0.0/16 | **não** usei o padrão do Calico (192.168.0.0/16) porque ele contém a rede dos nós |
+| Services | 10.96.0.0/12 | padrão do kubeadm |
+
+### Passo 1 — VMs (`create-vms.sh` + `user-data.tmpl`)
+
+Para cada nó: reserva o IP fixo na rede do libvirt (`virsh net-update ... ip-dhcp-host`), cria um disco de 30 GiB em copy-on-write sobre a cloud image (`virsh vol-create-as --backing-vol`) e sobe a VM com `virt-install --import --cloud-init user-data=...`. O cloud-init só define hostname, `/etc/hosts` e a chave SSH.
+
+### Passo 2 — Preparação dos 3 nós (`prepare-node.sh`)
+
+Rodado via `ssh ubuntu@<ip> 'sudo bash -s' < prepare-node.sh` em cada nó. O script:
+
+1. desliga a swap (`swapoff -a` + comenta no `/etc/fstab`);
+2. carrega `overlay` e `br_netfilter` e liga `net.ipv4.ip_forward` e `net.bridge.bridge-nf-call-iptables`;
+3. instala o **containerd 2.x** (repo do Docker) e troca `SystemdCgroup = false → true`, porque o kubelet usa o cgroup driver `systemd` e os dois precisam ser iguais;
+4. instala `kubelet`, `kubeadm` e `kubectl` **1.36.6** do `pkgs.k8s.io` e trava a versão com `apt-mark hold`.
+
+Conferência:
+
+```console
+$ for ip in 10 11 12; do ssh ubuntu@192.168.122.$ip 'echo "$(hostname): ufw=... swap=... cgroup=... br_netfilter=... ip_forward=... hold=..."'; done
+tipsbank-cp: ufw=inactive swap=0 cgroup=1 br_netfilter=1 ip_forward=1 hold=kubeadm kubectl kubelet
+tipsbank-w1: ufw=inactive swap=0 cgroup=1 br_netfilter=1 ip_forward=1 hold=kubeadm kubectl kubelet
+tipsbank-w2: ufw=inactive swap=0 cgroup=1 br_netfilter=1 ip_forward=1 hold=kubeadm kubectl kubelet
+```
+
+**Portas (armadilha do manual)**: o `ufw` vem desativado na cloud image e as 3 VMs estão na mesma bridge sem filtro, então todas as portas do Day-1 já estão liberadas entre os nós: 6443 (API), 2379-2380 (etcd), 10250 (kubelet), 10257/10259 (controller-manager/scheduler), 30000-32767 (NodePort) e, do Calico, 179/TCP (BGP) e IP-in-IP (protocolo 4).
+
+### Passo 3 — `kubeadm init` no control-plane
+
+```console
+$ sudo kubeadm init \
+    --kubernetes-version v1.36.6 \
+    --apiserver-advertise-address 192.168.122.10 \
+    --pod-network-cidr 10.244.0.0/16 \
+    --node-name tipsbank-cp
+...
+Your Kubernetes control-plane has initialized successfully!
+```
+
+### Passo 4 — `kubeadm join` dos workers
+
+```console
+$ JOIN=$(ssh ubuntu@192.168.122.10 'kubeadm token create --print-join-command')
+$ ssh ubuntu@192.168.122.11 "sudo $JOIN"     # idem no .12
+...
+This node has joined the cluster
+```
+
+Antes do CNI os 3 nós ficam `NotReady`. É o esperado: o kubelet só marca o nó `Ready` quando existe uma rede de pods configurada.
+
+### Passo 5 — CNI Calico (`install-calico.sh`)
+
+Usei o Calico porque ele implementa **NetworkPolicy** (exigido na etapa 2.5; o Flannel não implementa). Instalei pelo manifest `calico.yaml`, sem o Tigera operator, e defini o `CALICO_IPV4POOL_CIDR` igual ao `--pod-network-cidr`:
+
+```console
+$ ./install-calico.sh
+            - name: CALICO_IPV4POOL_CIDR
+              value: "10.244.0.0/16"
+$ kubectl -n kube-system rollout status ds/calico-node
+daemon set "calico-node" successfully rolled out
+```
+
+### Critério 1 — 3 nodes `Ready`
+
+```console
+$ kubectl get nodes -o wide
+NAME          STATUS   ROLES           AGE     VERSION   INTERNAL-IP      EXTERNAL-IP   OS-IMAGE             KERNEL-VERSION              CONTAINER-RUNTIME
+tipsbank-cp   Ready    control-plane   2m41s   v1.36.6   192.168.122.10   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic (amd64)   containerd://2.4.2
+tipsbank-w1   Ready    <none>          2m30s   v1.36.6   192.168.122.11   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic (amd64)   containerd://2.4.2
+tipsbank-w2   Ready    <none>          2m30s   v1.36.6   192.168.122.12   <none>        Ubuntu 24.04.5 LTS   6.8.0-147-generic (amd64)   containerd://2.4.2
+```
+
+### Critério 2 — Todos os pods do `kube-system` em `Running`
+
+```console
+$ kubectl get pods -A -o wide
+NAMESPACE     NAME                                       READY   STATUS    RESTARTS   AGE     IP               NODE
+kube-system   calico-kube-controllers-6ffffbccff-g524j   1/1     Running   0          2m3s    10.244.63.131    tipsbank-w2
+kube-system   calico-node-4qwxf                          1/1     Running   0          2m3s    192.168.122.12   tipsbank-w2
+kube-system   calico-node-4w7fs                          1/1     Running   0          2m3s    192.168.122.10   tipsbank-cp
+kube-system   calico-node-tgk5d                          1/1     Running   0          2m3s    192.168.122.11   tipsbank-w1
+kube-system   coredns-589f44dc88-mdj96                   1/1     Running   0          2m31s   10.244.63.130    tipsbank-w2
+kube-system   coredns-589f44dc88-vv5cm                   1/1     Running   0          2m31s   10.244.63.129    tipsbank-w2
+kube-system   etcd-tipsbank-cp                           1/1     Running   0          2m40s   192.168.122.10   tipsbank-cp
+kube-system   kube-apiserver-tipsbank-cp                 1/1     Running   0          2m40s   192.168.122.10   tipsbank-cp
+kube-system   kube-controller-manager-tipsbank-cp        1/1     Running   0          2m40s   192.168.122.10   tipsbank-cp
+kube-system   kube-proxy-9mpqz                           1/1     Running   0          2m30s   192.168.122.12   tipsbank-w2
+kube-system   kube-proxy-hfwcl                           1/1     Running   0          2m30s   192.168.122.11   tipsbank-w1
+kube-system   kube-proxy-xk97v                           1/1     Running   0          2m32s   192.168.122.10   tipsbank-cp
+kube-system   kube-scheduler-tipsbank-cp                 1/1     Running   0          2m40s   192.168.122.10   tipsbank-cp
+```
+
+### Critério 3 — `kubectl run nginx` vai para um worker (taint mantido)
+
+```console
+$ kubectl describe node tipsbank-cp | grep Taints
+Taints:             node-role.kubernetes.io/control-plane:NoSchedule
+
+$ kubectl run nginx --image=nginx
+pod/nginx created
+$ kubectl get pod nginx -o wide
+NAME    READY   STATUS    RESTARTS   AGE   IP             NODE          NOMINATED NODE   READINESS GATES
+nginx   1/1     Running   0          13s   10.244.41.65   tipsbank-w1   <none>           <none>
+```
+
+O taint `NoSchedule` do control-plane **não foi removido**, por isso o scheduler mandou o pod para o `tipsbank-w1`.
+
+### Extra — rede de pods entre nós
+
+Um nó `Ready` não garante que o tráfego entre nós funciona. Por isso subi um pod no `tipsbank-w2` que resolve DNS (CoreDNS) e acessa o nginx, que está no `tipsbank-w1`:
+
+```console
+$ kubectl run nettest --image=busybox:1.37 --restart=Never \
+    --overrides='{"spec":{"nodeName":"tipsbank-w2"}}' \
+    -- sh -c 'nslookup kubernetes.default.svc.cluster.local; wget -qO- -T5 http://10.244.41.65 | grep -o "<title>.*</title>"'
+$ kubectl logs nettest
+Server:		10.96.0.10
+Address:	10.96.0.10:53
+
+Name:	kubernetes.default.svc.cluster.local
+Address: 10.96.0.1
+
+<title>Welcome to nginx!</title>
+```
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| 3 nodes `Ready` | ✅ |
+| Todos os pods do `kube-system` em `Running` | ✅ 13/13 |
+| `kubectl run nginx` agendado em worker, sem remover o taint | ✅ `tipsbank-w1` |

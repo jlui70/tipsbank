@@ -1,0 +1,25 @@
+#cloud-config
+# Cloud-init mínimo: hostname, usuário com a sua chave SSH e pacotes base.
+# A preparação do Kubernetes fica em prepare-node.sh (rodado via SSH, de propósito,
+# para cada passo ficar visível).
+hostname: __HOSTNAME__
+fqdn: __HOSTNAME__.tipsbank.local
+manage_etc_hosts: false
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - __SSH_KEY__
+ssh_pwauth: false
+package_update: true
+packages: [qemu-guest-agent, curl, gpg, apt-transport-https, ca-certificates]
+write_files:
+  - path: /etc/hosts
+    content: |
+      127.0.0.1 localhost
+      192.168.122.10 tipsbank-cp
+      192.168.122.11 tipsbank-w1
+      192.168.122.12 tipsbank-w2
+runcmd:
+  - systemctl enable --now qemu-guest-agent
