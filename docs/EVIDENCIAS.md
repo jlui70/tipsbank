@@ -1064,3 +1064,187 @@ O sidecar novo já entra limpo nos três.
 | Pod da `api-transacoes` com 2 containers | ✅ `app` + `log-forwarder` (2/2) |
 | `kubectl logs -c log-forwarder` com o log estruturado | ✅ JSON válido, transferências visíveis |
 | Sem variável sensível no Deployment (`secretKeyRef`/`configMapKeyRef`) | ✅ |
+
+---
+
+## Etapa 1.6 — PV NFS para a auditoria
+
+**Data**: 2026-11-03 · **Servidor NFS**: VM externa `tipsbank-nfs` (192.168.122.13, Ubuntu 24.04, `nfs-kernel-server`) · **Arquivos**: [`infra/nfs/`](../infra/nfs/), [`k8s/auditoria/pv-nfs.yaml`](../k8s/auditoria/pv-nfs.yaml), [`k8s/auditoria/auditoria.yaml`](../k8s/auditoria/auditoria.yaml)
+
+### Decisão: servidor NFS fora do cluster
+
+O manual aceita "StatefulSet `nfs-ganesha`" ou "um nó externo com `nfs-kernel-server`". Escolhi o nó externo porque um servidor NFS em container precisa rodar como root/privileged. Isso violaria o comando de compliance #2 ("nenhum pod rodando como root", em **todos** os namespaces) e exigiria uma exceção no Kyverno na Semana 4.
+
+| Item | Valor |
+|---|---|
+| VM | `tipsbank-nfs`, 1 vCPU / 1 GiB / 20 GiB, criada por `infra/nfs/create-nfs-vm.sh` (mesma imagem base e cloud-init da 1.3) |
+| Export | `/srv/nfs/auditoria 192.168.122.0/24(rw,sync,no_subtree_check,all_squash,anonuid=65532,anongid=65532)` |
+| Dono do diretório | `65532:65532`, modo `0770` |
+| Cliente nos nós | `nfs-common` instalado nos 3 nós (também incluído no `infra/kubeadm/prepare-node.sh`) |
+
+**`all_squash` + `anonuid=65532`**: todo acesso de cliente vira o UID 65532 (o `nonroot` do Distroless). Os arquivos já nascem com o dono certo, e o pod não precisa de um initContainer rodando como root para fazer `chown`, que o compliance também barraria. Teste de montagem direto no nó, sem Kubernetes: um arquivo criado pelo **root** do `tipsbank-w1` aparece com dono `65532`:
+
+```console
+$ ssh ubuntu@192.168.122.11 'sudo mount -t nfs 192.168.122.13:/srv/nfs/auditoria /mnt/t && sudo touch /mnt/t/teste-root && ls -ln /mnt/t'
+-rw-r--r-- 1 65532 65532 0 Nov  3 21:44 teste-root
+```
+
+O kubelet usa o `mount.nfs` do **nó** para montar o volume. Sem o pacote `nfs-common` nos workers, o pod fica preso em `ContainerCreating` com erro de mount.
+
+### PV e PVC
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: auditoria-nfs
+spec:
+  capacity: {storage: 1Gi}
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain     # apagar o PVC não apaga os eventos de auditoria
+  storageClassName: ""                      # estático: não usa a StorageClass default (local-path)
+  mountOptions: [nfsvers=4.2, hard]
+  nfs:
+    server: 192.168.122.13                  # IP: quem monta é o kubelet no nó, que não usa o CoreDNS
+    path: /srv/nfs/auditoria
+  claimRef: {namespace: tipsbank-auditoria, name: auditoria-data}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: auditoria-data
+  namespace: tipsbank-auditoria
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: auditoria-nfs
+  resources: {requests: {storage: 1Gi}}
+```
+
+- `storageClassName: ""` no PV **e** no PVC: sem isso, o PVC pegaria a StorageClass default (local-path), que é RWO e cria outro volume.
+- `claimRef` + `volumeName`: amarra o PV a esse PVC nos dois sentidos.
+- `Retain`: trilha de auditoria não pode sumir junto com um `kubectl delete pvc`.
+- No Deployment da `auditoria`, o `emptyDir` virou `persistentVolumeClaim: {claimName: auditoria-data}` e as réplicas foram de 2 para 3.
+
+```console
+$ kubectl apply -f k8s/auditoria/pv-nfs.yaml -f k8s/auditoria/auditoria.yaml
+$ kubectl -n tipsbank-auditoria rollout status deploy/auditoria
+deployment "auditoria" successfully rolled out
+$ kubectl get pods -n tipsbank-auditoria -o wide
+NAME                         READY   STATUS    RESTARTS   AGE   IP              NODE
+auditoria-5b5d94954b-kqjf8   1/1     Running   0          11s   10.244.41.75    tipsbank-w1
+auditoria-5b5d94954b-txjtk   1/1     Running   0          16s   10.244.63.141   tipsbank-w2
+auditoria-5b5d94954b-vb6bf   1/1     Running   0          6s    10.244.63.142   tipsbank-w2
+
+$ ssh ubuntu@192.168.122.11 'mount | grep nfs4'
+192.168.122.13:/srv/nfs/auditoria on /var/lib/kubelet/pods/15823689-.../volumes/kubernetes.io~nfs/auditoria-nfs type nfs4 (rw,relatime,vers=4.2,rsize=131072,wsize=131072,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=192.168.122.11,local_lock=none,addr=192.168.122.13)
+```
+
+### Critério 1 — PV `Bound` ao PVC correto
+
+```console
+$ kubectl get pv,pvc -A
+NAME                                                        CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                                     STORAGECLASS
+persistentvolume/auditoria-nfs                              1Gi        RWX            Retain           Bound    tipsbank-auditoria/auditoria-data
+persistentvolume/pvc-6cce5c49-8d70-446a-9ccf-0781e3270a06   2Gi        RWO            Delete           Bound    tipsbank-contas/data-postgres-primary-0   local-path
+
+NAMESPACE            NAME                                            STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS
+tipsbank-auditoria   persistentvolumeclaim/auditoria-data            Bound    auditoria-nfs                              1Gi        RWX
+tipsbank-contas      persistentvolumeclaim/data-postgres-primary-0   Bound    pvc-6cce5c49-8d70-446a-9ccf-0781e3270a06   2Gi        RWO            local-path
+```
+
+`auditoria-nfs` (RWX, estático, sem StorageClass) está `Bound` a `tipsbank-auditoria/auditoria-data`. O outro PV é o do Postgres (1.4), dinâmico via local-path.
+
+### Critério 2 — Os pods listam os mesmos arquivos
+
+A imagem da `auditoria` é Distroless e **não tem `ls`**, então o comando literal do manual falha:
+
+```console
+$ kubectl exec -n tipsbank-auditoria deploy/auditoria -- ls /data
+error: ... OCI runtime exec failed: exec failed: unable to start container process: exec: "ls": executable file not found in $PATH
+```
+
+Usei o equivalente com o Python que já existe na imagem:
+
+```console
+$ for p in auditoria-5b5d94954b-kqjf8 auditoria-5b5d94954b-txjtk auditoria-5b5d94954b-vb6bf; do
+    echo "$p $(kubectl exec -n tipsbank-auditoria $p -- python3 -c "import os; print(sorted(os.listdir('/data')))")"; done
+auditoria-5b5d94954b-kqjf8 ['eventos-2026-11-03.jsonl']
+auditoria-5b5d94954b-txjtk ['eventos-2026-11-03.jsonl']
+auditoria-5b5d94954b-vb6bf ['eventos-2026-11-03.jsonl']
+```
+
+As 3 réplicas, em 2 nós diferentes (`tipsbank-w1` e `tipsbank-w2`), veem o mesmo arquivo.
+
+### Critério 3 — Após 100 transferências, a soma das linhas bate
+
+Com o `/data` vazio, disparei 100 transferências de **dentro do cluster** (um pod busybox chamando o Service da `api-transacoes`), para o tráfego ser balanceado entre as réplicas. O `port-forward` se conectaria a um pod só.
+
+```console
+$ kubectl exec -n tipsbank-contas postgres-primary-0 -- psql -U tipsbank -d tipsbank -tAc "select count(*) from transacoes where status='concluida'"
+109
+$ kubectl run carga -n tipsbank-transacoes --image=busybox:1.37@sha256:a7dbc319... --restart=Never --overrides='...' # 100 x wget --post-data ... /transferencias
+$ kubectl logs carga -n tipsbank-transacoes
+enviadas=100 ok=100
+$ kubectl exec -n tipsbank-contas postgres-primary-0 -- psql ... -tAc "select count(*) from transacoes where status='concluida'"
+209                                                    # +100
+
+# eventos recebidos por réplica (logs "evento registrado ... tipo=transferencia")
+auditoria-5b5d94954b-kqjf8 recebeu: 37 eventos (tipsbank-w1)
+auditoria-5b5d94954b-txjtk recebeu: 30 eventos (tipsbank-w2)
+auditoria-5b5d94954b-vb6bf recebeu: 33 eventos (tipsbank-w2)
+
+# soma das linhas em TODOS os arquivos de /data, lida de cada pod
+auditoria-5b5d94954b-kqjf8 arquivos= 1 linhas= 100 json_validas= 100
+auditoria-5b5d94954b-txjtk arquivos= 1 linhas= 100 json_validas= 100
+auditoria-5b5d94954b-vb6bf arquivos= 1 linhas= 100 json_validas= 100
+
+# direto no servidor NFS
+$ ssh ubuntu@192.168.122.13 "sudo sh -c 'wc -l /srv/nfs/auditoria/*.jsonl'"
+100 /srv/nfs/auditoria/eventos-2026-11-03.jsonl
+```
+
+100 transferências disparadas = 100 concluídas no Postgres = 37 + 30 + 33 eventos recebidos pelas 3 réplicas = 100 linhas no arquivo compartilhado, todas JSON válido.
+
+### Armadilha: conflito observado com escrita concorrente
+
+O manual avisa: "como a app faz `open("a")` por escrita, o NFS precisa suportar locking". Para testar, disparei **300 eventos direto na auditoria, com 10 envios em paralelo**: 10 loops de 30 `wget` rodando ao mesmo tempo contra o Service. Esse teste foi feito antes da execução limpa acima. O arquivo resultante foi guardado fora do export, em `/srv/nfs/evidencias/eventos-2026-11-03.stress.jsonl`, para não contaminar a contagem do critério 3.
+
+```console
+POST 201 recebidos pelo cliente: 300
+auditoria-5b5d94954b-kqjf8 registrou: 92
+auditoria-5b5d94954b-txjtk registrou: 119
+auditoria-5b5d94954b-vb6bf registrou: 89          # 92 + 119 + 89 = 300: a app confirmou todos
+
+$ ssh ubuntu@192.168.122.13 "sudo python3 -c '...análise do arquivo...'"
+stress: linhas= 379 validas= 373 corrompidas= 6 bytes_NUL= 1291 | eventos stress= 273 de 300 (perdidos 27 ) | transferencias= 100
+```
+
+**Conflito observado: 27 de 300 eventos (9%) perdidos**, mesmo com a API respondendo HTTP 201 para todos, e **6 linhas corrompidas**, cada uma com cerca de 215 bytes NUL e só o começo de um evento:
+
+```console
+430 bytes, NUL= 216 | inicio: b'{"id": "b480eed9-a719-4c21-94a8-1246bccdbfa4", "recebido_em": "2026-11-03T21:46:35.984949+'
+429 bytes, NUL= 215 | inicio: b'{"id": "cd2bc68b-e56b-46c9-9c9b-d5c51451833e", "recebido_em": "2026-11-03T21:46:36.253649+'
+```
+
+**Causa:**
+1. A app grava com `open("a")` + `write()`, **sem pedir lock** (`fcntl.lockf`/`flock`).
+2. Em disco local, o kernel garante que cada `write` com `O_APPEND` vai para o fim do arquivo de forma atômica. **No NFS não**: cada cliente (cada nó) pergunta o tamanho do arquivo ao servidor e grava naquele deslocamento. Dois pods em nós diferentes, gravando ao mesmo tempo, recebem o mesmo "fim de arquivo" e um sobrescreve o outro. Daí os eventos perdidos e os buracos preenchidos com NUL, do tamanho de um evento (~215 bytes).
+3. O servidor **suporta** locking (NFSv4.2: o lock faz parte do protocolo, `local_lock=none` no mount). Mas lock no NFS é cooperativo: só protege quem pede, e a app não pede. "O NFS suportar locking" é necessário, mas não basta.
+4. Com carga sequencial (as 100 transferências do critério 3) não aparece, porque nunca há duas gravações ao mesmo tempo.
+
+**Impacto:** num banco, perder evento de auditoria depois de confirmar com 201 é uma falha de compliance. Correções possíveis, todas exigindo mudança no `main.py` e portanto nova imagem, novo scan e nova assinatura:
+- `fcntl.lockf(f, fcntl.LOCK_EX)` em volta do `write` (o NFSv4 repassa o lock ao servidor), mantendo um arquivo único;
+- um arquivo por réplica (`eventos-<dia>-<hostname>.jsonl`), sem disputa. O critério do manual já fala em "soma das linhas em **todos os arquivos**";
+- ou um backend com escrita transacional (ex.: tabela no Postgres).
+
+Nesta etapa mantive a app original e registrei a limitação, como o manual pede.
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| PV `Bound` ao PVC correto | ✅ `auditoria-nfs` ↔ `tipsbank-auditoria/auditoria-data` (RWX) |
+| Pods listam os mesmos arquivos | ✅ 3 réplicas em 2 nós (via `python3 os.listdir`: a imagem não tem `ls`) |
+| 100 transferências = soma das linhas | ✅ 100 = 100 (37 + 30 + 33 por réplica) |
+| Armadilha de locking | ⚠️ Conflito observado e documentado: 27/300 perdidos com 10 envios em paralelo |

@@ -51,4 +51,7 @@ apt-get install -y -qq kubelet=$K8S_VERSION kubeadm=$K8S_VERSION kubectl=$K8S_VE
 apt-mark hold kubelet kubeadm kubectl >/dev/null
 systemctl enable kubelet >/dev/null
 
+# 6) cliente NFS: o kubelet usa mount.nfs do NÓ para montar PVs NFS (etapa 1.6)
+apt-get install -y -qq nfs-common >/dev/null
+
 echo "== $(hostname): $(containerd --version | awk '{print $3}') | $(kubeadm version -o short) | swap: $(swapon --show | wc -l) linhas"

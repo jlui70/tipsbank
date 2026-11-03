@@ -1,4 +1,4 @@
-# auditoria: grava eventos em /data. emptyDir TEMPORÁRIO (cada réplica tem o seu) -> vira PVC NFS RWX na etapa 1.6.
+# auditoria: grava eventos em /data, num PVC NFS ReadWriteMany compartilhado pelas 3 réplicas (etapa 1.6).
 apiVersion: v1
 kind: Service
 metadata:
@@ -18,7 +18,7 @@ metadata:
   namespace: tipsbank-auditoria
   labels: {app.kubernetes.io/name: auditoria, app.kubernetes.io/part-of: tipsbank, role: app}
 spec:
-  replicas: 2
+  replicas: 3
   selector:
     matchLabels: {app.kubernetes.io/name: auditoria}
   template:
@@ -63,4 +63,4 @@ spec:
             - {name: data, mountPath: /data}
       volumes:
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim: {claimName: auditoria-data}

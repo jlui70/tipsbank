@@ -1,0 +1,33 @@
+# Volume NFS compartilhado (RWX) da auditoria — etapa 1.6 (Day-6).
+# Servidor FORA do cluster: VM tipsbank-nfs (infra/nfs/), export com all_squash -> UID 65532.
+# PV é recurso do cluster (sem namespace); o PVC fica no namespace da auditoria.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: auditoria-nfs
+  labels: {app.kubernetes.io/part-of: tipsbank, tipsbank.io/volume: auditoria-nfs}
+spec:
+  capacity: {storage: 1Gi}
+  accessModes: [ReadWriteMany]              # várias réplicas, em nós diferentes, gravando ao mesmo tempo
+  persistentVolumeReclaimPolicy: Retain     # apagar o PVC NÃO apaga os eventos de auditoria
+  storageClassName: ""                      # estático: não usa a StorageClass default (local-path)
+  mountOptions: [nfsvers=4.2, hard]         # NFSv4: lock integrado ao protocolo; hard: espera o servidor em vez de dar erro de I/O
+  nfs:
+    server: 192.168.122.13                  # IP, não DNS: quem monta é o kubelet no nó, que não usa o CoreDNS
+    path: /srv/nfs/auditoria
+  claimRef:                                 # reserva o PV para este PVC (nenhum outro consegue "roubar")
+    namespace: tipsbank-auditoria
+    name: auditoria-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: auditoria-data
+  namespace: tipsbank-auditoria
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: auditoria-nfs
+  resources:
+    requests: {storage: 1Gi}
