@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.7
 
 # =============================================================================
-# STAGE 1 — builder (Python 3.11-slim)
+# STAGE 1 — builder (Python 3.13-slim, Debian 13 trixie)
 # =============================================================================
-FROM python:3.11-slim-bookworm AS builder
+FROM python:3.13-slim-trixie AS builder
 
 WORKDIR /app
 
@@ -15,9 +15,9 @@ COPY main.py .
 
 # =============================================================================
 # STAGE 2 — runtime (Distroless Python, sem shell, sem package manager)
-# gcr.io/distroless/python3-debian12 → Python 3.11 + glibc, user nonroot (uid 65532)
+# gcr.io/distroless/python3-debian13 → Python 3.13 + glibc, user nonroot (uid 65532)
 # =============================================================================
-FROM gcr.io/distroless/python3-debian12:nonroot
+FROM gcr.io/distroless/python3-debian13:nonroot
 
 WORKDIR /app
 

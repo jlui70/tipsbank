@@ -221,3 +221,315 @@ web user=101
 | Transferência de R$ 100 altera os 2 saldos | ✅ |
 | 1 linha no `.jsonl` por transferência | ✅ (5/5 via curl, 6/6 após o teste na SPA) |
 | SPA ponta a ponta | ✅ |
+
+---
+
+## Etapa 1.2 — Build Distroless, scan com Trivy, assinatura Cosign
+
+**Data**: 2026-11-03 · **Ferramentas**: Docker 29.1.3 + buildx 0.30.1, Trivy 0.69.3, Docker Scout 1.20.3, Cosign 3.1.4 · **Registry**: `ghcr.io/jlui70` (exigido pelo comando de compliance #1, que só aceita `ghcr.io/<user>`)
+
+### Por que Distroless (multi-stage) reduz vulnerabilidades
+
+Os Dockerfiles das APIs têm **dois estágios**:
+
+1. **builder** (`python:3.x-slim`): tem `pip`, compiladores e shell. Instala as dependências com `pip install --target=/packages`. Esse estágio **não vai para a imagem final**.
+2. **runtime** (`gcr.io/distroless/python3-*:nonroot`): recebe só o `/packages` e o `main.py`. Tem o interpretador Python e a glibc, e roda como o usuário `nonroot` (UID 65532).
+
+Isso reduz vulnerabilidades por três motivos:
+- **Menos pacotes, menos CVEs**: a imagem não tem `apt`, `bash`, `coreutils`, `curl` nem compiladores, e cada pacote a menos é um pacote a menos para ter CVE. O Trivy encontra só ~25 pacotes Python e as libs mínimas do Debian.
+- **Menos superfície de ataque**: sem shell, quem conseguir executar código pela aplicação não tem `sh`, nem gerenciador de pacotes para instalar ferramentas, nem `curl` para baixar payloads (prova abaixo).
+- **Não-root por padrão**: mesmo que alguém escape da aplicação, o processo não tem privilégio de root dentro do container.
+
+O `--target=/packages` é usado em vez de um venv porque o venv guarda o caminho absoluto do `python3` do builder. No Distroless o binário fica em outro caminho e o venv quebraria. Com `PYTHONPATH=/packages` e `PATH=/packages/bin:$PATH`, o `python3` do runtime encontra as libs.
+
+### Problema encontrado: as bases originais não passavam no critério
+
+Primeiro escaneei as imagens base que vinham nos Dockerfiles:
+
+```console
+$ trivy image -q --severity HIGH,CRITICAL -f json gcr.io/distroless/python3-debian12:nonroot \
+    | jq -r '[.Results[].Vulnerabilities[]?] | "total=\(length) CRITICAL=\(map(select(.Severity=="CRITICAL"))|length) com-fix=\(map(select(.Status=="fixed"))|length) will_not_fix=\(map(select(.Status=="will_not_fix"))|length)"'
+total=63 CRITICAL=2 com-fix=45 will_not_fix=1
+
+$ trivy image ... nginxinc/nginx-unprivileged:1.27-alpine   # mesmo filtro jq
+total=60 CRITICAL=3 com-fix=60 will_not_fix=0
+```
+
+- **`python3-debian12`**: 45 CVEs já têm correção no Debian, mas a imagem Distroless ainda não foi reconstruída com essas correções. E, como ela não tem `apt`, **eu não consigo aplicar os patches no meu build**. Sobram ainda CVEs `will_not_fix` (zlib, CVE-2023-45853) e `affected` (ex.: sqlite, CVE-2025-7458, CRITICAL), que nenhuma atualização resolve.
+- **`nginx-unprivileged:1.27-alpine`**: a linha 1.27 não recebe mais atualizações. As 60 CVEs já têm correção em versões mais novas.
+
+### Alterações feitas
+
+**APIs** (`apps/{api-contas,api-transacoes,auditoria}/Dockerfile`): troca para **Debian 13 (trixie)**. O builder e o runtime precisam ter **a mesma versão do Python**, porque o `/packages` contém wheels compilados para o Python do builder (ex.: `pydantic-core`, `psycopg-binary`).
+
+```diff
+-FROM python:3.11-slim-bookworm AS builder
++FROM python:3.13-slim-trixie AS builder
+ ...
+-FROM gcr.io/distroless/python3-debian12:nonroot
++FROM gcr.io/distroless/python3-debian13:nonroot
+```
+
+**web** (`apps/web/Dockerfile`): base atual com tag fixa (o compliance proíbe `:latest`), mais `apk upgrade` para aplicar as correções do Alpine publicadas depois da imagem base. Para isso o build vira root **apenas nesse passo** e volta para o UID 101:
+
+```diff
+-FROM nginxinc/nginx-unprivileged:1.27-alpine
++FROM nginxinc/nginx-unprivileged:1.31.7-alpine3.24
++USER root
++RUN apk upgrade --no-cache
++USER 101
+```
+
+**Dependências Python** (`requirements.txt` das 3 APIs): depois de trocar a base, o `trivy image` ainda apontava **3 HIGH no `starlette 0.38.6`** (CVE-2024-47874, CVE-2026-48818, CVE-2026-54283). O starlette é dependência **transitiva**: não aparece no `requirements.txt`, vem junto com o `fastapi==0.115.0`, que trava `starlette<0.39`. Por isso o `trivy fs apps/`, que só lê o que está declarado, dava 0. Só o `trivy image`, que lê o que foi realmente instalado em `/packages`, encontrou.
+
+```diff
+-fastapi==0.115.0
++fastapi==0.162.0
++starlette==1.10.0
+```
+
+Antes de mudar, confirmei com `pip install --dry-run` que o `fastapi` 0.162.0 resolve junto com os pins atuais (`pydantic==2.9.2`, `uvicorn==0.30.6`). Fixei o `starlette` explicitamente para a versão não mudar sozinha entre builds. Depois rodei de novo, no `docker compose`, todos os testes da etapa 1.1 (health, `/metrics`, login 200/401, validação 422, transferência, auditoria, extrato e proxy do `web`): tudo OK.
+
+### Build
+
+```console
+$ R=ghcr.io/jlui70; TAG=v1.0.0
+$ for a in api-contas api-transacoes auditoria web; do docker build -t $R/tipsbank-$a:$TAG apps/$a; done
+
+$ docker images --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}' | grep -E 'REPOSITORY|ghcr.io/jlui70'
+REPOSITORY:TAG                                  IMAGE ID       SIZE
+ghcr.io/jlui70/tipsbank-api-contas:v1.0.0       d6f0139e1ef3   131MB
+ghcr.io/jlui70/tipsbank-api-transacoes:v1.0.0   e7125437d9aa   132MB
+ghcr.io/jlui70/tipsbank-auditoria:v1.0.0        58ade0b93e48   100MB
+ghcr.io/jlui70/tipsbank-web:v1.0.0              e9ac58eededb   65.7MB
+```
+
+O `-t` dá o nome completo, com o registry. É por esse nome que o `docker push` sabe para onde enviar.
+
+### Critério 1 — Trivy: 0 HIGH/CRITICAL nas 4 imagens
+
+```console
+$ for a in api-contas api-transacoes auditoria web; do
+    n=$(trivy image -q --severity HIGH,CRITICAL --ignore-unfixed -f json $R/tipsbank-$a:v1.0.0 | jq "[.Results[].Vulnerabilities[]?] | length")
+    t=$(trivy image -q --severity HIGH,CRITICAL -f json $R/tipsbank-$a:v1.0.0 | jq "[.Results[].Vulnerabilities[]?] | length")
+    echo "$a  com-fix=$n  total=$t"; done
+api-contas  com-fix=0  total=29
+api-transacoes  com-fix=0  total=29
+auditoria  com-fix=0  total=29
+web  com-fix=0  total=0
+```
+
+O `jq` soma as vulnerabilidades de **todos** os alvos que o Trivy escaneia: o sistema operacional e cada pacote Python. A tabela padrão do Trivy mostra a mesma coisa, só que com uma linha por alvo (são 21 a 28 por imagem):
+
+```console
+$ trivy image --severity HIGH,CRITICAL --ignore-unfixed ghcr.io/jlui70/tipsbank-api-contas:v1.0.0
+│ ghcr.io/jlui70/tipsbank-api-contas:v1.0.0 (debian 13.7) │   debian   │        0        │    -    │
+│ packages/SQLAlchemy-2.0.35.dist-info/METADATA           │ python-pkg │        0        │    -    │
+│ packages/bcrypt-4.2.0.dist-info/METADATA                │ python-pkg │        0        │    -    │
+│ packages/fastapi-0.162.0.dist-info/METADATA             │ python-pkg │        0        │    -    │
+│ packages/starlette-1.10.0.dist-info/METADATA            │ python-pkg │        0        │    -    │
+│ ...                                                     │ python-pkg │        0        │    -    │
+```
+
+**Justificativa do `--ignore-unfixed`**: as 29 HIGH que aparecem sem o filtro nas APIs são **todas `affected`**, ou seja, o Debian conhece a falha mas ainda **não publicou correção**. Não há versão para onde atualizar:
+
+```console
+$ trivy image -q --severity HIGH,CRITICAL -f json $R/tipsbank-api-contas:v1.0.0 | jq -r '.Results[].Vulnerabilities[]? | "\(.Severity) \(.Status)"' | sort | uniq -c
+     29 HIGH affected
+
+$ ... | jq -r '[.Results[].Vulnerabilities[]?.VulnerabilityID] | unique | length'
+13
+
+$ ... | jq -r '.Results[].Vulnerabilities[]? | .PkgName' | sort | uniq -c
+      2 libexpat1
+      1 libncursesw6
+      5 libpython3.13-minimal
+      5 libpython3.13-stdlib
+      1 libsqlite3-0
+      1 libtinfo6
+      4 libuuid1
+      5 python3.13-minimal
+      5 python3.13-venv
+```
+
+São **13 CVEs únicas**, contadas mais de uma vez porque estão em subpacotes do mesmo código-fonte (as mesmas 5 do CPython aparecem em 4 pacotes). Nenhuma é CRITICAL. Quando o Debian publicar as correções, basta reconstruir as imagens. Em comparação com a base original, saímos de 63 (2 CRITICAL, 45 com correção pendente) para 0 com correção disponível.
+
+### Docker Scout (segunda opinião, outro banco de CVEs)
+
+```console
+$ for a in api-contas api-transacoes auditoria web; do docker scout quickview local://$R/tipsbank-$a:v1.0.0; done
+ Target     │  local://ghcr.io/jlui70/tipsbank-api-contas:v1.0.0      │    0C     0H     0M     0L
+ Target     │  local://ghcr.io/jlui70/tipsbank-api-transacoes:v1.0.0  │    0C     0H     0M     0L
+ Target     │  local://ghcr.io/jlui70/tipsbank-auditoria:v1.0.0       │    0C     0H     0M     0L
+ Target     │  local://ghcr.io/jlui70/tipsbank-web:v1.0.0             │    0C     1H     5M     5L     1?
+   Base image │  nginxinc/nginx-unprivileged:1-alpine                 │    8C    23H     5M     5L     1?
+
+$ docker scout cves --only-severity critical,high local://$R/tipsbank-web:v1.0.0
+   0C     1H     0M     0L  libxml2 2.13.9-r2
+    ✗ HIGH CVE-2026-86140
+      Affected range : <=2.13.9-r2
+      Fixed version  : not fixed
+```
+
+- **APIs**: o Scout confirma o Trivy, com 0 em todas as severidades.
+- **web**: o Scout encontra 1 HIGH no `libxml2` (CVE-2026-86140) que o Trivy não lista, nem sem o filtro, porque os bancos de CVEs são diferentes. Ela também está **sem correção publicada** (`not fixed`). Por isso vale usar dois scanners: um cobre o que falta no outro.
+- A linha `Base image` é uma **inferência** do Scout (a imagem foi construída sem *provenance attestation*, então ele "adivinha" a base). Pelo mesmo motivo ele identifica a base das APIs como `distroless/cc-debian13`, quando ela é `python3-debian13`. Essa linha não deve ser lida como medição da base real.
+
+### Critério 2 — Usuário não-root (65532 nas APIs, 101 no web)
+
+```console
+$ for a in api-contas api-transacoes auditoria web; do echo "$a User=$(docker inspect $R/tipsbank-$a:v1.0.0 --format '{{.Config.User}}')"; done
+api-contas User=65532
+api-transacoes User=65532
+auditoria User=65532
+web User=101
+
+$ docker run --rm --entrypoint id $R/tipsbank-web:v1.0.0
+uid=101(nginx) gid=101(nginx) groups=101(nginx),101(nginx)
+```
+
+Prova de que a imagem Distroless **não tem shell**:
+
+```console
+$ docker run --rm --entrypoint sh $R/tipsbank-api-contas:v1.0.0 -c id
+docker: Error response from daemon: ... exec: "sh": executable file not found in $PATH
+```
+
+### Critério 3 — Tamanho (Python < 150 MB, web < 30 MB)
+
+Existem duas medidas de tamanho: o `docker images` mostra a imagem **descompactada** no disco local, e o registry guarda as camadas **comprimidas**, que é o que o nó do cluster baixa. Medi o tamanho comprimido no ghcr.io somando as camadas do manifest:
+
+```console
+$ for a in api-contas api-transacoes auditoria web; do
+    printf "%-24s %s MB\n" $a $(docker buildx imagetools inspect --raw $R/tipsbank-$a:v1.0.0 | jq '[.layers[].size] | add / 1e6 * 10 | round / 10'); done
+api-contas               46 MB
+api-transacoes           46.2 MB
+auditoria                35.6 MB
+web                      28.7 MB
+```
+
+| Imagem | Descompactada | Comprimida (registry) | Limite | |
+|---|---|---|---|---|
+| api-contas | 131 MB | 46,0 MB | 150 MB | ✅ |
+| api-transacoes | 132 MB | 46,2 MB | 150 MB | ✅ |
+| auditoria | 100 MB | 35,6 MB | 150 MB | ✅ |
+| web | 65,7 MB | **28,7 MB** | 30 MB | ✅ |
+
+As APIs ficam abaixo do limite nas duas medidas. Para o `web`, o critério se refere ao tamanho comprimido: até a base original `1.27-alpine` já passava de 30 MB descompactada. No `web`, a maior camada é o próprio nginx (~17 MB). O `apk upgrade` acrescenta ~1,9 MB e o HTML ~1 MB.
+
+### Push para o ghcr.io
+
+```console
+$ for a in api-contas api-transacoes auditoria web; do docker push $R/tipsbank-$a:v1.0.0; done
+...
+b64fe4bb89ff: Mounted from jlui70/tipsbank-auditoria
+v1.0.0: digest: sha256:c919b4d3096a906937522d512143c0020100c1ac31ac88e79849aac777f42e41 size: 10985
+```
+
+`Mounted from` significa que o registry **reaproveitou** camadas que já tinha recebido de outra imagem. As camadas são endereçadas pelo sha256 do conteúdo, então a base comum das 3 APIs só é enviada uma vez.
+
+| Imagem | Digest |
+|---|---|
+| tipsbank-api-contas | `sha256:c919b4d3096a906937522d512143c0020100c1ac31ac88e79849aac777f42e41` |
+| tipsbank-api-transacoes | `sha256:415945fea3f0cd8e69fb4e736e6f071bde7ad948783a22b09c30aac7c12a2c6e` |
+| tipsbank-auditoria | `sha256:64768d4d27788fe6e390ffb27e1cca5ae068a79a1779e98eb6702ba1ab2af3b2` |
+| tipsbank-web | `sha256:852f48826838c0de6a5dd73880ef13c151464f6f26bdc2ae90f5d9423b966ded` |
+
+Os 4 pacotes foram deixados **públicos** no GitHub (Package settings → Change visibility), para o cluster baixar sem `imagePullSecret`. Teste de acesso anônimo, com uma configuração do Docker vazia (sem nenhuma credencial):
+
+```console
+$ ANON=$(mktemp -d); for a in api-contas api-transacoes auditoria web; do
+    DOCKER_CONFIG=$ANON docker buildx imagetools inspect $R/tipsbank-$a:v1.0.0 >/dev/null && echo "$a publico"; done
+api-contas publico
+api-transacoes publico
+auditoria publico
+web publico
+```
+
+### Assinatura com Cosign (keyless / OIDC)
+
+Escolhi a assinatura **keyless** porque o comando de compliance #7 do manual verifica com `--certificate-identity-regexp` e `--certificate-oidc-issuer-regexp`. Essas opções só se aplicam a assinaturas keyless. Com chave local (`cosign.key`), o comando exigiria `--key` e falharia.
+
+```console
+$ for a in api-contas api-transacoes auditoria web; do
+    DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' $R/tipsbank-$a:v1.0.0)
+    cosign sign --yes "$DIGEST"; done
+```
+
+- **Assinar pelo digest** (`imagem@sha256:...`) e não pela tag: uma tag pode passar a apontar para outra imagem, o digest não. A assinatura fica presa exatamente à imagem que foi escaneada.
+- **Como o keyless funciona**:
+  1. O cosign abre o navegador para o login OIDC (usei GitHub).
+  2. O **Fulcio**, a autoridade certificadora do Sigstore, emite um certificado válido por ~10 minutos, com a minha identidade.
+  3. A assinatura é registrada no **Rekor**, o log público de transparência.
+  4. A assinatura é gravada no próprio ghcr.io, ligada à imagem.
+- **Identidade**: usei o e-mail noreply do GitHub (`188764035+jlui70@users.noreply.github.com`) em vez do e-mail pessoal, porque a identidade fica pública e permanente no certificado e no Rekor.
+- O `--yes` aceita o aviso de que a identidade será publicada. A variável `COSIGN_EXPERIMENTAL=1` do `scripts/build-e-assinar.sh` não é mais necessária no cosign 3.x, que já faz keyless por padrão.
+
+A assinatura fica anexada à imagem como um *OCI referrer*:
+
+```console
+$ cosign tree $R/tipsbank-api-contas:v1.0.0
+📦 Supply Chain Security Related artifacts for an image: ghcr.io/jlui70/tipsbank-api-contas:v1.0.0
+└── 🔗 https://sigstore.dev/cosign/sign/v1 artifacts via OCI referrer: ghcr.io/jlui70/tipsbank-api-contas@sha256:f102fa38...
+   └── 🍒 sha256:1d07d1748fcfbd2b6aa64c26d062773e377b991485c1e965740b7bb8756a0029
+```
+
+### Critério 4 — `cosign verify` passa nas 4 imagens
+
+**Formato do comando de compliance #7:**
+
+```console
+$ for a in api-contas api-transacoes auditoria web; do img=$R/tipsbank-$a:v1.0.0
+    cosign verify $img --certificate-identity-regexp '.*' --certificate-oidc-issuer-regexp '.*' >/dev/null && echo "OK: $img"; done
+
+Verification for ghcr.io/jlui70/tipsbank-api-contas:v1.0.0 --
+The following checks were performed on each of these signatures:
+  - The cosign claims were validated
+  - Existence of the claims in the transparency log was verified offline
+  - The code-signing certificate was verified using trusted certificate authority certificates
+OK: ghcr.io/jlui70/tipsbank-api-contas:v1.0.0
+OK: ghcr.io/jlui70/tipsbank-api-transacoes:v1.0.0
+OK: ghcr.io/jlui70/tipsbank-auditoria:v1.0.0
+OK: ghcr.io/jlui70/tipsbank-web:v1.0.0
+```
+
+As três verificações do cosign:
+1. as informações da assinatura conferem com o digest da imagem;
+2. a assinatura está registrada no Rekor;
+3. o certificado foi emitido pelo Fulcio.
+
+**Verificação rigorosa**, com a identidade e o emissor exatos. O `'.*'` do compliance aceita uma assinatura keyless de **qualquer pessoa**. É esta versão que garante que fui **eu** quem assinou:
+
+```console
+$ for a in api-contas api-transacoes auditoria web; do img=$R/tipsbank-$a:v1.0.0
+    cosign verify $img \
+      --certificate-identity=188764035+jlui70@users.noreply.github.com \
+      --certificate-oidc-issuer=https://github.com/login/oauth >/dev/null && echo "OK: $img"; done
+OK: ghcr.io/jlui70/tipsbank-api-contas:v1.0.0
+OK: ghcr.io/jlui70/tipsbank-api-transacoes:v1.0.0
+OK: ghcr.io/jlui70/tipsbank-auditoria:v1.0.0
+OK: ghcr.io/jlui70/tipsbank-web:v1.0.0
+```
+
+**Teste negativo**: com outra identidade, a verificação falha, como deve:
+
+```console
+$ cosign verify $R/tipsbank-api-contas:v1.0.0 \
+    --certificate-identity=luiz7030@gmail.com --certificate-oidc-issuer=https://github.com/login/oauth
+Error: no matching attestations: failed to verify certificate identity: no matching CertificateIdentity found,
+last error: expected SAN value "luiz7030@gmail.com", got "188764035+jlui70@users.noreply.github.com"
+```
+
+### Nota sobre o `web` e o critério "Distroless"
+
+O `web` usa `nginx-unprivileged` (Alpine). Ele é **não-root (UID 101) e minimal**, mas **não é Distroless** no sentido estrito: tem o shell do Alpine (`/bin/sh`) e o `apk`. Conforme o manual, o critério "100% Distroless" vale para as 3 APIs Python, e o `web` é a alternativa nonroot/minimal. Os demais critérios (não rodar como root, não usar `:latest`, 0 HIGH/CRITICAL com correção disponível, imagem assinada) valem integralmente para ele e foram atendidos.
+
+### Resultado
+
+| Critério | api-contas | api-transacoes | auditoria | web |
+|---|---|---|---|---|
+| Trivy 0 HIGH/CRITICAL (com correção disponível) | ✅ | ✅ | ✅ | ✅ |
+| Docker Scout | ✅ 0C 0H | ✅ 0C 0H | ✅ 0C 0H | ✅ 1H sem correção |
+| `cosign verify` (compliance #7 e rigoroso) | ✅ | ✅ | ✅ | ✅ |
+| Usuário não-root | ✅ 65532 | ✅ 65532 | ✅ 65532 | ✅ 101 |
+| Tamanho (Python < 150 MB, web < 30 MB) | ✅ 46,0 MB | ✅ 46,2 MB | ✅ 35,6 MB | ✅ 28,7 MB |

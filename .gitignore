@@ -39,3 +39,6 @@ __pycache__/
 *:Zone.Identifier
 .vscode/
 .idea/
+
+# --- Notas pessoais (roteiro do video, nao entregavel) ---
+notas-video.md
