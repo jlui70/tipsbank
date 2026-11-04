@@ -1,0 +1,76 @@
+# Etapa 2.4 — Ingress canário da api-transacoes.
+# Um Ingress com canary: "true" precisa ter o MESMO host e path de um Ingress "principal"
+# (api-transacoes / api-transacoes-spa em ingress.yaml). O controller não cria uma rota nova:
+# ele divide o tráfego daquela rota entre o Service principal (v1) e o deste Ingress (v2).
+# Ordem de decisão do controller: cabeçalho (X-Canary) -> cookie -> peso.
+#   canary-by-header-value: "true" -> X-Canary: true manda SEMPRE para a v2 (o valor pedido no manual);
+#   qualquer outro valor, ou sem o cabeçalho, cai na regra de peso (10% v2 / 90% v1).
+#   (Sem canary-by-header-value, os valores especiais seriam "always" e "never".)
+# As demais anotações (rewrite-target, tls, affinity...) são herdadas do Ingress principal.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-transacoes-canary
+  namespace: tipsbank-transacoes
+  labels:
+    app.kubernetes.io/name: api-transacoes
+    app.kubernetes.io/part-of: tipsbank
+    version: v2
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "10"
+    nginx.ingress.kubernetes.io/canary-by-header: X-Canary
+    nginx.ingress.kubernetes.io/canary-by-header-value: "true"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [api.tipsbank.local]
+      secretName: api-tipsbank-tls
+  rules:
+    - host: api.tipsbank.local
+      http:
+        paths:
+          - path: /transacoes(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: api-transacoes-v2
+                port:
+                  number: 8080
+---
+# O mesmo canário para as chamadas da SPA (app.tipsbank.local/api/transacoes/*): com o Ingress puro
+# (2.1), a SPA passa pelo controller, e o split fica transparente para o usuário final.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-transacoes-spa-canary
+  namespace: tipsbank-transacoes
+  labels:
+    app.kubernetes.io/name: api-transacoes
+    app.kubernetes.io/part-of: tipsbank
+    version: v2
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "10"
+    nginx.ingress.kubernetes.io/canary-by-header: X-Canary
+    nginx.ingress.kubernetes.io/canary-by-header-value: "true"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [app.tipsbank.local]
+      secretName: app-tipsbank-tls
+  rules:
+    - host: app.tipsbank.local
+      http:
+        paths:
+          - path: /api/transacoes(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: api-transacoes-v2
+                port:
+                  number: 8080

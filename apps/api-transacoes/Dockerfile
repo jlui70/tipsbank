@@ -12,6 +12,10 @@ COPY main.py .
 
 FROM gcr.io/distroless/python3-debian13:nonroot
 
+# Etapa 2.4: versão definida no build (docker build --build-arg APP_VERSION=v2 ...).
+# O ARG fica no estágio final porque cada FROM começa sem os ARGs anteriores.
+ARG APP_VERSION=v1
+
 WORKDIR /app
 
 COPY --from=builder /packages /packages
@@ -21,7 +25,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/packages \
     PATH=/packages/bin:$PATH \
-    APP_VERSION=v1
+    APP_VERSION=${APP_VERSION}
 
 EXPOSE 8080
 

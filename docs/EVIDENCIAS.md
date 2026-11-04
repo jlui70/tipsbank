@@ -1601,3 +1601,155 @@ Sem o cabeçalho (é o caso das chamadas da SPA), o hash é de uma string vazia,
 | Rajada de 100 requests com 429 após o rate limit | ✅ `ab -n 100 -c 50`: 74 × 200 e 26 × 429 |
 | Affinity Cookie em transações | ✅ 10/10 no mesmo pod com o cookie; 5/5 sem |
 | Upstream Hashing documentado | ✅ mesmo `X-Cliente` → mesmo pod; ocorrência do upstream compartilhado registrada |
+
+## Etapa 2.4 — Canary de transações
+
+**Data**: 2026-11-04 · **Imagem v2**: `ghcr.io/jlui70/tipsbank-api-transacoes:v2.0.0@sha256:b67d2d2726893029ea6fcefc520f4e0ae04b047d531b6da209cd94c3506a01a7` · **Arquivos**: [`apps/api-transacoes/`](../apps/api-transacoes/), [`k8s/transacoes/api-transacoes.yaml`](../k8s/transacoes/api-transacoes.yaml), [`k8s/transacoes/api-transacoes-v2.yaml`](../k8s/transacoes/api-transacoes-v2.yaml), [`k8s/transacoes/ingress-canary.yaml`](../k8s/transacoes/ingress-canary.yaml)
+
+### Passos 1 e 2 — v2: build, scan, push e assinatura
+
+O manual oferece duas mudanças, e as duas foram feitas:
+
+- **`APP_VERSION` no build:** `ARG APP_VERSION=v1` no estágio final do Dockerfile, mais `ENV APP_VERSION=${APP_VERSION}`. O build da v2 usa `--build-arg APP_VERSION=v2`. O padrão continua `v1`.
+- **Endpoint novo `GET /pix` (mock)**, que só existe na v2. Ele permite diferenciar as versões pelo comportamento, e não só pelo texto da versão.
+
+```console
+$ docker build --build-arg APP_VERSION=v2 -t ghcr.io/jlui70/tipsbank-api-transacoes:v2.0.0 apps/api-transacoes
+$ docker inspect ghcr.io/jlui70/tipsbank-api-transacoes:v2.0.0 --format '{{.Config.User}}'    # 65532
+$ trivy image -q --severity HIGH,CRITICAL --ignore-unfixed -f json ghcr.io/jlui70/tipsbank-api-transacoes:v2.0.0 \
+    | jq '[.Results[].Vulnerabilities[]?] | length'
+0
+$ docker push ghcr.io/jlui70/tipsbank-api-transacoes:v2.0.0
+$ cosign sign --yes ghcr.io/jlui70/tipsbank-api-transacoes@sha256:b67d2d2726893029ea6fcefc520f4e0ae04b047d531b6da209cd94c3506a01a7
+$ cosign verify ghcr.io/jlui70/tipsbank-api-transacoes:v2.0.0 \
+    --certificate-identity=188764035+jlui70@users.noreply.github.com \
+    --certificate-oidc-issuer=https://github.com/login/oauth
+[{"critical":{"identity":{"docker-reference":"ghcr.io/jlui70/tipsbank-api-transacoes:v2.0.0"},"image":{"docker-manifest-digest":"sha256:b67d2d2726893029ea6fcefc520f4e0ae04b047d531b6da209cd94c3506a01a7"},"type":"https://sigstore.dev/cosign/sign/v1"},"optional":{}}]
+```
+
+A v2 usa a mesma identidade keyless e o mesmo emissor da 1.2. O Deployment referencia a imagem por **tag@digest**.
+
+### Passos 3 e 4 — Deployment e Service da v2 (e o ajuste na v1)
+
+**Problema encontrado:** o Service e o Deployment da v1 selecionavam só `app.kubernetes.io/name: api-transacoes`. Com a v2 usando o mesmo nome, o Service da v1 passaria a incluir o pod da v2. O split deixaria de ser 90/10, e os dois Deployments ficariam com selectors sobrepostos, o que o Kubernetes desaconselha.
+
+**Solução:** label `version` nas duas versões, e `version` no selector de cada Service e Deployment:
+
+| Objeto | Selector |
+|---|---|
+| Service `api-transacoes` / Deployment `api-transacoes` (v1, 2 réplicas) | `app.kubernetes.io/name: api-transacoes, version: v1` |
+| Service `api-transacoes-v2` / Deployment `api-transacoes-v2` (v2, 1 réplica) | `app.kubernetes.io/name: api-transacoes, version: v2` |
+
+O `app.kubernetes.io/name` continua igual nas duas versões, e a NetworkPolicy da 2.5 vale para ambas.
+
+**A v2 não recebe o `APP_VERSION` do ConfigMap.** Na v1, a variável vem do `transacoes-config` (`v1`) e sobrescreveria a da imagem: a v2 responderia `v1`.
+
+**O selector de um Deployment é imutável:**
+
+```console
+$ kubectl apply --dry-run=server -f k8s/transacoes/api-transacoes.yaml
+The Deployment "api-transacoes" is invalid: spec.selector: Invalid value: {"matchLabels":{"app.kubernetes.io/name":"api-transacoes","version":"v1"}}: field is immutable
+```
+
+A v1 foi recriada sem derrubar a API. O Deployment foi apagado com `--cascade=orphan` (os pods antigos continuaram atendendo), o novo foi criado, o Service só mudou depois dos pods novos prontos, e por fim o ReplicaSet órfão foi removido. Um laço de `curl` a cada 0,2 s mediu a continuidade:
+
+```console
+$ kubectl -n tipsbank-transacoes delete deploy api-transacoes --cascade=orphan
+$ kubectl apply -f k8s/transacoes/api-transacoes.yaml -l role=app       # só o Deployment (o Service não tem role=app)
+$ kubectl -n tipsbank-transacoes rollout status deploy/api-transacoes
+$ kubectl apply -f k8s/transacoes/api-transacoes.yaml                   # agora o Service com version: v1
+$ kubectl -n tipsbank-transacoes delete rs -l 'app.kubernetes.io/name=api-transacoes,!version'
+
+# requisições durante a troca
+     99 200
+      1 000
+```
+
+Uma requisição (a 45ª, durante a subida dos pods novos) estourou o `--max-time 2` do `curl`, sem erro no log do controller. Num ambiente real, a alternativa sem nenhuma perda é criar o Deployment novo com outro nome, virar o Service e só depois apagar o antigo.
+
+```console
+$ kubectl -n tipsbank-transacoes get pods -L version
+NAME                                 READY   STATUS    RESTARTS   AGE   VERSION
+api-transacoes-68d8d7fb4c-82hz2      2/2     Running   0          13m   v1
+api-transacoes-68d8d7fb4c-dwf5c      2/2     Running   0          13m   v1
+api-transacoes-v2-757757d964-r9kmd   2/2     Running   0          12s   v2
+
+# endpoints de cada Service: sem mistura
+api-transacoes    -> api-transacoes-68d8d7fb4c-dwf5c api-transacoes-68d8d7fb4c-82hz2
+api-transacoes-v2 -> api-transacoes-v2-757757d964-r9kmd
+```
+
+### Passo 5 — Ingress canário
+
+`k8s/transacoes/ingress-canary.yaml`: dois Ingress com `canary: "true"`, `canary-weight: "10"`, `canary-by-header: X-Canary` e `canary-by-header-value: "true"`. Um está no host `api.tipsbank.local` (`/transacoes...`) e o outro em `app.tipsbank.local` (`/api/transacoes...`, as chamadas da SPA). Cada um tem o mesmo host e path do Ingress principal correspondente, e o controller divide o tráfego daquela rota entre o Service da v1 e o `api-transacoes-v2`. Com o Ingress puro (2.1), a SPA também passa pelo canário, e o split fica transparente para o usuário final.
+
+```console
+$ kubectl get ingress -n tipsbank-transacoes
+NAME                        CLASS   HOSTS                ADDRESS                         PORTS     AGE
+api-transacoes              nginx   api.tipsbank.local   192.168.122.11,192.168.122.12   80, 443   86m
+api-transacoes-canary       nginx   api.tipsbank.local   192.168.122.11,192.168.122.12   80, 443   10s
+api-transacoes-spa          nginx   app.tipsbank.local   192.168.122.11,192.168.122.12   80, 443   86m
+api-transacoes-spa-canary   nginx   app.tipsbank.local   192.168.122.11,192.168.122.12   80, 443   10s
+```
+
+### Critério 1 — Proporção ~9:1 em `/transacoes/health/live`
+
+1000 requisições sem cabeçalho:
+
+```console
+$ seq 1000 | xargs -P 20 -I{} curl -sk https://api.tipsbank.local/transacoes/health/live -w '\n' | jq -r .version | sort | uniq -c
+    897 v1
+    103 v2
+```
+
+**897 / 103 = 89,7% / 10,3%.** Pelo host da SPA (500 requisições em `app.tipsbank.local/api/transacoes/health/live`): 437 v1 / 63 v2. O peso é sorteado a cada requisição, e por isso amostras menores oscilam mais.
+
+### Extra — Canary por cabeçalho `X-Canary: true`
+
+```console
+$ for i in 1 2 3 4 5; do curl -sk -H 'X-Canary: true' https://api.tipsbank.local/transacoes/health/live; echo; done
+{"status":"ok","version":"v2"}      (5 de 5)
+
+$ curl -sk -H 'X-Canary: true' https://api.tipsbank.local/transacoes/pix
+{"status":"mock","pix":"em breve","version":"v2"}
+$ curl -sk -o /dev/null -w '%{http_code}\n' -H 'X-Canary: false' https://api.tipsbank.local/transacoes/pix
+404                                  # cai no peso -> quase sempre v1, que não tem /pix
+
+$ curl -sk -X POST https://api.tipsbank.local/transacoes/transferencias -H 'X-Canary: true' \
+    -H 'content-type: application/json' -d '{"origem_id":"1111...","destino_id":"2222...","valor":"1.00"}' -D - -o /dev/null
+HTTP/2 201
+x-app-version: v2                    # transferência real (Postgres + auditoria) atendida pela v2
+```
+
+Qualquer outro valor de `X-Canary` (ou nenhum) cai na regra de peso.
+
+### Critério 2 — `kubectl rollout undo` nos dois Deployments
+
+Para ter uma revisão anterior, cada Deployment recebeu um `rollout restart` (nova revisão com a anotação `restartedAt`) e depois um `rollout undo`:
+
+```console
+$ kubectl -n tipsbank-transacoes rollout restart deploy/api-transacoes-v2
+$ kubectl -n tipsbank-transacoes rollout undo deploy/api-transacoes-v2
+deployment.apps/api-transacoes-v2 rolled back
+$ kubectl -n tipsbank-transacoes rollout restart deploy/api-transacoes
+$ kubectl -n tipsbank-transacoes rollout undo deploy/api-transacoes
+deployment.apps/api-transacoes rolled back
+
+$ kubectl -n tipsbank-transacoes get rs -L version
+NAME                           DESIRED   CURRENT   READY   AGE     VERSION
+api-transacoes-68d8d7fb4c      2         2         2       15m     v1    <- ReplicaSet original de volta
+api-transacoes-dbddb7864       0         0         0       60s     v1    <- revisão do restart, desfeita
+api-transacoes-v2-757757d964   1         1         1       2m30s   v2    <- original de volta
+api-transacoes-v2-86dbd48d8d   0         0         0       79s     v2    <- desfeita
+```
+
+O `undo` reaproveita o template da revisão anterior: os pods voltam ao **mesmo ReplicaSet** (mesmo hash `68d8d7fb4c` / `757757d964`), e a revisão 1 passa a se chamar 3. Depois do undo, o canário continua 9:1 (273 v1 / 27 v2 em 300 requisições).
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| `/transacoes/health/live` com v1/v2 em ~9:1 | ✅ 897 / 103 em 1000 requisições |
+| `kubectl rollout undo` em qualquer Deployment | ✅ v1 e v2 voltaram ao ReplicaSet original |
+| Canary por `X-Canary: true` (extra) | ✅ 5/5 na v2; `/pix` 200 na v2 e 404 na v1 |
+| v2 assinada e sem HIGH/CRITICAL | ✅ Trivy 0; `cosign verify` com a identidade da 1.2 |

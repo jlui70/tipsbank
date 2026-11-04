@@ -117,6 +117,12 @@ def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
+@app.get("/pix")
+def pix():
+    # Etapa 2.4: endpoint novo da v2 (mock), usado para mostrar o canary. Na imagem v1.0.0 é 404.
+    return {"status": "mock", "pix": "em breve", "version": APP_VERSION}
+
+
 @app.post("/transferencias", response_model=TransacaoOut, status_code=201)
 def transferir(payload: TransferenciaIn):
     tx_id = str(uuid.uuid4())

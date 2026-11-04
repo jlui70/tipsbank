@@ -1,0 +1,97 @@
+# Etapa 2.4 — api-transacoes v2 (canary). Mesma configuração da v1 (api-transacoes.yaml),
+# com 3 diferenças:
+#   1. imagem v2.0.0 (APP_VERSION=v2 no build + endpoint mock GET /pix);
+#   2. label version: v2 (o Service e o Deployment da v1 selecionam version: v1, então não se misturam);
+#   3. sem a variável APP_VERSION do ConfigMap: na v1 ela vale "v1" e sobrescreveria a da imagem.
+# O tráfego chega aqui pelo Ingress canário (ingress-canary.yaml): 10% por peso ou X-Canary: true.
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-transacoes-v2
+  namespace: tipsbank-transacoes
+  labels: {app.kubernetes.io/name: api-transacoes, app.kubernetes.io/part-of: tipsbank, version: v2}
+spec:
+  type: ClusterIP
+  selector: {app.kubernetes.io/name: api-transacoes, version: v2}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-transacoes-v2
+  namespace: tipsbank-transacoes
+  labels: {app.kubernetes.io/name: api-transacoes, app.kubernetes.io/part-of: tipsbank, role: app, version: v2}
+spec:
+  replicas: 1                    # o canary recebe 10% do tráfego: uma réplica basta
+  selector:
+    matchLabels: {app.kubernetes.io/name: api-transacoes, version: v2}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: api-transacoes, app.kubernetes.io/part-of: tipsbank, role: app, version: v2}
+      annotations:
+        tipsbank.io/log-config-sha: "7ec289c99786"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: app
+          image: ghcr.io/jlui70/tipsbank-api-transacoes:v2.0.0@sha256:b67d2d2726893029ea6fcefc520f4e0ae04b047d531b6da209cd94c3506a01a7
+          args: [--log-config, /etc/app/log-config.json]
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - name: DB_URL
+              valueFrom: {secretKeyRef: {name: transacoes-db, key: DB_URL}}
+            - name: CONTAS_URL
+              valueFrom: {configMapKeyRef: {name: transacoes-config, key: CONTAS_URL}}
+            - name: AUDITORIA_URL
+              valueFrom: {configMapKeyRef: {name: transacoes-config, key: AUDITORIA_URL}}
+            - name: LOG_LEVEL
+              valueFrom: {configMapKeyRef: {name: transacoes-config, key: LOG_LEVEL}}
+          securityContext:
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          startupProbe:
+            httpGet: {path: /health/startup, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: {path: /health/ready, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health/live, port: http}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          volumeMounts:
+            - {name: app-logs, mountPath: /var/log/app}
+            - {name: log-config, mountPath: /etc/app, readOnly: true}
+        - name: log-forwarder
+          image: busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+          command: [sh, -c, 'exec tail -n +1 -F /var/log/app/app.log']
+          securityContext:
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          livenessProbe:
+            exec: {command: [pidof, tail]}
+            periodSeconds: 30
+          resources:
+            requests: {cpu: 5m, memory: 8Mi}
+            limits: {cpu: 50m, memory: 32Mi}
+          volumeMounts:
+            - {name: app-logs, mountPath: /var/log/app, readOnly: true}
+      volumes:
+        - name: app-logs
+          emptyDir: {sizeLimit: 50Mi}
+        - name: log-config
+          configMap: {name: transacoes-log-config}
