@@ -1389,3 +1389,215 @@ SPA no navegador em `http://app.tipsbank.local` (resolvido pelo `/etc/hosts`), l
 | `api.tipsbank.local/contas/contas` → contas | ✅ 2 contas seed |
 | `/etc/hosts` com as entradas | ✅ `192.168.122.11 app.tipsbank.local api.tipsbank.local` |
 | SPA no navegador pelo nome | ✅ login e dashboard em `app.tipsbank.local` (print) |
+
+## Etapa 2.2 — TLS com cert-manager + recursos avançados do Ingress
+
+**Data**: 2026-11-04 · **cert-manager**: v1.21.3 (Helm, CRDs incluídas) · **Arquivos**: [`infra/cert-manager/`](../infra/cert-manager/), [`infra/ingress-nginx/values-kubeadm.yaml`](../infra/ingress-nginx/values-kubeadm.yaml), [`k8s/*/ingress.yaml`](../k8s/), [`k8s/contas/secret-basic-auth.yaml.example`](../k8s/contas/secret-basic-auth.yaml.example), [`k8s/contas/gerar-basic-auth.sh`](../k8s/contas/gerar-basic-auth.sh)
+
+### cert-manager e ClusterIssuer
+
+```bash
+./infra/cert-manager/install.sh       # helm upgrade --install (values.yaml) + cluster-issuers.yaml
+```
+
+| Decisão (`infra/cert-manager/values.yaml`) | Por quê |
+|---|---|
+| `startupapicheck.enabled: false` | É um `Job` pós-instalação que só testa a API do cert-manager. Job é proibido no desafio. O `install.sh` faz a mesma checagem com `rollout status` + `apply --dry-run=server` |
+| `containerSecurityContext.runAsUser: 65532` nos 3 componentes | O comando de compliance #2 trata container sem `runAsUser` explícito como root. As imagens já rodam como 65532 |
+| `resources.limits` nos 3 componentes | Compliance #4 |
+| Imagens `quay.io/jetstack/*` | Registry aceito pelo compliance #1 |
+
+**Cadeia de certificados do lab (`cluster-issuers.yaml`):** um ClusterIssuer `selfsigned` cria **uma vez** a CA `TipsBank Lab CA` (Certificate `isCA: true`, Secret `tipsbank-ca` no ns `cert-manager`), e o ClusterIssuer `tipsbank-ca`, do tipo CA, assina os certificados dos Ingress. Comparado a usar o `selfsigned` direto em cada Ingress, todos os certificados têm o mesmo emissor, e basta confiar em um único `ca.crt` para o `curl`/navegador aceitarem todos, sem `-k`.
+
+```console
+$ helm list -n cert-manager
+NAME          NAMESPACE     REVISION  STATUS    CHART                 APP VERSION
+cert-manager  cert-manager  1         deployed  cert-manager-v1.21.3  v1.21.3
+
+$ kubectl get clusterissuer
+NAME          READY   AGE
+selfsigned    True    4m11s
+tipsbank-ca   True    4m11s
+
+$ kubectl get jobs -A
+No resources found
+```
+
+### TLS nos Ingress
+
+Todos os Ingress ganharam `tls:` com o host. Os que têm a anotação `cert-manager.io/cluster-issuer: tipsbank-ca` fazem o cert-manager criar o `Certificate` automaticamente (ingress-shim). Um Ingress só lê Secrets do próprio namespace, por isso cada namespace tem o seu certificado: 7 no total, mais a CA. O `api-contas-admin` reaproveita o Secret `api-tipsbank-tls` do `api-contas` (mesmo host e namespace) sem a anotação, porque dois Ingress anotados com o mesmo `secretName` disputariam o mesmo Certificate.
+
+```console
+$ kubectl get certificate -A
+NAMESPACE             NAME               READY   SECRET             AGE
+cert-manager          tipsbank-ca        True    tipsbank-ca        2m15s
+tipsbank-auditoria    api-tipsbank-tls   True    api-tipsbank-tls   20s
+tipsbank-auditoria    app-tipsbank-tls   True    app-tipsbank-tls   20s
+tipsbank-contas       api-tipsbank-tls   True    api-tipsbank-tls   21s
+tipsbank-contas       app-tipsbank-tls   True    app-tipsbank-tls   20s
+tipsbank-transacoes   api-tipsbank-tls   True    api-tipsbank-tls   20s
+tipsbank-transacoes   app-tipsbank-tls   True    app-tipsbank-tls   20s
+tipsbank-web          app-tipsbank-tls   True    app-tipsbank-tls   21s
+
+$ kubectl get ingress -A
+NAMESPACE             NAME                 CLASS   HOSTS                ADDRESS                         PORTS     AGE
+tipsbank-auditoria    auditoria            nginx   api.tipsbank.local   192.168.122.11,192.168.122.12   80, 443   19m
+tipsbank-auditoria    auditoria-spa        nginx   app.tipsbank.local   192.168.122.11,192.168.122.12   80, 443   19m
+tipsbank-contas       api-contas           nginx   api.tipsbank.local   192.168.122.11,192.168.122.12   80, 443   19m
+tipsbank-contas       api-contas-admin     nginx   api.tipsbank.local   192.168.122.11,192.168.122.12   80, 443   2m17s
+tipsbank-contas       api-contas-spa       nginx   app.tipsbank.local   192.168.122.11,192.168.122.12   80, 443   19m
+tipsbank-transacoes   api-transacoes       nginx   api.tipsbank.local   192.168.122.11,192.168.122.12   80, 443   19m
+tipsbank-transacoes   api-transacoes-spa   nginx   app.tipsbank.local   192.168.122.11,192.168.122.12   80, 443   19m
+tipsbank-web          web                  nginx   app.tipsbank.local   192.168.122.11,192.168.122.12   80, 443   19m
+```
+
+### Critério 1 — `curl -k https://app.tipsbank.local/` retorna 200
+
+```console
+$ curl -sk -o /dev/null -w '%{http_code} %{content_type}\n' https://app.tipsbank.local/
+200 text/html
+
+$ echo | openssl s_client -connect 192.168.122.11:443 -servername app.tipsbank.local 2>/dev/null \
+    | openssl x509 -noout -issuer -ext subjectAltName -dates
+issuer=CN = TipsBank Lab CA
+X509v3 Subject Alternative Name: critical
+    DNS:app.tipsbank.local
+notBefore=Nov  4 19:34:27 2026 GMT
+notAfter=Feb  2 19:34:27 2027 GMT
+
+# sem -k, confiando só na CA do lab
+$ kubectl -n cert-manager get secret tipsbank-ca -o jsonpath='{.data.ca\.crt}' | base64 -d > tipsbank-ca.crt
+$ curl -s --cacert tipsbank-ca.crt -o /dev/null -w '%{http_code} ssl_verify=%{ssl_verify_result}\n' https://app.tipsbank.local/
+200 ssl_verify=0
+
+# HTTP agora redireciona para HTTPS (padrão do Ingress NGINX quando o Ingress tem tls)
+$ curl -s -o /dev/null -w '%{http_code} -> %{redirect_url}\n' http://app.tipsbank.local/
+308 -> https://app.tipsbank.local/
+$ curl -skI https://app.tipsbank.local/ | grep -i strict
+strict-transport-security: max-age=31536000; includeSubDomains
+```
+
+O certificado é renovado sozinho pelo cert-manager (validade padrão de 90 dias, renovação aos 2/3).
+
+### Critério 2 — Basic Auth em `api.tipsbank.local/contas/admin`
+
+A `api-contas` não tem rotas `/admin`. O Ingress `api-contas-admin` cria uma entrada administrativa autenticada para a mesma API: path `/contas/admin(/|$)(.*)` com `rewrite-target: /$2`, então `/contas/admin/contas` chega na API como `/contas`. O path é mais longo que o do Ingress `api-contas`, e por isso o controller o testa primeiro.
+
+**Credencial fora do Git**, no mesmo padrão dos Secrets do banco (1.4): só o template `secret-basic-auth.yaml.example` é versionado. O `gerar-basic-auth.sh` gera a senha (`openssl rand`), calcula o hash SHA-512 crypt (`openssl passwd -6 -stdin`, sem a senha aparecer na linha de comando) e grava `secret-basic-auth.yaml` + `.basic-auth-senha` com permissão `600`. Os dois estão no `.gitignore`. Só o **hash** vai para o cluster.
+
+```console
+$ ./k8s/contas/gerar-basic-auth.sh
+gerado: secret-basic-auth.yaml (usuário: admin, senha em .basic-auth-senha)
+$ git check-ignore -v k8s/contas/secret-basic-auth.yaml k8s/contas/.basic-auth-senha
+.gitignore:22:k8s/**/secret-basic-auth.yaml   k8s/contas/secret-basic-auth.yaml
+.gitignore:23:k8s/**/.basic-auth-senha        k8s/contas/.basic-auth-senha
+$ kubectl apply -f k8s/contas/secret-basic-auth.yaml
+
+$ curl -sk -o /dev/null -w 'sem credencial: %{http_code}\n' https://api.tipsbank.local/contas/admin/contas
+sem credencial: 401
+$ curl -sk -o /dev/null -w 'senha errada:   %{http_code}\n' -u admin:errada https://api.tipsbank.local/contas/admin/contas
+senha errada:   401
+$ curl -sk -u "admin:$(cat k8s/contas/.basic-auth-senha)" https://api.tipsbank.local/contas/admin/contas | jq -c '[.[] | .titular]'
+["Jeferson Fernando","LinuxTips SA"]
+$ curl -sk -o /dev/null -w 'com credencial: %{http_code}\n' -u "admin:$(cat k8s/contas/.basic-auth-senha)" https://api.tipsbank.local/contas/admin/contas
+com credencial: 200
+```
+
+### Affinity Cookie em `api.tipsbank.local/transacoes`
+
+Anotações no Ingress `api-transacoes`: `affinity: cookie`, `session-cookie-name: TIPSBANK_TX`, `session-cookie-max-age: "3600"` e `session-cookie-path: /transacoes`. O path explícito é necessário porque, com `use-regex`, o path da location é uma regex e não serviria como path de cookie. Teste: o pod que atendeu cada requisição aparece no log do controller (`upstream_addr`).
+
+```console
+$ kubectl get pods -n tipsbank-transacoes -o custom-columns=POD:.metadata.name,IP:.status.podIP --no-headers
+api-transacoes-7bdfb68566-2sr6v   10.244.63.150
+api-transacoes-7bdfb68566-frk47   10.244.41.81
+
+$ curl -sk -c jar.txt -D - -o /dev/null https://api.tipsbank.local/transacoes/health/live | grep -i set-cookie
+set-cookie: TIPSBANK_TX=1793820901.762.170.746183|ce724c...; Max-Age=3600; Path=/transacoes; Secure; HttpOnly
+
+# 10 requisições sem cookie x 10 com o cookie (-b jar.txt); contagem por pod no log do controller
+== sem cookie
+      5 ] 10.244.41.81:8080
+      5 ] 10.244.63.150:8080
+== com cookie
+     10 ] 10.244.41.81:8080
+```
+
+### Rate limit de 50 req/s em `app.tipsbank.local`
+
+Anotações no Ingress `web`: `limit-rps: "50"` e `limit-burst-multiplier: "1"`. No ConfigMap do controller: `limit-req-status-code: "429"`.
+
+- O **burst** padrão do Ingress NGINX é 5× o limite (250). Uma rajada de 100 requisições nunca seria barrada. Com multiplicador 1, o burst é 50.
+- O status padrão do nginx para limite estourado é **503**, que pareceria erro do servidor. `429 Too Many Requests` é o código correto e o que o critério pede.
+- O limite é por IP de cliente e por réplica do controller. O `/etc/hosts` aponta para o w1, então toda a rajada cai no mesmo controller.
+- Vale só para o Ingress `web` (a SPA em `/`). As rotas `/api/*` do mesmo host são outros Ingress e não são limitadas.
+
+```console
+$ seq 100 | xargs -P 50 -I{} curl -sk -o /dev/null -w '%{http_code}\n' https://app.tipsbank.local/ | sort | uniq -c
+     97 200
+      3 429
+$ curl -sk -i https://app.tipsbank.local/ | head -1        # durante uma rajada
+HTTP/2 429
+$ seq 100 | xargs -P 50 -I{} curl -sk -o /dev/null -w '%{http_code}\n' https://app.tipsbank.local/api/contas/health/live | sort | uniq -c
+    100 200
+```
+
+Com `curl`, cada requisição abre uma conexão TLS nova, e a rajada leva ~1,1 s: cabem ~50/s + 50 de burst ≈ 105, e só 3 passaram do limite. Ferramentas de carga como `hey`/`ab` reaproveitam conexões, mandam mais rápido e mostram a proporção real.
+
+Com o **`ab`** (Apache Bench, pacote `apache2-utils`), que é o que o manual pede: 100 requisições, 50 simultâneas. A contagem por código vem do log do controller (User-Agent `ApacheBench`):
+
+```console
+$ ab -n 100 -c 50 https://app.tipsbank.local/ | grep -E 'Concurrency|Time taken|Complete|Failed|Non-2xx|Requests per second'
+Concurrency Level:      50
+Time taken for tests:   0.816 seconds
+Complete requests:      100
+Failed requests:        26
+Non-2xx responses:      26
+Requests per second:    122.51 [#/sec] (mean)
+
+$ kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller --tail=500 | grep '"ApacheBench' | awk '{print $9}' | sort | uniq -c
+     74 200
+     26 429
+```
+
+A rajada a 122 req/s passa do limite de 50/s + burst de 50: as primeiras ~74 são atendidas e as **26 excedentes recebem 429**. O "Failed requests: 26" do `ab` são os mesmos 429: o `ab` conta como falha qualquer resposta com tamanho diferente da primeira.
+
+### Upstream Hashing (passo 7) em `api.tipsbank.local/auditoria`
+
+Anotação `upstream-hash-by: "$http_x_cliente"`: o controller escolhe o pod pelo hash do cabeçalho `X-Cliente` (hash consistente). O mesmo cliente cai sempre no mesmo pod. Com outra réplica a mais ou a menos, só uma parte dos clientes muda de pod.
+
+**Ocorrência do teste:** na 1ª tentativa a anotação estava só no Ingress `auditoria`, e o hash não funcionou (o mesmo cliente caía nos 3 pods). O controller cria **um upstream por Service** (`tipsbank-auditoria-auditoria-8080`), compartilhado pelos Ingress `auditoria` e `auditoria-spa`, e o que não tinha a anotação prevaleceu. Diagnóstico com o `/dbg` do controller:
+
+```console
+$ kubectl exec -n ingress-nginx <controller> -- /dbg backends get tipsbank-auditoria-auditoria-8080 | jq -c .upstreamHashByConfig
+{"upstream-hash-by-subset-size":3}                                   # antes: sem upstream-hash-by
+{"upstream-hash-by":"$http_x_cliente","upstream-hash-by-subset-size":3}   # depois: anotação nos 2 Ingress
+```
+
+Resultado com a anotação nos dois Ingress (4 requisições por cliente, 6 sem cabeçalho):
+
+```console
+$ kubectl get pods -n tipsbank-auditoria -o custom-columns=POD:.metadata.name,IP:.status.podIP --no-headers
+auditoria-5b5d94954b-kqjf8   10.244.41.76
+auditoria-5b5d94954b-txjtk   10.244.63.149
+auditoria-5b5d94954b-vb6bf   10.244.63.153
+
+      4 ana 10.244.63.149
+      4 bruno 10.244.63.149
+      4 carla 10.244.63.149
+      4 diego 10.244.63.153
+      4 elisa 10.244.41.76
+      6 semheader 10.244.63.153
+```
+
+Sem o cabeçalho (é o caso das chamadas da SPA), o hash é de uma string vazia, e tudo vai para o mesmo pod. Com a auditoria gravando no NFS compartilhado (1.6), isso não afeta o resultado. Pela mesma regra de "um upstream por Service", o Affinity Cookie da `api-transacoes` também vale para o upstream usado pelo `api-transacoes-spa`. Na prática, o navegador não envia o cookie em `/api/transacoes`, porque o `Path` do cookie é `/transacoes`.
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| `curl -k https://app.tipsbank.local/` → 200 | ✅ 200 (e 200 sem `-k`, com `--cacert` da CA do lab) |
+| `/contas/admin/contas` → 401 sem credencial, 200 com | ✅ 401 / 401 (senha errada) / 200 |
+| Rajada de 100 requests com 429 após o rate limit | ✅ `ab -n 100 -c 50`: 74 × 200 e 26 × 429 |
+| Affinity Cookie em transações | ✅ 10/10 no mesmo pod com o cookie; 5/5 sem |
+| Upstream Hashing documentado | ✅ mesmo `X-Cliente` → mesmo pod; ocorrência do upstream compartilhado registrada |

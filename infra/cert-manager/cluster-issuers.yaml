@@ -1,0 +1,38 @@
+# Emissores do lab (etapa 2.2). Cadeia em 2 níveis, o padrão do cert-manager para CA própria:
+#   1. selfsigned  : ClusterIssuer auto-assinado, usado UMA vez para criar a CA
+#   2. tipsbank-ca : Certificate da CA (isCA: true), guardado no Secret tipsbank-ca
+#   3. tipsbank-ca : ClusterIssuer do tipo CA, que assina os certificados dos Ingress
+# Vantagem sobre usar o selfsigned direto em cada Ingress: todos os certificados têm o mesmo
+# emissor, e basta confiar no tipsbank-ca.crt (uma vez) para o navegador aceitar todos.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: tipsbank-ca
+  namespace: cert-manager          # ClusterIssuer do tipo CA lê o Secret deste namespace
+spec:
+  isCA: true
+  commonName: TipsBank Lab CA
+  secretName: tipsbank-ca
+  duration: 87600h                 # 10 anos (CA de lab)
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: selfsigned
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: tipsbank-ca
+spec:
+  ca:
+    secretName: tipsbank-ca

@@ -1,6 +1,7 @@
 # Etapa 2.1 — entrada do usuário final: app.tipsbank.local -> SPA (svc/web).
 # Ingress puro: as chamadas /api/<serviço>/* da SPA são roteadas pelo Ingress direto para as APIs
 # (Ingress <api>-spa em cada namespace); o web só serve arquivos estáticos.
+# Etapa 2.2 — TLS (cert-manager, ClusterIssuer tipsbank-ca) e rate limit de 50 req/s.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -9,8 +10,19 @@ metadata:
   labels:
     app.kubernetes.io/name: web
     app.kubernetes.io/part-of: tipsbank
+  annotations:
+    # cert-manager vê esta anotação + o bloco tls e cria o Certificate app-tipsbank-tls
+    cert-manager.io/cluster-issuer: tipsbank-ca
+    # Rate limit por IP de cliente: 50 req/s. O burst padrão é 5x o limite (250), e uma rajada
+    # de 100 requests nunca seria barrada. Com multiplicador 1 o burst é 50: o excedente recebe 429
+    # (limit-req-status-code: 429 no ConfigMap do controller; o padrão do nginx seria 503).
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "1"
 spec:
   ingressClassName: nginx
+  tls:
+    - hosts: [app.tipsbank.local]
+      secretName: app-tipsbank-tls
   rules:
     - host: app.tipsbank.local
       http:

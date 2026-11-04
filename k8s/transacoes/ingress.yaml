@@ -1,5 +1,6 @@
 # Etapa 2.1 — rotas da api-transacoes (mesmo padrão do k8s/contas/ingress.yaml).
-# Na 2.2 o Ingress do host api ganha Affinity Cookie; na 2.4 ganha um Ingress canário.
+# Etapa 2.2 — TLS + Affinity Cookie no host api: transferências da mesma sessão caem no mesmo pod.
+# Na 2.4 este Ingress ganha um Ingress canário no mesmo host/path.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -9,10 +10,20 @@ metadata:
     app.kubernetes.io/name: api-transacoes
     app.kubernetes.io/part-of: tipsbank
   annotations:
+    cert-manager.io/cluster-issuer: tipsbank-ca
     nginx.ingress.kubernetes.io/use-regex: "true"
     nginx.ingress.kubernetes.io/rewrite-target: /$2
+    # 1ª resposta traz Set-Cookie TIPSBANK_TX; com o cookie, o controller manda sempre para o mesmo pod
+    nginx.ingress.kubernetes.io/affinity: cookie
+    nginx.ingress.kubernetes.io/session-cookie-name: TIPSBANK_TX
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
+    # com use-regex o path da location é uma regex: o cookie precisa de um path literal
+    nginx.ingress.kubernetes.io/session-cookie-path: /transacoes
 spec:
   ingressClassName: nginx
+  tls:
+    - hosts: [api.tipsbank.local]
+      secretName: api-tipsbank-tls
   rules:
     - host: api.tipsbank.local
       http:
@@ -34,10 +45,14 @@ metadata:
     app.kubernetes.io/name: api-transacoes
     app.kubernetes.io/part-of: tipsbank
   annotations:
+    cert-manager.io/cluster-issuer: tipsbank-ca
     nginx.ingress.kubernetes.io/use-regex: "true"
     nginx.ingress.kubernetes.io/rewrite-target: /$2
 spec:
   ingressClassName: nginx
+  tls:
+    - hosts: [app.tipsbank.local]
+      secretName: app-tipsbank-tls
   rules:
     - host: app.tipsbank.local
       http:

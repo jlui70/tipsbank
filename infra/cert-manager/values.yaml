@@ -1,0 +1,38 @@
+# cert-manager v1.21.3 (etapa 2.2). Imagens em quay.io/jetstack (aceito pelo compliance #1).
+crds:
+  enabled: true        # instala as CRDs junto (Certificate, Issuer, ClusterIssuer...)
+  keep: true           # helm uninstall não apaga as CRDs (nem os certificados emitidos)
+
+# startupapicheck é um Job pós-instalação que só testa se a API do cert-manager responde.
+# O desafio proíbe Job (exceto o do Locust) -> desligado. A checagem é feita à mão
+# (kubectl wait nos 3 Deployments + emissão de um Certificate de teste).
+startupapicheck:
+  enabled: false
+
+# Compliance #2: o comando olha runAsUser em CADA container (ausente conta como root).
+# As 3 imagens já rodam como 65532; aqui só fica explícito. Os maps são mesclados com os
+# padrões do chart (drop ALL, readOnlyRootFilesystem, allowPrivilegeEscalation: false).
+containerSecurityContext:
+  runAsUser: 65532
+  runAsGroup: 65532
+# Compliance #4: limits em todos os containers.
+resources:
+  requests: {cpu: 10m, memory: 64Mi}
+  limits: {cpu: 200m, memory: 256Mi}
+
+webhook:
+  containerSecurityContext:
+    runAsUser: 65532
+    runAsGroup: 65532
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+    limits: {cpu: 100m, memory: 128Mi}
+
+# Atenção (etapa 4.6): o template do cainjector não tem livenessProbe -> aparece no compliance #3.
+cainjector:
+  containerSecurityContext:
+    runAsUser: 65532
+    runAsGroup: 65532
+  resources:
+    requests: {cpu: 10m, memory: 64Mi}
+    limits: {cpu: 200m, memory: 256Mi}

@@ -40,6 +40,12 @@ controller:
   publishService:
     enabled: false
 
+  # ConfigMap global do controller (etapa 2.2): quem estoura o rate limit recebe
+  # 429 Too Many Requests, e não o 503 padrão do nginx (que pareceria erro do servidor).
+  config:
+    limit-req-status-code: "429"
+    limit-conn-status-code: "429"
+
   ingressClassResource:
     name: nginx
     enabled: true

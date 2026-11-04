@@ -1,9 +1,13 @@
 # Etapa 2.1 — rotas da api-contas. Um Ingress por host, para as anotações da 2.2
-# (ex.: Basic Auth em /contas/admin) valerem só onde devem.
-# O Ingress precisa estar no mesmo namespace do Service; o controller junta os dois hosts.
+# valerem só onde devem. O Ingress precisa estar no mesmo namespace do Service;
+# o controller junta todos os Ingress do mesmo host.
 #
 # rewrite-target /$2 remove o prefixo: /contas/contas -> /contas na API (mesmo efeito do
 # proxy_pass http://contas/; que o nginx do web fazia na etapa 1.4).
+#
+# Etapa 2.2 — TLS: cada namespace precisa do seu Secret de certificado (um Ingress só lê
+# Secrets do próprio namespace). Só UM Ingress por host e namespace leva a anotação do
+# cert-manager; o outro (api-contas-admin) reaproveita o mesmo Secret.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -13,15 +17,54 @@ metadata:
     app.kubernetes.io/name: api-contas
     app.kubernetes.io/part-of: tipsbank
   annotations:
+    cert-manager.io/cluster-issuer: tipsbank-ca
     nginx.ingress.kubernetes.io/use-regex: "true"
     nginx.ingress.kubernetes.io/rewrite-target: /$2
 spec:
   ingressClassName: nginx
+  tls:
+    - hosts: [api.tipsbank.local]
+      secretName: api-tipsbank-tls
   rules:
     - host: api.tipsbank.local          # acesso direto às APIs (testes fora do frontend)
       http:
         paths:
           - path: /contas(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: api-contas
+                port:
+                  number: 8080
+---
+# Etapa 2.2 — /contas/admin/* protegido por Basic Auth.
+# A api-contas não tem rotas /admin: o Ingress cria uma "porta administrativa" autenticada
+# para a mesma API (/contas/admin/contas -> /contas). O Secret vem de k8s/contas/gerar-basic-auth.sh.
+# Path mais longo que /contas(/|$)(.*): o controller testa os paths regex do maior para o menor.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-contas-admin
+  namespace: tipsbank-contas
+  labels:
+    app.kubernetes.io/name: api-contas
+    app.kubernetes.io/part-of: tipsbank
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: contas-admin-basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "TipsBank - area administrativa"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [api.tipsbank.local]
+      secretName: api-tipsbank-tls        # o mesmo do Ingress api-contas (sem anotação de issuer)
+  rules:
+    - host: api.tipsbank.local
+      http:
+        paths:
+          - path: /contas/admin(/|$)(.*)
             pathType: ImplementationSpecific
             backend:
               service:
@@ -38,10 +81,14 @@ metadata:
     app.kubernetes.io/name: api-contas
     app.kubernetes.io/part-of: tipsbank
   annotations:
+    cert-manager.io/cluster-issuer: tipsbank-ca
     nginx.ingress.kubernetes.io/use-regex: "true"
     nginx.ingress.kubernetes.io/rewrite-target: /$2
 spec:
   ingressClassName: nginx
+  tls:
+    - hosts: [app.tipsbank.local]
+      secretName: app-tipsbank-tls
   rules:
     - host: app.tipsbank.local          # chamadas da SPA: /api/contas/* (antes feitas pelo proxy do web)
       http:
