@@ -1,0 +1,88 @@
+# Etapa 2.5 — NetworkPolicy zero-trust do namespace tipsbank-contas (api-contas + postgres-primary).
+# Modelo em todos os namespaces tipsbank-*:
+#   1. default-deny: nada entra nem sai (ingress + egress) de nenhum pod do namespace;
+#   2. allow-dns-egress: todos os pods consultam o CoreDNS (kube-system, porta 53 UDP/TCP);
+#   3. uma policy por fluxo necessário (ARQUITETURA §5), com origem/destino por label + namespace.
+# NetworkPolicy é aditiva: o tráfego passa se QUALQUER policy que seleciona o pod permitir.
+# Seletores de namespace usam o label automático kubernetes.io/metadata.name.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: tipsbank-contas
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {}                      # {} = todos os pods do namespace
+  policyTypes: [Ingress, Egress]       # sem regras = nega tudo nos dois sentidos
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: tipsbank-contas
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+# api-contas recebe do Ingress Controller (api.tipsbank.local e /api/contas da SPA)
+# e da api-transacoes (débito/crédito das transferências).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-contas-ingress
+  namespace: tipsbank-contas
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: api-contas}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: ingress-nginx}}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-transacoes}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: api-transacoes}}   # v1 e v2
+      ports:
+        - {protocol: TCP, port: 8080}
+---
+# api-contas -> postgres-primary (mesmo namespace)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-contas-egress-postgres
+  namespace: tipsbank-contas
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: api-contas}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector: {matchLabels: {app.kubernetes.io/name: postgres-primary}}
+      ports:
+        - {protocol: TCP, port: 5432}
+---
+# postgres-primary só aceita conexões dos pods de aplicação que usam o banco:
+# api-contas (mesmo ns) e api-transacoes (grava a tabela transacoes; ns tipsbank-transacoes).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-ingress
+  namespace: tipsbank-contas
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: postgres-primary}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app.kubernetes.io/name: api-contas, role: app}}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-transacoes}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: api-transacoes, role: app}}
+      ports:
+        - {protocol: TCP, port: 5432}

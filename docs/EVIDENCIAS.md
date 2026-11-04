@@ -1753,3 +1753,158 @@ O `undo` reaproveita o template da revisão anterior: os pods voltam ao **mesmo 
 | `kubectl rollout undo` em qualquer Deployment | ✅ v1 e v2 voltaram ao ReplicaSet original |
 | Canary por `X-Canary: true` (extra) | ✅ 5/5 na v2; `/pix` 200 na v2 e 404 na v1 |
 | v2 assinada e sem HIGH/CRITICAL | ✅ Trivy 0; `cosign verify` com a identidade da 1.2 |
+
+## Etapa 2.5 — NetworkPolicy zero-trust
+
+**Data**: 2026-11-04 · **CNI**: Calico v3.33.0 (implementa NetworkPolicy; etapa 1.3) · **Arquivos**: [`k8s/contas/networkpolicy.yaml`](../k8s/contas/networkpolicy.yaml), [`k8s/transacoes/networkpolicy.yaml`](../k8s/transacoes/networkpolicy.yaml), [`k8s/auditoria/networkpolicy.yaml`](../k8s/auditoria/networkpolicy.yaml), [`k8s/web/networkpolicy.yaml`](../k8s/web/networkpolicy.yaml)
+
+### Modelo
+
+Em cada um dos 4 namespaces `tipsbank-*`:
+
+1. **`default-deny`**: `podSelector: {}` + `policyTypes: [Ingress, Egress]` sem regras. Nada entra nem sai.
+2. **`allow-dns-egress`**: todos os pods saem só para o CoreDNS (`kube-system`, `k8s-app: kube-dns`), porta 53 UDP/TCP.
+3. **Uma policy por fluxo** da ARQUITETURA §5, com origem e destino por `podSelector` + `namespaceSelector` (label automático `kubernetes.io/metadata.name`).
+
+| Namespace | Entrada permitida | Saída permitida (além do DNS) |
+|---|---|---|
+| `tipsbank-web` | ingress-nginx → `web:8080` | nenhuma (Ingress puro, 2.1) |
+| `tipsbank-contas` | ingress-nginx e api-transacoes → `api-contas:8080`; api-contas e api-transacoes (`role: app`) → `postgres-primary:5432` | api-contas → postgres:5432 |
+| `tipsbank-transacoes` | ingress-nginx → `api-transacoes:8080` (v1 e v2) | api-contas:8080, auditoria:8080, postgres:5432; HTTPS externo com `ipBlock` + `except` |
+| `tipsbank-auditoria` | ingress-nginx e api-transacoes → `auditoria:8080` | nenhuma |
+
+As policies selecionam `app.kubernetes.io/name: api-transacoes`, igual nas duas versões do canary (2.4). A v1 e a v2 têm as mesmas permissões.
+
+**Decisões em relação ao passo 3 do manual:**
+
+- **`web` → APIs: não liberado.** Com o Ingress puro (2.1), o `web` não faz proxy, e a policy do `tipsbank-web` é a versão "drasticamente mais simples" prevista no manual: entrada só do controller e saída só para o DNS.
+- **`api-transacoes` → `postgres-primary:5432`: liberado.** O manual omite esse fluxo, mas a ARQUITETURA o lista: a `api-transacoes` grava a tabela `transacoes`.
+- **`auditoria` → NFS 2049: não liberado, porque não é necessário.** Quem monta o volume NFS é o **kubelet**, no namespace de rede do nó, e NetworkPolicy só controla o tráfego dos pods. Prova abaixo: com as policies ativas, um pod novo da auditoria monta e grava no NFS, e o próprio pod continua **sem** acesso a `192.168.122.13:2049`.
+- **`ipBlock` com `except` (passo 4):** a `api-transacoes` pode sair por HTTPS (443) para provedores externos (o PIX da v2), via `0.0.0.0/0` **exceto** as faixas privadas `10.0.0.0/8` (pods e Services do kubeadm), `172.16.0.0/12` e `192.168.0.0/16` (inclui `192.168.122.0/24`, os nós e VMs do lab: API server, kubelet, etcd e NFS, a rede de gerência) e o link-local `169.254.0.0/16` (inclui o metadata da nuvem). Ou seja: saída **só para a internet pública**. Usar as faixas privadas padrão, e não as do lab, faz a mesma policy valer no EKS (2.3), onde a VPC padrão do `eksctl` é `192.168.0.0/16` e o endpoint privado do API server fica dentro dela, na porta 443.
+
+```console
+$ kubectl get netpol -A
+NAMESPACE             NAME                            POD-SELECTOR                              AGE
+tipsbank-auditoria    allow-dns-egress                <none>                                    67s
+tipsbank-auditoria    auditoria-ingress               app.kubernetes.io/name=auditoria          67s
+tipsbank-auditoria    default-deny                    <none>                                    67s
+tipsbank-contas       allow-dns-egress                <none>                                    68s
+tipsbank-contas       api-contas-egress-postgres      app.kubernetes.io/name=api-contas         68s
+tipsbank-contas       api-contas-ingress              app.kubernetes.io/name=api-contas         68s
+tipsbank-contas       default-deny                    <none>                                    68s
+tipsbank-contas       postgres-ingress                app.kubernetes.io/name=postgres-primary   68s
+tipsbank-transacoes   allow-dns-egress                <none>                                    68s
+tipsbank-transacoes   api-transacoes-egress-externo   app.kubernetes.io/name=api-transacoes     67s
+tipsbank-transacoes   api-transacoes-egress-interno   app.kubernetes.io/name=api-transacoes     67s
+tipsbank-transacoes   api-transacoes-ingress          app.kubernetes.io/name=api-transacoes     68s
+tipsbank-transacoes   default-deny                    <none>                                    68s
+tipsbank-web          allow-dns-egress                <none>                                    67s
+tipsbank-web          default-deny                    <none>                                    67s
+tipsbank-web          web-ingress                     app.kubernetes.io/name=web                67s
+```
+
+### Aplicação sem interrupção
+
+Um laço chamou a SPA, a `api-contas` (pela rota da SPA) e uma transferência (`POST /transferencias`, que passa por api-transacoes → api-contas → Postgres → auditoria) a cada 0,3 s, antes, durante e depois do `kubectl apply`:
+
+```console
+# SPA / api-contas / transferência — 150 ciclos
+    150 200 200 201
+```
+
+### Como os testes foram feitos
+
+As imagens das APIs são Distroless, sem `curl` nem shell. Os testes rodam com `python3` dentro do container `app` (`urllib` para HTTP e `socket` para TCP, com timeout de 3 s). No `web` (nginx-unprivileged, Alpine), com `wget`/`nc`.
+
+```bash
+kubectl exec -n tipsbank-auditoria <pod> -c app -- python3 -c "
+import urllib.request
+print(urllib.request.urlopen('http://api-contas.tipsbank-contas:8080/health/live', timeout=3).status)"
+```
+
+### Antes x depois
+
+| De → para | Antes | Depois |
+|---|---|---|
+| auditoria → api-contas:8080 | OK | **bloqueado** (timeout) |
+| auditoria → postgres:5432 | OK | **bloqueado** |
+| transacoes → api-contas:8080 | OK | OK (200) |
+| transacoes → API server 192.168.122.10:6443 | OK | **bloqueado** (`except`) |
+| transacoes → NFS 192.168.122.13:2049 | OK | **bloqueado** (`except`) |
+| transacoes → internet 1.1.1.1:443 | OK | OK (`ipBlock`) |
+| transacoes → 169.254.169.254:80 | sem resposta (não há metadata no lab) | **bloqueado** (`except`) |
+| web → api-contas:8080 | OK | **bloqueado** |
+
+### Critério 1 — auditoria → api-contas: timeout
+
+```console
+$ kubectl exec -n tipsbank-auditoria auditoria-5b5d94954b-kqjf8 -c app -- python3 -c "...urlopen('http://api-contas.tipsbank-contas:8080/health/live', timeout=3)..."
+BLOQUEADO URLError <urlopen error timed out>
+```
+
+### Critério 2 — transacoes → api-contas: 200
+
+```console
+$ kubectl exec -n tipsbank-transacoes api-transacoes-68d8d7fb4c-mmlsk -c app -- python3 -c "...urlopen('http://api-contas.tipsbank-contas:8080/health/live', timeout=3).status"
+200
+$ kubectl exec -n tipsbank-transacoes api-transacoes-v2-757757d964-8gqdn -c app -- python3 -c "..."     # v2
+200
+```
+
+### Critério 3 — saída para IP não permitido: bloqueada
+
+A partir da `api-transacoes` (o único pod com alguma saída externa):
+
+```console
+  169.254.169.254:80 (metadata)     BLOQUEADO TimeoutError
+  192.168.122.10:6443 (API server)  BLOQUEADO TimeoutError
+  192.168.122.11:10250 (kubelet)    BLOQUEADO TimeoutError
+  192.168.122.13:2049 (NFS)         BLOQUEADO TimeoutError
+  1.1.1.1:443 (externo HTTPS)       OK                      <- única saída externa, só a 443
+  1.1.1.1:80 (externo HTTP)         BLOQUEADO TimeoutError
+```
+
+Outros bloqueios conferidos:
+
+```console
+  auditoria -> postgres:5432        BLOQUEADO TimeoutError
+  auditoria -> 1.1.1.1:443          BLOQUEADO TimeoutError
+  api-contas -> auditoria:8080      BLOQUEADO TimeoutError
+  api-contas -> 192.168.122.10:6443 BLOQUEADO TimeoutError
+  web -> api-contas:8080            BLOQUEADO
+  web -> 1.1.1.1:443                BLOQUEADO
+```
+
+Fluxos permitidos e DNS:
+
+```console
+  transacoes -> auditoria:8080      OK
+  transacoes -> postgres:5432       OK
+  api-contas -> postgres:5432       OK
+  auditoria resolve api-contas: 10.100.19.37
+```
+
+### Probes e NFS continuam funcionando
+
+- **Probes:** nenhum pod perdeu o `READY` nem reiniciou depois das policies (os restarts listados são do boot da manhã). O tráfego do kubelet para os pods do próprio nó é sempre permitido pela especificação de NetworkPolicy.
+- **NFS:** um pod da auditoria foi recriado com as policies ativas e montou o volume normalmente:
+
+```console
+$ kubectl delete pod -n tipsbank-auditoria auditoria-5b5d94954b-kqjf8
+$ kubectl -n tipsbank-auditoria rollout status deploy/auditoria
+deployment "auditoria" successfully rolled out
+$ kubectl exec -n tipsbank-auditoria auditoria-5b5d94954b-r967v -- python3 -c "...open('/data/.teste-netpol','w')...os.listdir('/data')"
+grava no NFS: ['.teste-netpol', 'eventos-2026-11-03.jsonl', 'eventos-2026-11-04.jsonl']
+$ ssh ubuntu@192.168.122.11 "mount | grep -c 'nfs4.*192.168.122.13'"
+1
+```
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| auditoria → api-contas:8080 | ✅ timeout |
+| transacoes → api-contas:8080/health/live | ✅ 200 (v1 e v2) |
+| Saída para IP não permitido | ✅ bloqueada: metadata, API server, kubelet e NFS |
+| `default-deny` + DNS nos 4 namespaces | ✅ 16 policies; app funcionando (150/150 ciclos) |
+| `ipBlock` com `except` | ✅ 443 externo só para a internet pública (faixas privadas e link-local no `except`), só para a api-transacoes |

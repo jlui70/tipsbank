@@ -1,0 +1,99 @@
+# Etapa 2.5 — NetworkPolicy zero-trust do namespace tipsbank-transacoes (api-transacoes v1 e v2).
+# Mesmo modelo do k8s/contas/networkpolicy.yaml. As policies selecionam app.kubernetes.io/name,
+# que é igual nas duas versões do canary (2.4): v1 e v2 têm exatamente as mesmas permissões.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: tipsbank-transacoes
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: tipsbank-transacoes
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+# api-transacoes recebe só do Ingress Controller (api.tipsbank.local/transacoes e /api/transacoes da SPA).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-transacoes-ingress
+  namespace: tipsbank-transacoes
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: api-transacoes}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: ingress-nginx}}
+      ports:
+        - {protocol: TCP, port: 8080}
+---
+# Saídas internas da api-transacoes: api-contas:8080, auditoria:8080 e postgres-primary:5432.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-transacoes-egress-interno
+  namespace: tipsbank-transacoes
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: api-transacoes}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-contas}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: api-contas}}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-auditoria}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: auditoria}}
+      ports:
+        - {protocol: TCP, port: 8080}
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-contas}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: postgres-primary}}
+      ports:
+        - {protocol: TCP, port: 5432}
+---
+# Passo 4 do manual (Day-17): ipBlock com except.
+# Saída HTTPS externa para provedores de pagamento (ex.: o PIX da v2), MAS só para a internet
+# pública: o except tira do 0.0.0.0/0 todas as faixas privadas e o link-local.
+#   10.0.0.0/8      -> rede de pods (10.244/16) e de Services (10.96/12) do kubeadm
+#   172.16.0.0/12   -> faixa privada (redes internas de datacenter/VPC)
+#   192.168.0.0/16  -> nós e VMs do lab (192.168.122/24: API server, kubelet, etcd, NFS = gerência)
+#                      e a VPC padrão do eksctl no EKS (2.3): a mesma policy vale nos dois clusters
+#   169.254.0.0/16  -> link-local, inclui o metadata da nuvem (169.254.169.254 no EKS)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-transacoes-egress-externo
+  namespace: tipsbank-transacoes
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: api-transacoes}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - {protocol: TCP, port: 443}

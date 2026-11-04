@@ -1,0 +1,45 @@
+# Etapa 2.5 — NetworkPolicy zero-trust do namespace tipsbank-web.
+# Com o Ingress puro (2.1) o web não chama nenhuma API: só recebe do Ingress Controller
+# na porta 8080 e só sai para o DNS (a versão mais simples prevista no manual).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: tipsbank-web
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: tipsbank-web
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-ingress
+  namespace: tipsbank-web
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: web}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: ingress-nginx}}
+      ports:
+        - {protocol: TCP, port: 8080}

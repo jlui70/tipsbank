@@ -1,0 +1,53 @@
+# Etapa 2.5 — NetworkPolicy zero-trust do namespace tipsbank-auditoria.
+# Mesmo modelo do k8s/contas/networkpolicy.yaml.
+#
+# Sobre o NFS (manual: "auditoria -> nfs-server porta 2049"): quem monta o volume NFS é o KUBELET,
+# no namespace de rede do nó, e não o pod. NetworkPolicy só controla o tráfego dos pods, então o
+# mount não passa por aqui, e o pod não precisa (nem deve ter) egress para 192.168.122.13:2049.
+# Prova na EVIDENCIAS 2.5: com estas policies, um pod novo da auditoria monta e grava no NFS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: tipsbank-auditoria
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: tipsbank-auditoria
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+# auditoria recebe do Ingress Controller (leitura de eventos) e da api-transacoes (POST /eventos).
+# Não tem nenhuma saída além do DNS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: auditoria-ingress
+  namespace: tipsbank-auditoria
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: auditoria}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: ingress-nginx}}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-transacoes}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: api-transacoes}}
+      ports:
+        - {protocol: TCP, port: 8080}
