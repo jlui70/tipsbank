@@ -1,0 +1,64 @@
+# Ingress NGINX Controller no cluster kubeadm (etapa 2.1).
+# Chart ingress-nginx 4.15.1 / controller v1.15.1 (última versão: o projeto foi aposentado em 03/2026).
+#
+# Sem LoadBalancer no kubeadm: o controller escuta direto nas portas 80/443 dos workers (hostPort).
+# O "IP do controller" é o IP do worker: 192.168.122.11 ou 192.168.122.12.
+controller:
+  kind: Deployment
+  replicaCount: 2                  # 1 por worker (o control-plane tem taint NoSchedule)
+
+  hostPort:
+    enabled: true
+    ports:
+      http: 80
+      https: 443
+
+  # Com hostPort, dois pods não cabem no mesmo nó (a porta 80 do nó já estaria ocupada).
+  # O padrão (maxSurge 25% / maxUnavailable 25%) com 2 réplicas vira surge 1 / unavailable 0:
+  # o pod novo ficaria Pending para sempre. Aqui o rollout derruba 1 e sobe 1.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+              app.kubernetes.io/component: controller
+
+  # Sem LoadBalancer: Service interno. O tráfego entra pelo hostPort.
+  service:
+    type: ClusterIP
+
+  # O status.address dos Ingress recebe o IP dos nós onde o controller roda
+  # (com publishService ligado ele leria o IP externo do Service, que não existe aqui).
+  publishService:
+    enabled: false
+
+  ingressClassResource:
+    name: nginx
+    enabled: true
+    default: false                 # cada Ingress declara ingressClassName: nginx
+
+  # O webhook de validação precisa de um certificado gerado por 2 Jobs (admission-create/patch).
+  # O desafio proíbe Job (exceto o do Locust) -> webhook desligado, sem Jobs no cluster.
+  admissionWebhooks:
+    enabled: false
+
+  # Compliance: o chart já traz probes e securityContext (runAsUser 101, drop ALL + NET_BIND_SERVICE).
+  # Faltam os limits (compliance #4).
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+commonLabels:
+  app.kubernetes.io/part-of: tipsbank-ingress

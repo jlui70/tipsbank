@@ -26,7 +26,7 @@ spec:
       labels: {app.kubernetes.io/name: web, app.kubernetes.io/part-of: tipsbank, role: frontend}
       annotations:
         # muda quando o nginx.conf muda -> força rollout (o nginx só lê a config no start)
-        tipsbank.io/nginx-conf-sha: "d823515f99de"
+        tipsbank.io/nginx-conf-sha: "414f1bbf64dd"
     spec:
       securityContext:
         runAsNonRoot: true

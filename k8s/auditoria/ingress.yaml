@@ -1,0 +1,50 @@
+# Etapa 2.1 — rotas da auditoria (mesmo padrão do k8s/contas/ingress.yaml).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auditoria
+  namespace: tipsbank-auditoria
+  labels:
+    app.kubernetes.io/name: auditoria
+    app.kubernetes.io/part-of: tipsbank
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.tipsbank.local
+      http:
+        paths:
+          - path: /auditoria(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: auditoria
+                port:
+                  number: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auditoria-spa
+  namespace: tipsbank-auditoria
+  labels:
+    app.kubernetes.io/name: auditoria
+    app.kubernetes.io/part-of: tipsbank
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: app.tipsbank.local
+      http:
+        paths:
+          - path: /api/auditoria(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: auditoria
+                port:
+                  number: 8080

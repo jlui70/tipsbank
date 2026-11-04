@@ -1,0 +1,55 @@
+# Etapa 2.1 — rotas da api-contas. Um Ingress por host, para as anotações da 2.2
+# (ex.: Basic Auth em /contas/admin) valerem só onde devem.
+# O Ingress precisa estar no mesmo namespace do Service; o controller junta os dois hosts.
+#
+# rewrite-target /$2 remove o prefixo: /contas/contas -> /contas na API (mesmo efeito do
+# proxy_pass http://contas/; que o nginx do web fazia na etapa 1.4).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-contas
+  namespace: tipsbank-contas
+  labels:
+    app.kubernetes.io/name: api-contas
+    app.kubernetes.io/part-of: tipsbank
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.tipsbank.local          # acesso direto às APIs (testes fora do frontend)
+      http:
+        paths:
+          - path: /contas(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: api-contas
+                port:
+                  number: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-contas-spa
+  namespace: tipsbank-contas
+  labels:
+    app.kubernetes.io/name: api-contas
+    app.kubernetes.io/part-of: tipsbank
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: app.tipsbank.local          # chamadas da SPA: /api/contas/* (antes feitas pelo proxy do web)
+      http:
+        paths:
+          - path: /api/contas(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: api-contas
+                port:
+                  number: 8080

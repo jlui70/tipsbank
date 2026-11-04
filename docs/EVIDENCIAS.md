@@ -1248,3 +1248,144 @@ Nesta etapa mantive a app original e registrei a limitação, como o manual pede
 | Pods listam os mesmos arquivos | ✅ 3 réplicas em 2 nós (via `python3 os.listdir`: a imagem não tem `ls`) |
 | 100 transferências = soma das linhas | ✅ 100 = 100 (37 + 30 + 33 por réplica) |
 | Armadilha de locking | ⚠️ Conflito observado e documentado: 27/300 perdidos com 10 envios em paralelo |
+
+---
+
+# SEMANA 2 — Exposição e Segurança de Rede
+
+## Etapa 2.1 — Ingress Nginx + múltiplos hosts
+
+**Data**: 2026-11-04 · **Controller**: Ingress NGINX v1.15.1 (chart `ingress-nginx` 4.15.1, Helm v4.3.1) · **Arquivos**: [`infra/ingress-nginx/`](../infra/ingress-nginx/), [`k8s/web/ingress.yaml`](../k8s/web/ingress.yaml), [`k8s/contas/ingress.yaml`](../k8s/contas/ingress.yaml), [`k8s/transacoes/ingress.yaml`](../k8s/transacoes/ingress.yaml), [`k8s/auditoria/ingress.yaml`](../k8s/auditoria/ingress.yaml), [`k8s/web/configmap-nginx.yaml`](../k8s/web/configmap-nginx.yaml)
+
+### Instalação do controller
+
+```bash
+./infra/ingress-nginx/install.sh      # helm upgrade --install ... --version 4.15.1 -f values-kubeadm.yaml
+```
+
+| Decisão (`values-kubeadm.yaml`) | Por quê |
+|---|---|
+| `hostPort` 80/443, 2 réplicas com anti-affinity (1 por worker), Service `ClusterIP` | O kubeadm não tem LoadBalancer. O controller escuta direto na porta 80/443 dos workers, e o "IP do controller" é o IP de um worker |
+| `updateStrategy` `maxSurge: 0` / `maxUnavailable: 1` | Com hostPort, dois pods não cabem no mesmo nó. O padrão (surge 1 / unavailable 0) deixaria o pod novo `Pending` para sempre num rollout |
+| `publishService.enabled: false` | O `ADDRESS` dos Ingress recebe o IP dos nós do controller (com o Service `ClusterIP` ficaria vazio) |
+| `admissionWebhooks.enabled: false` | O webhook de validação depende de 2 `Job` (`admission-create`/`patch`) para gerar o certificado. O desafio proíbe Job (exceto o do Locust). Sem o webhook, um Ingress inválido só aparece no log do controller, e não no `kubectl apply` |
+| `resources.limits` 500m / 256Mi | Compliance #4. Probes e `securityContext` (UID 101, `drop ALL` + `NET_BIND_SERVICE`, `allowPrivilegeEscalation: false`) já vêm no chart |
+| IngressClass `nginx`, `default: false` | Cada Ingress declara `ingressClassName: nginx` explicitamente (passo 4 do manual) |
+
+**Nota sobre a versão:** o projeto ingress-nginx foi **aposentado em março de 2026** (repositório arquivado, sem novas versões nem correções de segurança). A v1.15.1 é a última e foi testada oficialmente até o Kubernetes 1.35. Funciona no cluster 1.36.6 deste lab. Uso o Ingress NGINX porque o manual o exige (as anotações de canary, affinity, rate limit e auth das etapas 2.2 e 2.4 são dele). O sucessor indicado pelo Kubernetes é a Gateway API.
+
+```console
+$ helm list -n ingress-nginx
+NAME          NAMESPACE      REVISION  STATUS    CHART                 APP VERSION
+ingress-nginx ingress-nginx  1         deployed  ingress-nginx-4.15.1  1.15.1
+
+$ kubectl -n ingress-nginx get pods -o wide
+NAME                                        READY   STATUS    RESTARTS   AGE     IP              NODE
+ingress-nginx-controller-685ddd8b68-2k5z6   1/1     Running   0          6m43s   10.244.41.83    tipsbank-w1
+ingress-nginx-controller-685ddd8b68-gdbc6   1/1     Running   0          6m43s   10.244.63.154   tipsbank-w2
+
+$ kubectl get jobs -A
+No resources found
+```
+
+### Decisão: Ingress puro (sem proxy no `web`)
+
+O manual aceita manter o proxy reverso do `nginx.conf` do `web` ou usar Ingress com paths, e indica o Ingress como prática preferida. **Escolhi o Ingress puro:**
+
+- `app.tipsbank.local/` → `svc/web`, que agora só serve os arquivos estáticos da SPA.
+- As chamadas da SPA (`/api/contas/*`, `/api/transacoes/*`, `/api/auditoria/*`) são roteadas pelo Ingress **direto** para cada API. O `proxy_pass` e os `upstream` saíram do `k8s/web/configmap-nginx.yaml` (anotação `tipsbank.io/nginx-conf-sha` atualizada para forçar o rollout).
+- Ganhos: um salto a menos; o `web` não depende mais dos Services das APIs para iniciar (antes, no boot frio, ele caía com `host not found in upstream`); na 2.5, a NetworkPolicy do `tipsbank-web` precisa só de DNS + entrada do controller; e o canary da 2.4 também vale para o tráfego da SPA.
+
+**7 Ingress, um por namespace e por host.** Um Ingress só aponta para Services do próprio namespace. Separar os hosts deixa as anotações da 2.2 (Affinity Cookie e Basic Auth no host `api`, rate limit no `app`) restritas a onde devem valer.
+
+| Namespace | Ingress | Host | Path | Service |
+|---|---|---|---|---|
+| `tipsbank-web` | `web` | `app.tipsbank.local` | `/` (Prefix) | `web:8080` |
+| `tipsbank-contas` | `api-contas` | `api.tipsbank.local` | `/contas(/\|$)(.*)` | `api-contas:8080` |
+| `tipsbank-contas` | `api-contas-spa` | `app.tipsbank.local` | `/api/contas(/\|$)(.*)` | `api-contas:8080` |
+| `tipsbank-transacoes` | `api-transacoes` | `api.tipsbank.local` | `/transacoes(/\|$)(.*)` | `api-transacoes:8080` |
+| `tipsbank-transacoes` | `api-transacoes-spa` | `app.tipsbank.local` | `/api/transacoes(/\|$)(.*)` | `api-transacoes:8080` |
+| `tipsbank-auditoria` | `auditoria` | `api.tipsbank.local` | `/auditoria(/\|$)(.*)` | `auditoria:8080` |
+| `tipsbank-auditoria` | `auditoria-spa` | `app.tipsbank.local` | `/api/auditoria(/\|$)(.*)` | `auditoria:8080` |
+
+Nos Ingress das APIs, `use-regex: "true"` + `rewrite-target: /$2` removem o prefixo: `/contas/contas` chega na API como `/contas`. É o mesmo efeito do `proxy_pass http://contas/;` que o `web` fazia.
+
+### Critério 1 — Ingress com address preenchido
+
+```console
+$ kubectl get ingress -A
+NAMESPACE             NAME                 CLASS   HOSTS                ADDRESS                         PORTS   AGE
+tipsbank-auditoria    auditoria            nginx   api.tipsbank.local   192.168.122.11,192.168.122.12   80      5m29s
+tipsbank-auditoria    auditoria-spa        nginx   app.tipsbank.local   192.168.122.11,192.168.122.12   80      5m29s
+tipsbank-contas       api-contas           nginx   api.tipsbank.local   192.168.122.11,192.168.122.12   80      5m29s
+tipsbank-contas       api-contas-spa       nginx   app.tipsbank.local   192.168.122.11,192.168.122.12   80      5m29s
+tipsbank-transacoes   api-transacoes       nginx   api.tipsbank.local   192.168.122.11,192.168.122.12   80      5m29s
+tipsbank-transacoes   api-transacoes-spa   nginx   app.tipsbank.local   192.168.122.11,192.168.122.12   80      5m29s
+tipsbank-web          web                  nginx   app.tipsbank.local   192.168.122.11,192.168.122.12   80      5m29s
+```
+
+### Critério 2 — `app.tipsbank.local` retorna o HTML da SPA
+
+```console
+$ curl -s -i -H 'Host: app.tipsbank.local' http://192.168.122.11/ | head -3
+HTTP/1.1 200 OK
+Date: Wed, 04 Nov 2026 19:22:14 GMT
+Content-Type: text/html
+
+$ curl -s -H 'Host: app.tipsbank.local' http://192.168.122.11/ | grep -o '<title>.*</title>'
+<title>TipsBank — Internet Banking de Luxo</title>
+```
+
+### Critério 3 — `api.tipsbank.local/contas/contas` lista as contas
+
+```console
+$ curl -s -H 'Host: api.tipsbank.local' http://192.168.122.11/contas/contas | jq -c '[.[] | {titular, saldo}]'
+[{"titular":"Jeferson Fernando","saldo":"9620.00"},{"titular":"LinuxTips SA","saldo":"880.00"}]
+
+$ curl -s -H 'Host: api.tipsbank.local' http://192.168.122.11/transacoes/health/live
+{"status":"ok","version":"v1"}
+$ curl -s -H 'Host: api.tipsbank.local' http://192.168.122.11/auditoria/health/live
+{"status":"ok"}
+$ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: api.tipsbank.local' http://192.168.122.12/contas/contas   # pelo outro worker
+200
+```
+
+A rota da SPA vai direto para a API. No log do controller, o upstream é o Service da `api-contas`, e não o `web`:
+
+```console
+$ curl -s -H 'Host: app.tipsbank.local' http://192.168.122.11/api/contas/contas | jq length
+2
+$ kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller --prefix | grep 'api/contas/contas'
+[pod/ingress-nginx-controller-685ddd8b68-2k5z6/controller] 192.168.122.1 - - [04/Nov/2026:19:17:34 +0000] "GET /api/contas/contas HTTP/1.1" 200 235 "-" "curl/8.5.0" 98 0.012 [tipsbank-contas-api-contas-8080] [] 10.244.63.152:8080 235 0.012 200 ...
+```
+
+### Critério 4 — `/etc/hosts` do laptop
+
+```console
+$ grep tipsbank /etc/hosts
+192.168.122.11 app.tipsbank.local api.tipsbank.local
+
+$ curl -s http://app.tipsbank.local/ | grep -o '<title>.*</title>'
+<title>TipsBank — Internet Banking de Luxo</title>
+$ curl -s http://api.tipsbank.local/contas/contas | jq -c '[.[] | {titular, saldo}]'
+[{"titular":"Jeferson Fernando","saldo":"9620.00"},{"titular":"LinuxTips SA","saldo":"880.00"}]
+$ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://app.tipsbank.local/api/contas/login \
+    -H 'content-type: application/json' -d '{"documento":"12345678901","senha":"giropops"}'
+200
+```
+
+Os dois nomes apontam para o `tipsbank-w1`. O `tipsbank-w2` (192.168.122.12) responde igual e serve de alternativa se o w1 cair.
+
+SPA no navegador em `http://app.tipsbank.local` (resolvido pelo `/etc/hosts`), logada com a conta seed. O saldo (R$ 9.620,00) é o mesmo devolvido pelo `curl` em `api.tipsbank.local/contas/contas`, e todas as chamadas `/api/*` da página passam pelo Ingress:
+
+![SPA via Ingress em app.tipsbank.local](img/2.1-01-ingress.png)
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| `kubectl get ingress -A` com address | ✅ 7 Ingress, `192.168.122.11,192.168.122.12` |
+| `app.tipsbank.local` → HTML da SPA | ✅ HTTP 200, `<title>TipsBank ...` |
+| `api.tipsbank.local/contas/contas` → contas | ✅ 2 contas seed |
+| `/etc/hosts` com as entradas | ✅ `192.168.122.11 app.tipsbank.local api.tipsbank.local` |
+| SPA no navegador pelo nome | ✅ login e dashboard em `app.tipsbank.local` (print) |

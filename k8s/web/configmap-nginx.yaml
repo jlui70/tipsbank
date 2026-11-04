@@ -1,14 +1,14 @@
-# nginx.conf do web com upstreams FQDN inter-namespace (montado em /etc/nginx/nginx.conf).
-# Imagem web:v1.0.0 assinada fica intacta; só a configuração muda.
+# nginx.conf do web (montado em /etc/nginx/nginx.conf). Imagem web:v1.0.0 assinada fica intacta.
+# Etapa 2.1 (Ingress puro): o proxy /api/* saiu daqui. As chamadas da SPA para /api/<serviço>/*
+# são roteadas pelo Ingress NGINX direto para cada API (k8s/<ns>/ingress.yaml, Ingress *-spa).
+# Efeitos: um salto a menos, o web não depende mais dos Services das APIs no start
+# (antes: "host not found in upstream" no boot) e não precisa de egress para elas (NetPol 2.5).
 apiVersion: v1
 data:
   nginx.conf: |
-    # nginx config pro frontend TipsBank.
+    # nginx config pro frontend TipsBank no Kubernetes.
     # - Serve os arquivos estaticos em /
-    # - Faz proxy reverso para as APIs internas em /api/<servico>/*
-    # - Em producao (Kubernetes), o mesmo comportamento pode ser obtido com
-    #   um Ingress separando paths — mas manter o proxy no proprio frontend
-    #   simplifica CORS e locks o contrato com cada upstream.
+    # - /api/* nao chega aqui: o Ingress roteia direto para as APIs
 
     worker_processes auto;
     pid /tmp/nginx.pid;
@@ -30,12 +30,6 @@ data:
       uwsgi_temp_path       /tmp/uwsgi;
       scgi_temp_path        /tmp/scgi;
 
-      # Upstreams — FQDN dos Services (<svc>.<namespace>.svc.cluster.local).
-      # Resolvidos no start do nginx: os Services precisam existir antes do web.
-      upstream contas     { server api-contas.tipsbank-contas.svc.cluster.local:8080; }
-      upstream transacoes { server api-transacoes.tipsbank-transacoes.svc.cluster.local:8080; }
-      upstream auditoria  { server auditoria.tipsbank-auditoria.svc.cluster.local:8080; }
-
       server {
         listen 8080;
         server_name _;
@@ -47,33 +41,6 @@ data:
         location = /healthz {
           access_log off;
           return 200 "ok\n";
-        }
-
-        # API: contas
-        location /api/contas/ {
-          proxy_pass         http://contas/;
-          proxy_http_version 1.1;
-          proxy_set_header   Host $host;
-          proxy_set_header   X-Real-IP $remote_addr;
-          proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-        }
-
-        # API: transacoes
-        location /api/transacoes/ {
-          proxy_pass         http://transacoes/;
-          proxy_http_version 1.1;
-          proxy_set_header   Host $host;
-          proxy_set_header   X-Real-IP $remote_addr;
-          proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-        }
-
-        # API: auditoria
-        location /api/auditoria/ {
-          proxy_pass         http://auditoria/;
-          proxy_http_version 1.1;
-          proxy_set_header   Host $host;
-          proxy_set_header   X-Real-IP $remote_addr;
-          proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
         }
 
         # SPA fallback — qualquer rota que nao achar, volta pro index.html

@@ -1,0 +1,51 @@
+# Etapa 2.1 — rotas da api-transacoes (mesmo padrão do k8s/contas/ingress.yaml).
+# Na 2.2 o Ingress do host api ganha Affinity Cookie; na 2.4 ganha um Ingress canário.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-transacoes
+  namespace: tipsbank-transacoes
+  labels:
+    app.kubernetes.io/name: api-transacoes
+    app.kubernetes.io/part-of: tipsbank
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.tipsbank.local
+      http:
+        paths:
+          - path: /transacoes(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: api-transacoes
+                port:
+                  number: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-transacoes-spa
+  namespace: tipsbank-transacoes
+  labels:
+    app.kubernetes.io/name: api-transacoes
+    app.kubernetes.io/part-of: tipsbank
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: app.tipsbank.local
+      http:
+        paths:
+          - path: /api/transacoes(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: api-transacoes
+                port:
+                  number: 8080

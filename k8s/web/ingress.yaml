@@ -1,0 +1,24 @@
+# Etapa 2.1 — entrada do usuário final: app.tipsbank.local -> SPA (svc/web).
+# Ingress puro: as chamadas /api/<serviço>/* da SPA são roteadas pelo Ingress direto para as APIs
+# (Ingress <api>-spa em cada namespace); o web só serve arquivos estáticos.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  namespace: tipsbank-web
+  labels:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/part-of: tipsbank
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: app.tipsbank.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 8080
