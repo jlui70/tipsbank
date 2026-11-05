@@ -1,0 +1,59 @@
+# Etapa 2.3 — HTTPS com DNS real no EKS: Let's Encrypt via ACME HTTP-01.
+# Nomes (CNAME na zona DNS do devopsproject.com.br, na HostGator, apontando para o NLB):
+#   app.tipsbank.devopsproject.com.br   (SPA)
+#   api.tipsbank.devopsproject.com.br   (APIs)
+#
+# HTTP-01: o Let's Encrypt acessa http://<nome>/.well-known/acme-challenge/<token>. O cert-manager
+# cria um pod "solver" e um Ingress temporário para responder, e os apaga depois da validação.
+# Por isso a porta 80 do NLB precisa estar no ar e o DNS já apontando para ele.
+#
+# Ordem: 1º staging (sem limite apertado, certificado NÃO confiável) para validar o fluxo;
+#        2º trocar o issuerRef do Certificate para letsencrypt-prod (certificado confiável).
+# e-mail da conta ACME: opcional (o Let's Encrypt não envia mais avisos de expiração por e-mail).
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-staging-conta      # chave da conta ACME (criada pelo cert-manager)
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-prod-conta
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx
+---
+# UM certificado com os dois nomes, no namespace do controller, usado como certificado PADRÃO
+# (--default-ssl-certificate no values-eks.yaml). No EKS os Ingress mantêm o bloco tls: sem
+# secretName, e o controller entrega este certificado.
+# Motivo: com 1 certificado por namespace (como no kubeadm) seriam 4 certificados idênticos para
+# app.* e o Let's Encrypt limita a 5 duplicados por semana: uma 2ª tentativa já estouraria.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: tipsbank-tls
+  namespace: ingress-nginx
+spec:
+  secretName: tipsbank-tls
+  dnsNames:
+    - app.tipsbank.devopsproject.com.br
+    - api.tipsbank.devopsproject.com.br
+  issuerRef:
+    name: letsencrypt-staging              # depois de validar: letsencrypt-prod
+    kind: ClusterIssuer
+    group: cert-manager.io

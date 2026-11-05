@@ -1,0 +1,19 @@
+# Etapa 2.3 — volume da auditoria no EKS.
+# O PV NFS da 1.6 (k8s/auditoria/pv-nfs.yaml) aponta para 192.168.122.13, uma VM do lab local que
+# o EKS não alcança: NÃO aplicar o pv-nfs.yaml no EKS. A 2.3 pede "apenas a app e o Ingress", então
+# a auditoria roda aqui com um disco EBS (gp3, ReadWriteOnce) e 1 réplica:
+#   kubectl -n tipsbank-auditoria scale deploy/auditoria --replicas=1
+# RWO = um nó por vez; com 3 réplicas em nós diferentes, as outras ficariam presas em ContainerCreating.
+# O equivalente RWX gerenciado na AWS seria o EFS (driver EFS CSI), fora do escopo desta etapa.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: auditoria-data              # mesmo nome que o Deployment da auditoria usa
+  namespace: tipsbank-auditoria
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+  # sem storageClassName: usa a default (gp3)

@@ -1602,6 +1602,278 @@ Sem o cabeçalho (é o caso das chamadas da SPA), o hash é de uma string vazia,
 | Affinity Cookie em transações | ✅ 10/10 no mesmo pod com o cookie; 5/5 sem |
 | Upstream Hashing documentado | ✅ mesmo `X-Cliente` → mesmo pod; ocorrência do upstream compartilhado registrada |
 
+## Etapa 2.3 — Cluster EKS paralelo
+
+**Data**: 2026-11-05 · **Região**: `us-east-1` · **EKS**: 1.36 (nós `v1.36.5-eks`, Amazon Linux 2023) · **eksctl**: 0.225.0 · **Arquivos**: [`infra/eks/`](../infra/eks/), [`infra/ingress-nginx/values-eks.yaml`](../infra/ingress-nginx/values-eks.yaml)
+
+O mesmo TipsBank do kubeadm (Semana 1 + 2.1 e 2.2) rodou num cluster EKS criado com `eksctl`, ao lado do kubeadm, com um context para cada cluster e HTTPS com DNS real (domínio próprio + Let's Encrypt). Para economizar (passo 7 do manual), a sessão foi única: subir, aplicar, provar e destruir em ~1h30.
+
+### Cluster (passos 1 e 2)
+
+O comando do manual (`eksctl create cluster --name tipsbank --nodes 2 --node-type t3.medium`) foi escrito como arquivo versionado, [`infra/eks/cluster.yaml`](../infra/eks/cluster.yaml), com os ajustes que o TipsBank precisa no EKS:
+
+| Ajuste | Por quê |
+|---|---|
+| `version: "1.36"` | Mesma minor do kubeadm (1.36.6) |
+| `vpc.cidr: 192.168.0.0/16` (padrão do eksctl, explícito) | A NetworkPolicy da 2.5 já tem essa faixa no `except` |
+| `nat.gateway: Single` | 1 NAT Gateway para as subnets privadas (o `HighlyAvailable` cria 1 por AZ e custa 2×) |
+| Add-on `vpc-cni` com `enableNetworkPolicy: "true"` | Sem o agente de NetworkPolicy, o EKS aceita as policies e não aplica nenhuma (como o Flannel, armadilha da 2.5) |
+| Add-ons `aws-ebs-csi-driver` + `eks-pod-identity-agent` | O EKS atual não provisiona disco sem o driver EBS CSI, e a `gp2` que vem no cluster não é default. Permissão IAM do driver via Pod Identity (sem chave fixa) |
+| `disableIMDSv1: true` | Metadata da instância só com token (IMDSv2) |
+| `disablePodIMDS` no padrão (`false`) | De propósito: o "antes" da prova do `169.254.169.254` precisa mostrar o metadata respondendo aos pods |
+
+```console
+$ eksctl create cluster -f infra/eks/cluster.yaml --kubeconfig ~/.kube/tipsbank-eks.kubeconfig
+...
+2026-11-05 08:35:42 [✔]  created 1 managed nodegroup(s) in cluster "tipsbank"
+2026-11-05 08:37:03 [ℹ]  addon "aws-ebs-csi-driver" active
+2026-11-05 08:37:42 [ℹ]  addon "metrics-server" active
+2026-11-05 08:37:45 [✔]  EKS cluster "tipsbank" in "us-east-1" region is ready      # 08:21 → 08:37 (16 min)
+```
+
+**Contexts (passo 3 do manual):** cada cluster tem o seu arquivo, e a variável `KUBECONFIG` junta os dois numa visão só:
+
+```bash
+K=~/.kube/tipsbank-eks.kubeconfig
+kubectl --kubeconfig $K config rename-context "$(kubectl --kubeconfig $K config current-context)" eks-tipsbank
+export KUBECONFIG=~/.kube/tipsbank-eks.kubeconfig:~/.kube/tipsbank-kubeadm.kubeconfig
+```
+
+O `kubeadm-local` é o context renomeado na 2.5. O arquivo do EKS vai **primeiro** na lista: o context ativo vem dele, e nenhum comando grava `current-context` no arquivo do kubeadm. O kubeconfig do EKS não tem certificado de cliente: a cada comando ele roda `aws eks get-token` (com `AWS_PROFILE` gravado no próprio arquivo) e manda um token IAM temporário.
+
+```console
+$ kubectl config get-contexts
+CURRENT   NAME            CLUSTER                        AUTHINFO                                      NAMESPACE
+*         eks-tipsbank    tipsbank.us-east-1.eksctl.io   devops-manager@tipsbank.us-east-1.eksctl.io
+          kubeadm-local   kubernetes                     kubernetes-admin
+
+$ kubectl --context kubeadm-local get nodes
+NAME          STATUS   ROLES           AGE   VERSION
+tipsbank-cp   Ready    control-plane   40h   v1.36.6
+tipsbank-w1   Ready    <none>          40h   v1.36.6
+tipsbank-w2   Ready    <none>          40h   v1.36.6
+
+$ kubectl --context eks-tipsbank get nodes -o wide
+NAME                            STATUS   ROLES    AGE   VERSION               INTERNAL-IP     OS-IMAGE                        CONTAINER-RUNTIME
+ip-192-168-20-85.ec2.internal   Ready    <none>   15m   v1.36.5-eks-6e7947a   192.168.20.85   Amazon Linux 2023.12.20261102   containerd://2.3.7+unknown
+ip-192-168-56-27.ec2.internal   Ready    <none>   15m   v1.36.5-eks-6e7947a   192.168.56.27   Amazon Linux 2023.12.20261102   containerd://2.3.7+unknown
+```
+
+![contexts, nodes do EKS e Ingress com o NLB](img/2.3-01-contexts-nodes-ingress.png)
+
+### Storage, Ingress Controller e cert-manager (passo 4)
+
+```bash
+kubectl apply -f infra/eks/storageclass-gp3.yaml                       # gp3 (EBS CSI) como default
+./infra/ingress-nginx/install.sh infra/ingress-nginx/values-eks.yaml    # mesmo chart 4.15.1 da 2.1
+./infra/cert-manager/install.sh                                         # mesmo da 2.2
+```
+
+| Peça | kubeadm (2.1/2.2) | EKS (`values-eks.yaml`) |
+|---|---|---|
+| Entrada | `hostPort` 80/443 nos workers, Service `ClusterIP` | Service `type: LoadBalancer` → **NLB** (`aws-load-balancer-type: nlb`, cross-zone) |
+| IP do cliente | chega direto no worker | `externalTrafficPolicy: Local`: o NLB entrega no nó que tem o controller e preserva o IP de origem (o rate limit da 2.2 é por IP) |
+| ADDRESS dos Ingress | vazio (`publishService` off) | hostname do NLB (`publishService` padrão) |
+| Certificado | 1 por namespace, CA do lab | **1 certificado padrão** do controller (`--default-ssl-certificate=ingress-nginx/tipsbank-tls`), Let's Encrypt |
+| Admission webhook | off (Jobs) | off (mesmo motivo: o chart cria 2 Jobs) |
+
+```console
+$ kubectl get storageclass
+NAME            PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION
+gp2             kubernetes.io/aws-ebs   Delete          WaitForFirstConsumer   false
+gp3 (default)   ebs.csi.aws.com         Delete          WaitForFirstConsumer   true
+
+$ kubectl -n ingress-nginx get svc
+NAME                       TYPE           CLUSTER-IP       EXTERNAL-IP                                                                     PORT(S)
+ingress-nginx-controller   LoadBalancer   10.100.110.234   ac03c26f51d984c3c9d39140ae837f68-1707e78d2ef5cab5.elb.us-east-1.amazonaws.com   80:31105/TCP,443:31639/TCP
+```
+
+![NLB criado pelo Service LoadBalancer](img/2.3-07-console-nlb.png)
+
+### App (passo 5)
+
+Os mesmos manifests do kubeadm, aplicados arquivo por arquivo (um `kubectl apply -R -f k8s/` levaria junto o `pv-nfs.yaml`, que aponta para a VM NFS do lab, inalcançável da AWS). Secrets: os mesmos arquivos gerados localmente na 1.4 e na 2.2, fora do Git. Duas diferenças:
+
+- **Auditoria:** [`infra/eks/auditoria-pvc.yaml`](../infra/eks/auditoria-pvc.yaml) cria o PVC `auditoria-data` em EBS `gp3` (`ReadWriteOnce`) e a auditoria roda com **1 réplica**. O RWX equivalente na AWS seria o EFS, fora do escopo ("apenas a app e o Ingress"). Os `fsGroup` 70 (Postgres) e 65532 (auditoria) da 1.4/1.6 dão a posse do disco novo, e o `PGDATA` em subdiretório evita o `lost+found` do ext4.
+- **Ingress:** [`infra/eks/ingress-eks.sh`](../infra/eks/ingress-eks.sh) gera os 8 Ingress a partir dos `k8s/*/ingress.yaml` (troca `*.tipsbank.local` por `*.tipsbank.devopsproject.com.br`, tira a anotação da CA do lab e o `secretName`). Ele se recusa a rodar fora do context `eks-tipsbank`.
+
+```console
+$ kubectl get pods -A -o wide | grep tipsbank
+tipsbank-auditoria    auditoria-5b5d94954b-6hndc        1/1   Running   0   9m14s   192.168.42.121   ip-192-168-56-27.ec2.internal
+tipsbank-contas       api-contas-f48dbdf6-8tvlx         1/1   Running   0   9m20s   192.168.8.37     ip-192-168-20-85.ec2.internal
+tipsbank-contas       api-contas-f48dbdf6-d957j         1/1   Running   0   9m20s   192.168.34.99    ip-192-168-56-27.ec2.internal
+tipsbank-contas       postgres-primary-0                1/1   Running   0   10m     192.168.25.75    ip-192-168-20-85.ec2.internal
+tipsbank-transacoes   api-transacoes-68d8d7fb4c-8f9wv   2/2   Running   0   9m5s    192.168.33.226   ip-192-168-56-27.ec2.internal
+tipsbank-transacoes   api-transacoes-68d8d7fb4c-gfgxh   2/2   Running   0   9m5s    192.168.11.210   ip-192-168-20-85.ec2.internal
+tipsbank-web          web-fb74f8dbc-czbhz               1/1   Running   0   9m      192.168.47.165   ip-192-168-56-27.ec2.internal
+tipsbank-web          web-fb74f8dbc-nflth               1/1   Running   0   9m      192.168.8.178    ip-192-168-20-85.ec2.internal
+
+$ kubectl get pvc -A
+NAMESPACE            NAME                      STATUS   CAPACITY   ACCESS MODES   STORAGECLASS
+tipsbank-auditoria   auditoria-data            Bound    1Gi        RWO            gp3
+tipsbank-contas      data-postgres-primary-0   Bound    2Gi        RWO            gp3
+
+$ kubectl get ingress -A
+NAMESPACE             NAME                 CLASS   HOSTS                               ADDRESS                                                                         PORTS
+tipsbank-auditoria    auditoria            nginx   api.tipsbank.devopsproject.com.br   ac03c26f51d984c3c9d39140ae837f68-1707e78d2ef5cab5.elb.us-east-1.amazonaws.com   80, 443
+tipsbank-auditoria    auditoria-spa        nginx   app.tipsbank.devopsproject.com.br   ac03c26f51d984c3c9d39140ae837f68-1707e78d2ef5cab5.elb.us-east-1.amazonaws.com   80, 443
+tipsbank-contas       api-contas           nginx   api.tipsbank.devopsproject.com.br   ac03c26f51d984c3c9d39140ae837f68-1707e78d2ef5cab5.elb.us-east-1.amazonaws.com   80, 443
+tipsbank-contas       api-contas-admin     nginx   api.tipsbank.devopsproject.com.br   ac03c26f51d984c3c9d39140ae837f68-1707e78d2ef5cab5.elb.us-east-1.amazonaws.com   80, 443
+tipsbank-contas       api-contas-spa       nginx   app.tipsbank.devopsproject.com.br   ac03c26f51d984c3c9d39140ae837f68-1707e78d2ef5cab5.elb.us-east-1.amazonaws.com   80, 443
+tipsbank-transacoes   api-transacoes       nginx   api.tipsbank.devopsproject.com.br   ac03c26f51d984c3c9d39140ae837f68-1707e78d2ef5cab5.elb.us-east-1.amazonaws.com   80, 443
+tipsbank-transacoes   api-transacoes-spa   nginx   app.tipsbank.devopsproject.com.br   ac03c26f51d984c3c9d39140ae837f68-1707e78d2ef5cab5.elb.us-east-1.amazonaws.com   80, 443
+tipsbank-web          web                  nginx   app.tipsbank.devopsproject.com.br   ac03c26f51d984c3c9d39140ae837f68-1707e78d2ef5cab5.elb.us-east-1.amazonaws.com   80, 443
+```
+
+Os pods recebem IPs da própria VPC (`192.168.x.x`), não de um pod CIDR separado: é o VPC CNI.
+
+![console do EKS: cluster Active, 27 pods e 2 nodes](img/2.3-04-console-eks-cluster.png)
+![console do EKS: pods](img/2.3-05-console-eks-pods.png)
+![console do EKS: nodes](img/2.3-06-console-eks-nodes.png)
+
+**Console do EKS sem pods e nodes:** no primeiro acesso, o console mostrou "Data unavailable" em Pods e Nodes ([print](img/2.3-08-console-sem-access-entry.png)). O console consulta a API do **Kubernetes** com a identidade de quem está logado no navegador (o root da conta), e só o criador do cluster (`devops-manager`, usado pelo CLI) tinha **access entry**. Resolvido com uma access entry só leitura para o root (`AmazonEKSAdminViewPolicy`, escopo cluster): o IAM autentica, a access entry autoriza dentro do cluster.
+
+### HTTPS com DNS real (passo 6)
+
+Domínio próprio `devopsproject.com.br`, DNS na HostGator. Dois **CNAME** (TTL 300) apontam para o **hostname** do NLB: os IPs de um NLB podem mudar, o nome não.
+
+| Nome | Tipo | Aponta para |
+|---|---|---|
+| `app.tipsbank.devopsproject.com.br` | CNAME | `ac03c26f…-1707e78d2ef5cab5.elb.us-east-1.amazonaws.com` |
+| `api.tipsbank.devopsproject.com.br` | CNAME | idem |
+
+Certificado: [`infra/eks/letsencrypt.yaml`](../infra/eks/letsencrypt.yaml), ClusterIssuers `letsencrypt-staging` e `letsencrypt-prod` (ACME **HTTP-01**, solver pelo Ingress `nginx`) e **um** `Certificate` com os 2 nomes no namespace `ingress-nginx`, usado como certificado padrão do controller. Com 1 certificado por namespace (como no kubeadm), seriam 4 certificados idênticos para `app.*`, e o Let's Encrypt limita a 5 duplicados por semana. Primeiro **staging** (limites folgados, certificado não confiável) para validar o fluxo; depois **produção**.
+
+```console
+$ kubectl apply -f infra/eks/letsencrypt.yaml          # staging
+$ kubectl -n ingress-nginx get certificate,order
+NAME                                       READY   SECRET         AGE
+certificate.cert-manager.io/tipsbank-tls   True    tipsbank-tls   33s
+NAME                                                   STATE   AGE
+order.acme.cert-manager.io/tipsbank-tls-1-2721828999   valid   33s
+issuer=C = US, O = Let's Encrypt, CN = (STAGING) Ersatz Emmer YR2     # curl sem -k: exit 60 (não confiável, esperado)
+
+$ kubectl -n ingress-nginx patch certificate tipsbank-tls --type merge -p '{"spec":{"issuerRef":{"name":"letsencrypt-prod"}}}'
+$ kubectl -n ingress-nginx delete secret tipsbank-tls   # força a emissão nova
+$ kubectl -n ingress-nginx get certificate,order
+certificate.cert-manager.io/tipsbank-tls   True    tipsbank-tls   91s
+order.acme.cert-manager.io/tipsbank-tls-2-1484984183   valid   33s
+
+$ dig +noall +answer app.tipsbank.devopsproject.com.br @8.8.8.8
+app.tipsbank.devopsproject.com.br. 300 IN CNAME ac03c26f51d984c3c9d39140ae837f68-1707e78d2ef5cab5.elb.us-east-1.amazonaws.com.
+ac03c26f51d984c3c9d39140ae837f68-1707e78d2ef5cab5.elb.us-east-1.amazonaws.com. 60 IN A 34.198.179.128
+ac03c26f51d984c3c9d39140ae837f68-1707e78d2ef5cab5.elb.us-east-1.amazonaws.com. 60 IN A 18.211.3.171
+
+$ curl -s -o /dev/null -w '%{http_code} ssl_verify=%{ssl_verify_result}\n' https://app.tipsbank.devopsproject.com.br/       # SEM -k
+200 ssl_verify=0
+$ curl -s -o /dev/null -w '%{http_code} ssl_verify=%{ssl_verify_result}\n' https://api.tipsbank.devopsproject.com.br/contas/contas
+200 ssl_verify=0
+$ curl -s -o /dev/null -w '%{http_code}\n' https://api.tipsbank.devopsproject.com.br/contas/admin/      # Basic Auth da 2.2
+401
+$ curl -sI http://app.tipsbank.devopsproject.com.br/ | grep -iE '^(HTTP|location)'
+HTTP/1.1 308 Permanent Redirect
+Location: https://app.tipsbank.devopsproject.com.br
+$ curl -sI https://app.tipsbank.devopsproject.com.br/ | grep -i strict
+strict-transport-security: max-age=31536000; includeSubDomains
+
+$ echo | openssl s_client -connect app.tipsbank.devopsproject.com.br:443 -servername app.tipsbank.devopsproject.com.br 2>/dev/null \
+    | openssl x509 -noout -subject -issuer -ext subjectAltName -dates
+subject=CN = app.tipsbank.devopsproject.com.br
+issuer=C = US, O = Let's Encrypt, CN = YR2
+X509v3 Subject Alternative Name:
+    DNS:api.tipsbank.devopsproject.com.br, DNS:app.tipsbank.devopsproject.com.br
+notBefore=Nov  5 10:49:25 2026 GMT
+notAfter=Feb  3 10:49:24 2027 GMT
+```
+
+Transferência de ponta a ponta pela API pública, com as NetworkPolicies ativas (ver complemento na 2.5):
+
+```console
+$ curl -s -X POST https://api.tipsbank.devopsproject.com.br/transacoes/transferencias -H 'Content-Type: application/json' \
+    -d '{"origem_id":"11111111-1111-1111-1111-111111111111","destino_id":"22222222-2222-2222-2222-222222222222","valor":"10.00"}'
+{"id":"0f6362bb-0463-4f5a-a7e1-ed24f300285e",...,"valor":"10.00","status":"concluida"}       # HTTP 201
+$ curl -s https://api.tipsbank.devopsproject.com.br/contas/contas | jq -c '.[] | {titular, saldo}'
+{"titular":"Jeferson Fernando","saldo":"9990.00"}
+{"titular":"LinuxTips SA","saldo":"510.00"}
+# evento gravado pela auditoria no disco EBS (/data/eventos-2026-11-05.jsonl):
+{"tipo": "transferencia", "transacao_id": "0f6362bb-0463-4f5a-a7e1-ed24f300285e", "valor": "10.00", "versao_app": "v1", ...}
+```
+
+![SPA em https://app.tipsbank.devopsproject.com.br com certificado Let's Encrypt](img/2.3-02-app-https-letsencrypt.png)
+![API em https://api.tipsbank.devopsproject.com.br/contas/contas](img/2.3-03-api-https.png)
+
+### Infra criada na AWS
+
+O `eksctl` cria tudo via **CloudFormation** (stacks `eksctl-tipsbank-cluster`, `eksctl-tipsbank-nodegroup-ng-tipsbank` e a da role do add-on EBS CSI). O que ficou de pé durante a sessão:
+
+| Recurso | O quê | Para que serve no TipsBank |
+|---|---|---|
+| VPC `eksctl-tipsbank-cluster/VPC` | `192.168.0.0/16`, ao lado da VPC default (`172.31.0.0/16`) | Rede do cluster: nós **e pods** (VPC CNI) recebem IP daqui |
+| 4 subnets em 2 AZs (`us-east-1b`, `us-east-1c`) | 1 pública + 1 privada por AZ | Públicas: NLB e NAT. Privadas: disponíveis para nós sem IP público. Neste cluster, os nós ficaram nas públicas (padrão do eksctl sem `privateNetworking`) |
+| Internet Gateway + NAT Gateway (1, `Single`) | Saída para a internet | IGW para as subnets públicas, NAT para as privadas |
+| 4 route tables | a principal (sem uso), 1 pública e 1 privada por AZ | Rota `0.0.0.0/0` → IGW (públicas) ou → NAT (privadas) |
+| Control plane EKS | gerenciado pela AWS, fora da VPC do usuário | API server + etcd; chega nos nós por ENIs dentro das subnets |
+| 2 EC2 `t3.medium` (`tipsbank-ng-tipsbank-Node`) | managed node group, 1 por AZ, AL2023 | Os 2 workers (`kubectl get nodes`) |
+| 2 volumes EBS gp3 20 GiB | disco raiz de cada nó | Sistema e imagens. Os PVCs (`gp3` 2 Gi do Postgres e 1 Gi da auditoria) existiram só enquanto os namespaces existiram: no print, das 09:33, eles já tinham sido apagados (`reclaimPolicy: Delete`) |
+| NLB | criado pelo Service `LoadBalancer` do ingress-nginx | Entrada HTTP/HTTPS, alvo dos CNAMEs |
+| IAM | role do cluster, role dos nós, role do EBS CSI (Pod Identity), access entries | Quem pode fazer o quê, na AWS e dentro do cluster |
+
+![EC2: os 2 nós t3.medium, um por AZ](img/2.3-09-console-ec2-nodes.png)
+![EBS: discos raiz dos nós (PVCs já removidos)](img/2.3-10-console-ebs-volumes.png)
+![VPC: resource map com subnets, route tables, IGW e NAT](img/2.3-11-console-vpc-resource-map.png)
+
+### Destruição (passo 7)
+
+Na ordem: primeiro o Ingress Controller (apaga o NLB; se ele ficasse, o `eksctl delete` travaria na VPC), depois os namespaces (PVCs → discos EBS, `reclaimPolicy: Delete`), depois o cluster. No fim, os 2 CNAMEs foram apagados na HostGator: um CNAME apontando para um NLB que não existe mais é *dangling DNS* (quem conseguir um recurso com aquele nome passa a responder pelo subdomínio).
+
+```console
+$ helm uninstall ingress-nginx -n ingress-nginx --wait          # 1. NLB
+release "ingress-nginx" uninstalled
+$ kubectl delete namespace tipsbank-contas tipsbank-transacoes tipsbank-auditoria tipsbank-web   # 2. PVCs -> EBS
+$ kubectl get pv
+No resources found
+$ eksctl delete cluster -f infra/eks/cluster.yaml --wait          # 3. 09:31 -> 09:42 (11 min)
+2026-11-05 09:42:45 [✔]  all cluster resources were deleted
+
+# conferência de sobras (us-east-1): tudo vazio, só a VPC default
+eks clusters:        (nenhum)
+load balancers:      (nenhum)    # NLB e classic
+instâncias EC2:      (nenhuma)
+volumes EBS:         (nenhum)
+NAT Gateways:        (nenhum)
+Elastic IPs:         (nenhum)
+snapshots:           (nenhum)
+stacks CloudFormation *tipsbank*: (nenhuma)
+VPCs:                vpc-0dc71e6762068e32b 172.31.0.0/16   # a default da conta
+
+$ dig +short app.tipsbank.devopsproject.com.br @ns1090.hostgator.com.br    # CNAMEs apagados
+$ dig +short api.tipsbank.devopsproject.com.br @ns1090.hostgator.com.br
+```
+
+Sessão inteira: cluster de pé das 08:37 às 09:42 (~1h05), mais ~16 min de criação e ~11 min de remoção.
+
+### kubeadm × EKS
+
+| Peça | kubeadm (lab) | EKS |
+|---|---|---|
+| Control plane | VM `tipsbank-cp`, mantida por mim | gerenciado pela AWS (US$ 0,10/h) |
+| CNI | Calico, pod CIDR `10.244.0.0/16` | VPC CNI: pods com IP da VPC (`192.168.0.0/16`); NetworkPolicy pelo `aws-network-policy-agent` |
+| Pods por nó | sem limite prático | 17 por t3.medium (IPs das ENIs) |
+| Entrada | `hostPort` 80/443 nos workers | Service `LoadBalancer` → NLB |
+| StorageClass | `local-path` (disco do nó) | `gp3` via EBS CSI (disco de rede, preso a uma AZ) |
+| Volume RWX | NFS em VM | EFS (não usado: auditoria com 1 réplica RWO) |
+| TLS | CA do lab (cert-manager), 1 certificado por namespace | Let's Encrypt HTTP-01, 1 certificado padrão do controller |
+| Metadata | não existe | `169.254.169.254` com credenciais IAM do nó: bloqueado pela NetworkPolicy |
+| Acesso ao cluster | certificado X.509 do `admin.conf` | token IAM (`aws eks get-token`) + access entries |
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| `kubectl config get-contexts` mostra dois contexts funcionando | ✅ `kubeadm-local` (3 nós) e `eks-tipsbank` (2 nós) |
+| `kubectl --context eks-tipsbank get nodes` retorna os nodes do EKS | ✅ 2 × t3.medium `Ready`, v1.36.5-eks |
+| O TipsBank está acessível via HTTPS com DNS real | ✅ `https://app.tipsbank.devopsproject.com.br` e `https://api.tipsbank.devopsproject.com.br`, Let's Encrypt produção, 200 sem `-k` |
+
 ## Etapa 2.4 — Canary de transações
 
 **Data**: 2026-11-04 · **Imagem v2**: `ghcr.io/jlui70/tipsbank-api-transacoes:v2.0.0@sha256:b67d2d2726893029ea6fcefc520f4e0ae04b047d531b6da209cd94c3506a01a7` · **Arquivos**: [`apps/api-transacoes/`](../apps/api-transacoes/), [`k8s/transacoes/api-transacoes.yaml`](../k8s/transacoes/api-transacoes.yaml), [`k8s/transacoes/api-transacoes-v2.yaml`](../k8s/transacoes/api-transacoes-v2.yaml), [`k8s/transacoes/ingress-canary.yaml`](../k8s/transacoes/ingress-canary.yaml)
@@ -1899,6 +2171,31 @@ $ ssh ubuntu@192.168.122.11 "mount | grep -c 'nfs4.*192.168.122.13'"
 1
 ```
 
+### Complemento no EKS (2026-11-05): o `169.254.169.254` de verdade
+
+No kubeadm não existe metadata, então o bloqueio acima só mostra timeout. No EKS (2.3) o metadata da instância existe e entrega credenciais temporárias da IAM role do nó. As mesmas 16 policies, sem nenhuma alteração, foram aplicadas no EKS com o VPC CNI e o agente de NetworkPolicy ligado (`enableNetworkPolicy: "true"`, container `aws-eks-nodeagent` no DaemonSet `aws-node`):
+
+```console
+$ kubectl -n kube-system get ds aws-node -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{" "}{.image}{"\n"}{end}'
+aws-node 602401143452.dkr.ecr.us-east-1.amazonaws.com/amazon-k8s-cni:v1.22.4-eksbuild.10
+aws-eks-nodeagent 602401143452.dkr.ecr.us-east-1.amazonaws.com/amazon/aws-network-policy-agent:v1.4.0-eksbuild.1
+
+# PUT /latest/api/token (IMDSv2) de dentro do pod api-transacoes, via python3 (Distroless sem curl)
+ANTES:  METADATA RESPONDEU: token de 56 bytes
+$ kubectl apply -f k8s/contas/networkpolicy.yaml -f k8s/transacoes/networkpolicy.yaml -f k8s/auditoria/networkpolicy.yaml -f k8s/web/networkpolicy.yaml
+DEPOIS: BLOQUEADO <urlopen error timed out>
+
+$ kubectl get networkpolicy -A --no-headers | wc -l
+16
+# app continua funcionando: SPA, as 3 APIs e uma transferência e2e (201) pelo Ingress
+200 https://app.tipsbank.devopsproject.com.br/
+200 https://api.tipsbank.devopsproject.com.br/contas/contas
+200 https://api.tipsbank.devopsproject.com.br/transacoes/health/ready
+200 https://api.tipsbank.devopsproject.com.br/auditoria/health/ready
+```
+
+Sem a policy, um pod comprometido conseguiria pegar as credenciais do nó (a role dos nós tem, por exemplo, leitura do ECR e as permissões do VPC CNI para criar e alterar interfaces de rede na VPC) e agir na AWS com elas. O `except` com `169.254.0.0/16` fecha esse caminho, e o `except` com `192.168.0.0/16` (a VPC) faz a regra de saída 443 externa não incluir o endpoint privado do API server.
+
 ### Resultado
 
 | Critério | Status |
@@ -1906,5 +2203,6 @@ $ ssh ubuntu@192.168.122.11 "mount | grep -c 'nfs4.*192.168.122.13'"
 | auditoria → api-contas:8080 | ✅ timeout |
 | transacoes → api-contas:8080/health/live | ✅ 200 (v1 e v2) |
 | Saída para IP não permitido | ✅ bloqueada: metadata, API server, kubelet e NFS |
+| Saída para `169.254.169.254` no EKS (complemento, 2026-11-05) | ✅ antes: token IMDSv2 de 56 bytes; depois: timeout. App 200 e transferência 201 |
 | `default-deny` + DNS nos 4 namespaces | ✅ 16 policies; app funcionando (150/150 ciclos) |
 | `ipBlock` com `except` | ✅ 443 externo só para a internet pública (faixas privadas e link-local no `except`), só para a api-transacoes |

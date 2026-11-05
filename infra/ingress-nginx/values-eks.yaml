@@ -1,0 +1,59 @@
+# Ingress NGINX Controller no EKS (etapa 2.3). Mesmo chart/versão do kubeadm (4.15.1).
+# Uso: ./infra/ingress-nginx/install.sh infra/ingress-nginx/values-eks.yaml
+#
+# Diferença principal para o values-kubeadm.yaml: na nuvem existe LoadBalancer. O Service
+# type: LoadBalancer faz a AWS criar um NLB, e o "IP do controller" vira o hostname do NLB.
+controller:
+  kind: Deployment
+  replicaCount: 2
+
+  service:
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: nlb
+      service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    # Local = o NLB entrega direto no nó que tem o controller e preserva o IP do cliente.
+    # Sem isso o rate limit da 2.2 (por IP de cliente) veria o IP dos nós, e não o do usuário.
+    externalTrafficPolicy: Local
+
+  # publishService (padrão: true): o ADDRESS dos Ingress recebe o hostname do NLB.
+
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: ingress-nginx
+                app.kubernetes.io/component: controller
+
+  # Certificado padrão: o do Let's Encrypt (infra/eks/letsencrypt.yaml). Os Ingress no EKS têm
+  # tls: sem secretName, e o controller usa este. Até o Secret existir, ele usa um autoassinado.
+  extraArgs:
+    default-ssl-certificate: ingress-nginx/tipsbank-tls
+
+  config:
+    limit-req-status-code: "429"
+    limit-conn-status-code: "429"
+
+  ingressClassResource:
+    name: nginx
+    enabled: true
+    default: false
+
+  # Mesmo motivo do kubeadm: o webhook depende de 2 Jobs (proibidos no desafio).
+  admissionWebhooks:
+    enabled: false
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+commonLabels:
+  app.kubernetes.io/part-of: tipsbank-ingress

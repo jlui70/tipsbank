@@ -1,0 +1,16 @@
+# Etapa 2.3 — StorageClass default no EKS (disco EBS gp3 via driver EBS CSI).
+# Faz o papel do local-path do kubeadm (1.4): o PVC do Postgres não define storageClassName
+# e usa a classe default. Sem uma classe default, o PVC fica Pending para sempre.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer   # o disco nasce na AZ do nó onde o pod foi agendado
+reclaimPolicy: Delete                     # apagar o PVC apaga o disco (sem custo esquecido)
+allowVolumeExpansion: true
+parameters:
+  type: gp3
+  encrypted: "true"

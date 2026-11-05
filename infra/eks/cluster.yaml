@@ -1,0 +1,48 @@
+# Etapa 2.3 — cluster EKS paralelo (eksctl). Equivale ao comando do manual
+#   eksctl create cluster --name tipsbank --nodes 2 --node-type t3.medium
+# em arquivo versionado, com os ajustes que o TipsBank precisa no EKS.
+#
+# Criar:   eksctl create cluster -f infra/eks/cluster.yaml --kubeconfig ~/.kube/tipsbank-eks.kubeconfig
+# Apagar:  ver roteiros/2.3 (apagar ANTES o Ingress Controller, senão o NLB fica órfão)
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: tipsbank
+  region: us-east-1
+  version: "1.36"            # mesma minor do kubeadm (1.36.6); conferir: eksctl utils describe-cluster-versions --region us-east-1
+  tags:
+    projeto: tipsbank
+    etapa: "2.3"
+
+vpc:
+  cidr: 192.168.0.0/16       # padrão do eksctl, explícito: a NetworkPolicy da 2.5 tem 192.168.0.0/16 no except
+  nat:
+    gateway: Single          # 1 NAT Gateway (o mais barato; HighlyAvailable cria 1 por AZ)
+
+addons:
+  # VPC CNI com o agente de NetworkPolicy ligado (complemento da 2.5 no EKS).
+  # Sem isto, as NetworkPolicies são aceitas e não fazem nada (como no Flannel).
+  - name: vpc-cni
+    configurationValues: '{"enableNetworkPolicy": "true"}'
+  - name: coredns
+  - name: kube-proxy
+  # PVC do Postgres: o EKS atual não tem provisionador de disco sem o driver EBS CSI
+  # (e a StorageClass gp2 que vem no cluster não é mais default). Ver storageclass-gp3.yaml.
+  - name: eks-pod-identity-agent
+  - name: aws-ebs-csi-driver
+    useDefaultPodIdentityAssociations: true   # permissão IAM do driver via Pod Identity
+
+managedNodeGroups:
+  - name: ng-tipsbank
+    instanceType: t3.medium  # 2 vCPU / 4 GiB; no máximo 17 pods por nó com o VPC CNI
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 2
+    volumeSize: 20
+    disableIMDSv1: true      # metadata só com token (IMDSv2)
+    # disablePodIMDS fica no padrão (false): os pods ALCANÇAM o metadata (169.254.169.254).
+    # É de propósito: o "antes" da prova da 2.5 precisa mostrar o metadata respondendo,
+    # e o "depois" mostra a NetworkPolicy bloqueando.
+    labels:
+      tipsbank.io/cluster: eks
