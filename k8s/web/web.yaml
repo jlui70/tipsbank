@@ -18,7 +18,7 @@ metadata:
   namespace: tipsbank-web
   labels: {app.kubernetes.io/name: web, app.kubernetes.io/part-of: tipsbank, role: frontend}
 spec:
-  replicas: 2
+  # replicas: definido pelo HPA (hpa.yaml, etapa 3.7). Não volte a fixar aqui.
   selector:
     matchLabels: {app.kubernetes.io/name: web}
   template:

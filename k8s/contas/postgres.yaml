@@ -46,6 +46,9 @@ spec:
       containers:
         - name: postgres
           image: postgres:16-alpine
+          # 3.7: 150 conexões (padrão: 100). O HPA multiplica os pools das APIs; a conta está nos
+          # configmap-app.yaml. Na réplica (hot standby) o valor precisa ser >= ao do primary.
+          args: ["-c", "max_connections=150"]
           ports:
             - {name: postgres, containerPort: 5432}
           env:

@@ -30,3 +30,11 @@ kind: Namespace
 metadata:
   name: tipsbank-monitoring
   labels: {app.kubernetes.io/part-of: tipsbank, tipsbank.io/area: monitoring}
+---
+# Etapa 3.7: gerador de carga (Locust). Fica fora dos namespaces das APIs: o tráfego de teste entra
+# pela rede como o de um cliente e é liberado explicitamente nas NetworkPolicies.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tipsbank-loadtest
+  labels: {app.kubernetes.io/part-of: tipsbank, tipsbank.io/area: loadtest}

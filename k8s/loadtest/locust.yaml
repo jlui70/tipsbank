@@ -1,0 +1,93 @@
+# Etapa 3.7 — Locust (gerador de carga) como Deployment, com a UI em https://locust.tipsbank.local.
+# O teste é disparado pela UI (200 usuários, 20/s, 5 min); a carga vai DIRETO no Service da
+# api-transacoes (http://api-transacoes.tipsbank-transacoes:8080, como pede o manual), sem passar pelo
+# Ingress. As contas de cada usuário virtual são criadas na api-contas (CONTAS_URL).
+# Imagem: locust/Dockerfile (base oficial 2.31.3 fixada por digest + locustfile corrigido).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: locust
+  namespace: tipsbank-loadtest
+  labels: {app.kubernetes.io/name: locust, app.kubernetes.io/part-of: tipsbank}
+spec:
+  replicas: 1                     # modo standalone (master e worker no mesmo processo): 200 usuários cabem
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels: {app.kubernetes.io/name: locust}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: locust, app.kubernetes.io/part-of: tipsbank}
+    spec:
+      automountServiceAccountToken: false     # o Locust não fala com a API do Kubernetes
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: locust
+          image: ghcr.io/jlui70/tipsbank-locust:v1.0.0@sha256:c8d86e15ea84482902844a6c247aa11ae5ee93de5755fe84da486f06781d330c
+          env:
+            - {name: LOCUST_HOST, value: "http://api-transacoes.tipsbank-transacoes:8080"}
+            - {name: CONTAS_URL, value: "http://api-contas.tipsbank-contas:8080"}
+          ports:
+            - {name: web, containerPort: 8089}
+          readinessProbe:
+            httpGet: {path: /, port: web}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /, port: web}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: locust
+  namespace: tipsbank-loadtest
+  labels: {app.kubernetes.io/name: locust, app.kubernetes.io/part-of: tipsbank}
+spec:
+  selector: {app.kubernetes.io/name: locust}
+  ports:
+    - {name: web, port: 8089, targetPort: web}
+---
+# UI pelo Ingress com TLS (CA do lab) e Basic Auth: quem acessa a UI dispara carga no banco.
+# Secret loadtest-basic-auth: infra/monitoring/gerar-secrets.sh (mesma senha das UIs de monitoramento).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: locust
+  namespace: tipsbank-loadtest
+  labels: {app.kubernetes.io/name: locust, app.kubernetes.io/part-of: tipsbank}
+  annotations:
+    cert-manager.io/cluster-issuer: tipsbank-ca
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: loadtest-basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "TipsBank - teste de carga"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [locust.tipsbank.local]
+      secretName: locust-tipsbank-tls
+  rules:
+    - host: locust.tipsbank.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: locust
+                port: {number: 8089}

@@ -44,6 +44,8 @@ spec:
           podSelector: {matchLabels: {app.kubernetes.io/name: ingress-nginx}}
         - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-monitoring}}   # 3.5: scrape de /metrics
           podSelector: {matchLabels: {app.kubernetes.io/name: prometheus}}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-loadtest}}     # 3.7: Locust
+          podSelector: {matchLabels: {app.kubernetes.io/name: locust}}
       ports:
         - {protocol: TCP, port: 8080}
 ---

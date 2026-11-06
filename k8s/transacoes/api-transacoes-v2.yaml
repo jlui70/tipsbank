@@ -40,7 +40,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: app
-          image: ghcr.io/jlui70/tipsbank-api-transacoes:v2.0.0@sha256:b67d2d2726893029ea6fcefc520f4e0ae04b047d531b6da209cd94c3506a01a7
+          image: ghcr.io/jlui70/tipsbank-api-transacoes:v2.2.0@sha256:b0d43d2056718a35488c544f7dd96c988a991e4ce8d040ac13f4d1247a36d5ed
           args: [--log-config, /etc/app/log-config.json]
           ports:
             - {name: http, containerPort: 8080}
@@ -53,6 +53,10 @@ spec:
               valueFrom: {configMapKeyRef: {name: transacoes-config, key: AUDITORIA_URL}}
             - name: LOG_LEVEL
               valueFrom: {configMapKeyRef: {name: transacoes-config, key: LOG_LEVEL}}
+            - name: DB_POOL_SIZE
+              valueFrom: {configMapKeyRef: {name: transacoes-config, key: DB_POOL_SIZE}}
+            - name: DB_MAX_OVERFLOW
+              valueFrom: {configMapKeyRef: {name: transacoes-config, key: DB_MAX_OVERFLOW}}
           securityContext:
             runAsUser: 65532
             allowPrivilegeEscalation: false
@@ -65,12 +69,19 @@ spec:
             httpGet: {path: /health/startup, port: http}
             periodSeconds: 5
             failureThreshold: 30
+          # 3.7: timeouts calibrados no stress test. Com timeoutSeconds: 1 (padrão), sob CPU saturada o
+          # /health/live (def síncrono, mesmo pool de threads das requisições) passava de 1 s e o kubelet
+          # MATAVA pods ocupados, não travados: 28 restarts e conexões cortadas na 1ª rodada do Locust.
+          # Readiness tira o pod lento do balanceamento; liveness só reinicia após ~60 s sem resposta.
           readinessProbe:
             httpGet: {path: /health/ready, port: http}
             periodSeconds: 5
+            timeoutSeconds: 3
           livenessProbe:
             httpGet: {path: /health/live, port: http}
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
           resources:
             requests: {cpu: 100m, memory: 128Mi}   # 3.4: valores do manual (uso medido: ~3m / ~70Mi)
             limits: {cpu: 500m, memory: 256Mi}

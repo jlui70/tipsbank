@@ -521,6 +521,114 @@ data:
               "legendFormat": "{{pod}}"
             }
           ]
+        },
+        {
+          "id": 11,
+          "type": "timeseries",
+          "title": "HPA: réplicas atuais por Deployment (3.7)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 30,
+            "w": 12,
+            "h": 9
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "kube_horizontalpodautoscaler_status_current_replicas{namespace=~\"tipsbank-.*\"}",
+              "legendFormat": "{{horizontalpodautoscaler}}"
+            },
+            {
+              "refId": "B",
+              "expr": "kube_horizontalpodautoscaler_status_desired_replicas{namespace=~\"tipsbank-.*\"}",
+              "legendFormat": "{{horizontalpodautoscaler}} (desejado)"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 0,
+              "custom": {
+                "lineInterpolation": "stepAfter"
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": ".*desejado.*"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineStyle",
+                    "value": {
+                      "fill": "dash",
+                      "dash": [
+                        6,
+                        4
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": 12,
+          "type": "timeseries",
+          "title": "HPA: métrica atual (% do request) × alvo",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "gridPos": {
+            "x": 12,
+            "y": 30,
+            "w": 12,
+            "h": 9
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "kube_horizontalpodautoscaler_status_target_metric{namespace=~\"tipsbank-.*\", metric_target_type=\"utilization\"}",
+              "legendFormat": "{{horizontalpodautoscaler}} ({{metric_name}})"
+            },
+            {
+              "refId": "B",
+              "expr": "kube_horizontalpodautoscaler_spec_target_metric{namespace=~\"tipsbank-.*\", metric_target_type=\"utilization\"}",
+              "legendFormat": "alvo {{horizontalpodautoscaler}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "alvo.*"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineStyle",
+                    "value": {
+                      "fill": "dash",
+                      "dash": [
+                        6,
+                        4
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          }
         }
       ],
       "editable": true

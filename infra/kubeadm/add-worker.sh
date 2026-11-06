@@ -37,3 +37,7 @@ ssh ubuntu@$IP 'sudo bash -s' < "$DIR/prepare-node.sh"
 JOIN=$(ssh ubuntu@$CP 'kubeadm token create --print-join-command')
 ssh ubuntu@$IP "sudo $JOIN"
 echo "OK: $NAME ($IP) entrou no cluster"
+
+# 4) (3.7) o join herda serverTLSBootstrap do ConfigMap kubelet-config: aprova o CSR do certificado de
+#    servidor do kubelet (só se bater com o nome/IP do node), senão o Metrics Server não coleta dele
+"$DIR/kubelet-serving-tls.sh" --approve

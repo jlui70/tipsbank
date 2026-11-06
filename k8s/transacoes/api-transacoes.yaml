@@ -22,7 +22,7 @@ metadata:
   namespace: tipsbank-transacoes
   labels: {app.kubernetes.io/name: api-transacoes, app.kubernetes.io/part-of: tipsbank, role: app, version: v1}
 spec:
-  replicas: 2
+  # replicas: definido pelo HPA (hpa.yaml, etapa 3.7). Não volte a fixar aqui.
   revisionHistoryLimit: 5       # 3.2: guarda os 5 ReplicaSets anteriores para o rollout undo
   strategy:
     type: RollingUpdate
@@ -54,7 +54,7 @@ spec:
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: app              # nome fixo: o HPA ContainerResource (Semana 3) referencia "app"
-          image: ghcr.io/jlui70/tipsbank-api-transacoes:v1.0.0@sha256:415945fea3f0cd8e69fb4e736e6f071bde7ad948783a22b09c30aac7c12a2c6e
+          image: ghcr.io/jlui70/tipsbank-api-transacoes:v1.2.0@sha256:4e9c9d06fe2db5784ebb22754ad8114f9ef747abb58a861e5d40d4fcf87f1341
           args: [--log-config, /etc/app/log-config.json]   # somado ao ENTRYPOINT (python3 -m uvicorn ...)
           ports:
             - {name: http, containerPort: 8080}
@@ -69,6 +69,10 @@ spec:
               valueFrom: {configMapKeyRef: {name: transacoes-config, key: APP_VERSION}}
             - name: LOG_LEVEL
               valueFrom: {configMapKeyRef: {name: transacoes-config, key: LOG_LEVEL}}
+            - name: DB_POOL_SIZE
+              valueFrom: {configMapKeyRef: {name: transacoes-config, key: DB_POOL_SIZE}}
+            - name: DB_MAX_OVERFLOW
+              valueFrom: {configMapKeyRef: {name: transacoes-config, key: DB_MAX_OVERFLOW}}
           securityContext:
             runAsUser: 65532
             allowPrivilegeEscalation: false
@@ -81,12 +85,19 @@ spec:
             httpGet: {path: /health/startup, port: http}
             periodSeconds: 5
             failureThreshold: 30
+          # 3.7: timeouts calibrados no stress test. Com timeoutSeconds: 1 (padrão), sob CPU saturada o
+          # /health/live (def síncrono, mesmo pool de threads das requisições) passava de 1 s e o kubelet
+          # MATAVA pods ocupados, não travados: 28 restarts e conexões cortadas na 1ª rodada do Locust.
+          # Readiness tira o pod lento do balanceamento; liveness só reinicia após ~60 s sem resposta.
           readinessProbe:
             httpGet: {path: /health/ready, port: http}
             periodSeconds: 5
+            timeoutSeconds: 3
           livenessProbe:
             httpGet: {path: /health/live, port: http}
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
           resources:
             requests: {cpu: 100m, memory: 128Mi}   # 3.4: valores do manual (uso medido: ~3m / ~70Mi)
             limits: {cpu: 500m, memory: 256Mi}

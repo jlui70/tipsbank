@@ -1,0 +1,31 @@
+# metrics-server 3.14.0 (app v0.9.0) — values do lab kubeadm (etapa 3.7).
+# Instalação: infra/metrics-server/install.sh (helm upgrade --install no kube-system).
+#
+# Decisões:
+# - TLS verificado nos DOIS sentidos, sem --kubelet-insecure-tls e sem insecureSkipTLSVerify:
+#   * metrics-server -> kubelet (:10250): o kubelet serve certificado assinado pela CA do cluster
+#     (serverTLSBootstrap, infra/kubeadm/kubelet-serving-tls.sh); o metrics-server confere com a CA
+#     do próprio ServiceAccount, pelo InternalIP (que está nos SANs do certificado).
+#   * API server -> metrics-server (APIService v1beta1.metrics.k8s.io): certificado emitido pelo
+#     cert-manager (2.2) e CA injetada no APIService pelo cainjector (mesmo modelo do webhook da 3.5).
+# - resources/requests menores que o padrão (100m/200Mi): cluster de 4 nodes, ~40 pods.
+# - Sem Jobs no chart (conferido com helm template).
+
+apiService:
+  create: true
+  insecureSkipTLSVerify: false
+
+tls:
+  type: cert-manager
+  certManager:
+    addInjectorAnnotations: true
+
+defaultArgs:
+  - --cert-dir=/tmp
+  - --kubelet-preferred-address-types=InternalIP
+  - --kubelet-use-node-status-port
+  - --metric-resolution=15s
+
+resources:
+  requests: {cpu: 50m, memory: 64Mi}
+  limits: {cpu: 300m, memory: 192Mi}

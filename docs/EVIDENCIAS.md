@@ -2756,7 +2756,7 @@ Burstable OOMKilled exit=137                     # 137 = 128 + 9 (SIGKILL do ker
 |---|---|
 | Resources em todos os containers (incluindo sidecar) com os valores do manual | ✅ APIs, sidecar e Postgres (primary + replica) |
 | Nenhum pod BestEffort | ✅ 33/33 Burstable (inclui componentes de sistema; pod de teste da 1.3 removido) |
-| `kubectl top` × requests | ⏳ prévia pela Summary API; registro com `kubectl top` na 3.7 |
+| `kubectl top` × requests | ✅ prévia pela Summary API; registro com `kubectl top` (repouso e sob carga) na [3.7](#etapa-37--hpa--metrics-server--locust-stress-test) |
 | Extra: compliance #4 (4.6) | ✅ `[]` |
 
 ---
@@ -3226,3 +3226,361 @@ Decisão: **manter o limit de 50m do manual** e manter a regra padrão (severity
 |---|---|
 | Os 4 alertas em `kubectl get prometheusrule -A` | ✅ `tipsbank-slo` com `TipsBankApiDown`, `TipsBankP99Alto`, `TipsBankErroAltoApi`, `TipsBankPodCrashLoop`; `health=ok` no Prometheus |
 | Todos disparam quando a condição é provocada | ✅ 4/4 em `firing` no Alertmanager (prints `3.6-01` a `3.6-04`), cada falha desfeita e o alerta resolvido |
+
+---
+
+## Etapa 3.7 — HPA + Metrics Server + Locust stress test
+
+**Data**: 2026-11-06 · **Arquivos**: [`infra/kubeadm/kubelet-serving-tls.sh`](../infra/kubeadm/kubelet-serving-tls.sh), [`infra/metrics-server/`](../infra/metrics-server/), `k8s/{contas,transacoes,auditoria,web}/hpa.yaml`, [`k8s/loadtest/`](../k8s/loadtest/), [`locust/`](../locust/), [`apps/api-contas/main.py`](../apps/api-contas/main.py) e [`apps/api-transacoes/main.py`](../apps/api-transacoes/main.py) (v1.2.0), probes e pool nos manifests das APIs, `max_connections` em `k8s/contas/postgres*.yaml`
+
+### Resumo
+
+O teste de carga foi rodado **5 vezes**. Cada rodada revelou um problema, que foi corrigido antes da seguinte: só o HPA não resolve, porque cada réplica nova também consome CPU, threads e conexões de banco.
+
+| # | Mudança antes da rodada | Requisições | Falhas | Kills por liveness | Dinheiro nas 200 contas de teste |
+|---|---|---|---|---|---|
+| 1 | — (v1.0.0, probes com timeout padrão de 1 s) | 5.859 | **13,96%** | 28 | −R$ 6.480,20 (151 contas divergentes) |
+| 2 | probes calibradas (liveness 5 s × 6, readiness 3 s) | 5.050 | 8,59% | 5 | −R$ 3.322,78 (150 divergentes) |
+| 3 | app **v1.1.0**: `httpx.Client` compartilhado, transferência atômica e idempotente, `/health/live` async | 12.444 | 3,10% | 0 | **R$ 0,00** (0 divergentes) |
+| 4 | ramp de 20 para 2 usuários/s | 15.177 | 1,06% | 0 | R$ 0,00, mas 112 movimentos sem registro de transação |
+| 5 | app **v1.2.0**: pool por env (3+2) e transação registrada antes; Postgres `max_connections` 150 | **15.327** | **0,09%** | **0** | **R$ 0,00**, 0 divergentes, 0 órfãos |
+
+Todas as rodadas: 200 usuários, 5 minutos, carga direto no Service `http://api-transacoes.tipsbank-transacoes:8080`.
+
+### Passo 1 — Metrics Server com TLS verificado (sem `--kubelet-insecure-tls`)
+
+No kubeadm, o kubelet serve a porta 10250 com um certificado **autoassinado**. O atalho comum é `--kubelet-insecure-tls`, que faz o Metrics Server aceitar qualquer certificado. Aqui o kubelet passou a usar um certificado da CA do cluster:
+
+```console
+$ ./infra/kubeadm/kubelet-serving-tls.sh
+ConfigMap kube-system/kubelet-config: serverTLSBootstrap: true      # vale para os próximos "kubeadm join"
+  kubelet reiniciado
+tipsbank-cp (192.168.122.10): ok
+aprovado: csr-sq7g9 (tipsbank-cp: DNS:tipsbank-cp,IPAddress:192.168.122.10)
+...
+aprovado: csr-6kbp5 (tipsbank-w3: DNS:tipsbank-w3,IPAddress:192.168.122.14)
+
+NAME        SIGNERNAME                      REQUESTOR                 CONDITION
+csr-sq7g9   kubernetes.io/kubelet-serving   system:node:tipsbank-cp   Approved,Issued
+csr-cm9c4   kubernetes.io/kubelet-serving   system:node:tipsbank-w1   Approved,Issued
+csr-qxxjn   kubernetes.io/kubelet-serving   system:node:tipsbank-w2   Approved,Issued
+csr-6kbp5   kubernetes.io/kubelet-serving   system:node:tipsbank-w3   Approved,Issued
+```
+
+O script só aprova o CSR se o requisitante for `system:node:<nome>` e os SANs forem exatamente o nome e o InternalIP daquele node (o signer `kubelet-serving` não é aprovado automaticamente). O `add-worker.sh` chama o mesmo script com `--approve` para os próximos workers.
+
+```console
+# conferindo o certificado do kubelet com a CA do cluster (sem -k)
+$ openssl s_client -connect 192.168.122.11:10250 -CAfile k8s-ca.crt -verify_hostname tipsbank-w1
+subject=O = system:nodes, CN = system:node:tipsbank-w1
+issuer=CN = kubernetes
+Verify return code: 0 (ok)          # o mesmo nos 4 nodes
+```
+
+O outro lado (API server → Metrics Server, `APIService v1beta1.metrics.k8s.io`) também é verificado: o chart usa `insecureSkipTLSVerify: true` por padrão. Em `values-kubeadm.yaml` ficou `tls.type: cert-manager` e o cainjector da 2.2 grava a CA no APIService.
+
+```console
+$ ./infra/metrics-server/install.sh                 # chart metrics-server 3.14.0 (app v0.9.0), sem Jobs
+$ kubectl get apiservice v1beta1.metrics.k8s.io -o jsonpath='{.spec.insecureSkipTLSVerify}'
+                                                     # vazio = false
+$ kubectl get apiservice v1beta1.metrics.k8s.io -o jsonpath='{.spec.caBundle}' | base64 -d | openssl x509 -noout -subject -issuer
+subject=CN = metrics-server
+issuer=CN = metrics-server
+$ kubectl get apiservice v1beta1.metrics.k8s.io
+NAME                     SERVICE                      AVAILABLE   AGE
+v1beta1.metrics.k8s.io   kube-system/metrics-server   True        36s
+
+$ kubectl top nodes
+NAME          CPU(cores)   CPU(%)   MEMORY(bytes)   MEMORY(%)
+tipsbank-cp   330m         16%      1961Mi          51%
+tipsbank-w1   256m         12%      1579Mi          41%
+tipsbank-w2   421m         21%      1993Mi          52%
+tipsbank-w3   129m         6%       532Mi           18%
+```
+
+### Passo 2 — os HPAs
+
+| HPA | min/max | Métrica | Por quê |
+|---|---|---|---|
+| `api-contas` | 2/10 | `Resource` CPU 70% | manual |
+| `api-transacoes` | 3/15 | **`ContainerResource`** CPU 70% do container `app` | com `Resource`, o uso do sidecar `log-forwarder` (request 10m) entraria na média do pod |
+| `auditoria` | 2/6 | `Resource` memória 75% | manual |
+| `web` | 2/6 | `Resource` CPU 70% | opcional do manual |
+
+Behavior (passo 3), igual nos quatro:
+
+```yaml
+behavior:
+  scaleUp:                               # reage na hora: dobra ou +4 pods a cada 15 s (o que for maior)
+    stabilizationWindowSeconds: 0
+    selectPolicy: Max
+    policies:
+      - {type: Percent, value: 100, periodSeconds: 15}
+      - {type: Pods, value: 4, periodSeconds: 15}
+  scaleDown:                             # espera 120 s (padrão: 300 s) e corta no máximo 50% por minuto
+    stabilizationWindowSeconds: 120
+    selectPolicy: Max
+    policies:
+      - {type: Percent, value: 50, periodSeconds: 60}
+```
+
+**O `replicas:` saiu dos Deployments.** Se ficasse no manifest, cada `kubectl apply` devolveria o número fixo e "brigaria" com o HPA. Mas apagar a linha e dar `apply` faria pior: o `apply` compara com a anotação `last-applied-configuration`, entende que o campo foi removido e o Deployment volta para **1** réplica. A remoção foi feita assim:
+
+```console
+$ kubectl apply set-last-applied -f k8s/contas/api-contas.yaml      # (e os outros 3) só atualiza a anotação
+tipsbank-contas/api-contas last-applied replicas=None  atual=2       # objeto intacto
+$ kubectl diff -f k8s/contas/api-contas.yaml                          # nenhuma diferença nas réplicas
+$ kubectl apply -f k8s/contas/hpa.yaml -f k8s/transacoes/hpa.yaml -f k8s/auditoria/hpa.yaml -f k8s/web/hpa.yaml
+```
+
+### Critério 1 — `kubectl get hpa -A` com métricas ativas
+
+```console
+$ kubectl get hpa -A
+NAMESPACE             NAME             REFERENCE                   TARGETS           MINPODS   MAXPODS   REPLICAS   AGE
+tipsbank-auditoria    auditoria        Deployment/auditoria        memory: 36%/75%   2         6         3          32s
+tipsbank-contas       api-contas       Deployment/api-contas       cpu: 5%/70%       2         10        2          32s
+tipsbank-transacoes   api-transacoes   Deployment/api-transacoes   cpu: 4%/70%       3         15        3          32s
+tipsbank-web          web              Deployment/web              cpu: 4%/70%       2         6         2          32s
+
+$ kubectl -n tipsbank-transacoes describe hpa api-transacoes
+Metrics:                                                                  ( current / target )
+  resource cpu of container "app" on pods  (as a percentage of request):  4% (4m) / 70%
+  ScalingActive   True    ValidMetricFound  the HPA was able to successfully calculate a replica count from cpu container resource utilization (percentage of request)
+  Normal  SuccessfulRescale  17s   horizontal-pod-autoscaler  New size: 3; reason: Current number of replicas below Spec.MinReplicas
+```
+
+### Passos 4 a 6 — Locust no cluster
+
+O `locustfile.py` de referência **não funcionava** contra a api-transacoes:
+
+| Problema | Efeito | Correção |
+|---|---|---|
+| `on_start` fazia `POST /contas` no host do teste (a api-transacoes) | 404: nenhuma conta criada, nenhuma transferência | a conta é criada na api-contas (`CONTAS_URL`, URL absoluta) |
+| payload sem `senha` (obrigatória no `ContaIn`) | 422 | `senha` aleatória por usuário |
+
+| Peça | Como ficou |
+|---|---|
+| Imagem | `ghcr.io/jlui70/tipsbank-locust:v1.0.0@sha256:c8d86e15…` (base `locustio/locust:2.31.3` fixada por digest, uid 1000), assinada com cosign |
+| Deployment | `tipsbank-loadtest/locust`, 1 réplica, `readOnlyRootFilesystem` (só `/tmp` gravável), sem token de ServiceAccount, probes HTTP na UI |
+| Ingress | `https://locust.tipsbank.local` com TLS da `tipsbank-ca` e Basic Auth (Secret gerado por `infra/monitoring/gerar-secrets.sh`): sem senha 401, com senha 200 |
+| NetworkPolicy | `default-deny` no namespace; saída só para `api-transacoes:8080` e `api-contas:8080`; entrada só do ingress-nginx. As policies das duas APIs liberam o pod do Locust (as duas pontas) |
+
+Dashboard do Grafana (3.5) com 2 painéis novos: réplicas atuais × desejadas por HPA (`kube_horizontalpodautoscaler_status_*_replicas`) e métrica atual × alvo (`kube_horizontalpodautoscaler_status_target_metric`).
+
+### Passo 7 — as 5 rodadas
+
+#### Tentativa 1 — a liveness matando pods ocupados
+
+![Tentativa 1: 13,96% de falhas](img/3.7-00-tentativa1-falhas.png)
+
+```console
+POST  /contas (setup)    req=  200 fail=   0 med=13000 avg=12909 max=22232
+GET   /extrato/:id       req= 1356 fail=  80 med=4300  avg=5224  max=31600
+POST  /transferencias    req= 4303 fail= 738 med=8900  avg=9567  max=33748
+      Aggregated         req= 5859 fail= 818
+ERR 423 /transferencias HTTPError('500 Server Error ...')
+ERR 182 /transferencias ConnectionResetError(104, 'Connection reset by peer')
+ERR 125 /transferencias RemoteDisconnected('Remote end closed connection without response')
+...
+$ kubectl get events -A --field-selector reason=Killing | grep liveness      # contas 2, transacoes 26
+Container app failed liveness probe, will be restarted
+$ kubectl get pod ... -o jsonpath='{...lastState.terminated}'                # reason=Completed exitCode=0: SIGTERM, não OOM
+```
+
+Os 200 usuários entraram em 10 s e cada um criou uma conta: 200 hashes **bcrypt** na api-contas (2 pods, limit 500m), cada um levando ~13 s. Sob CPU saturada, o `GET /health/live` (um `def` síncrono, que espera thread livre no mesmo pool das rotas) passou de 1 s, o `timeoutSeconds` padrão. O kubelet reiniciou **pods vivos, só ocupados**: cada restart corta as conexões em andamento, sobra menos pod para a mesma carga e o próximo falha a probe. Os nodes w1/w2 ficaram em 90–99% de CPU real; o HPA chegou a pedir 10 réplicas da contas e 14 da transacoes, com 5 a 8 pods `Pending`.
+
+**Integridade:** com as 200 contas criadas com R$ 10.000 cada, a soma deveria ser R$ 2.010.533,33 (as 3 contas anteriores + 2.000.000). Era R$ 2.004.053,13. Extrato reconstruído por conta:
+
+```console
+ contas_locust | contas_divergentes |  falta   | sobra  | diferenca_total
+           200 |                151 | -7116.77 | 636.57 |        -6480.20
+```
+
+As contas reais (Jeferson, LinuxTips SA) não foram tocadas. Causa no código: uma transferência eram **duas chamadas HTTP** (`/saldo` débito e `/saldo` crédito) e depois um `INSERT`, sem idempotência. Timeout no débito que a api-contas gravou mesmo assim → 500 sem estorno (dinheiro some). Timeout no crédito que foi gravado → o "estorno" duplica (dinheiro aparece). Pod morto no meio → movimento sem registro.
+
+#### Tentativa 2 — probes calibradas
+
+```yaml
+# api-contas, api-transacoes (v1 e v2), auditoria
+readinessProbe: {periodSeconds: 5, timeoutSeconds: 3}                       # pod lento sai do balanceamento
+livenessProbe:  {periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 6} # só reinicia após ~60 s sem resposta
+```
+
+| | Tentativa 1 | Tentativa 2 |
+|---|---|---|
+| Falhas | 13,96% | 8,59% |
+| Kills por liveness | 28 | 5 |
+| Conexões cortadas (reset/disconnect/refused) | 390 | 122 |
+| Dinheiro divergente | −6.480,20 | −3.322,78 |
+
+![Tentativa 2: Locust](img/3.7-01-locust-stats.png)
+![Tentativa 2: Locust charts](img/3.7-02-locust-charts.png)
+![Grafana com as tentativas 1 e 2: réplicas sobem e descem](img/3.7-03-grafana2-hpa.png)
+![Terminal: HPA e pods no pico](img/3.7-04-hpa-terminal.png)
+
+Medição do que gastava a CPU: a api-transacoes criava um `httpx.Client()` **a cada chamada** (2 por transferência):
+
+```console
+$ docker run --rm --entrypoint python3 ghcr.io/jlui70/tipsbank-api-transacoes:v1.0.0@sha256:4159... -c '...'
+CPU por httpx.Client() novo: 25.4 ms | reaproveitando o client: 0.08 ms | versao httpx 0.27.2
+```
+
+~51 ms de CPU por transferência só montando clientes (carrega o bundle de CAs do certifi a cada vez, mesmo para HTTP) e uma conexão TCP nova por chamada. A ~25 transferências/s, isso é ~1,3 vCPU: um terço dos 2 workers.
+
+#### Tentativa 3 — app v1.1.0
+
+| Arquivo | Mudança |
+|---|---|
+| `apps/api-contas/main.py` | `POST /transferencias-internas`: débito + crédito + linha no ledger `movimentos` numa **transação SQL única**; `tx_id` como chave primária = **idempotência** (o mesmo pedido de novo devolve `repetida: true` e não move nada); locks das 2 contas sempre na ordem do id (sem deadlock); `/saldo` mantido para clientes antigos |
+| `apps/api-transacoes/main.py` | 1 `httpx.Client` por processo (keep-alive); 1 chamada atômica, repetida com o **mesmo** `tx_id` em caso de timeout |
+| as duas | middleware conta o 500 de exceção não tratada (achado da 3.6: `try/finally`); `/health/live` como `async def` (event loop, fora do pool de threads) |
+
+Teste local antes do push (Postgres + as duas APIs no Docker): 200 transferências cruzadas A↔B com 40 em paralelo → 200 × `201`, sem deadlock, soma conservada; mesmo `tx_id` 2× → `repetida: true`; banco fora → `500` contado em `http_requests_total`; `/health/live` com banco fora → `200`. Trivy: 0 HIGH/CRITICAL. Imagens `api-contas:v1.1.0`, `api-transacoes:v1.1.0` e `v2.1.0` (canary) assinadas.
+
+```console
+POST  /contas (setup)    req=  200 fail=   0 med=17000
+GET   /extrato/:id       req= 3069 fail=   0 med=540
+POST  /transferencias    req= 9175 fail= 386 med=3300
+      Aggregated         req=12444 fail= 386          # 3,10%, todos 503 nos primeiros ~90 s; depois, 5 intervalos de 30 s com 0 falhas
+
+ contas | divergentes | soma_saldos | soma_esperada | diferenca
+    200 |           0 |  2000000.00 |    2000000.00 |      0.00
+  status   | transacoes | com_movimento | sem_movimento
+ concluida |       8926 |          8926 |             0
+ pendente  |        386 |           386 |             0        # as 386 "falhas" foram gravadas na contas: só a confirmação chegou tarde
+```
+
+![Grafana tentativa 3](img/3.7-05-grafana2-hpa-v110.png)
+![Tentativa 3: Locust](img/3.7-06-locust-stats-v110.png)
+![Tentativa 3: Locust charts](img/3.7-07-locust-charts-v110.png)
+
+#### Tentativa 4 — rampa gradual e o limite de conexões do Postgres
+
+Os erros da tentativa 3 vinham todos da abertura das 200 contas em 10 s (bcrypt) antes de o HPA reagir. Com ramp de 2 usuários/s (200 em ~100 s), a criação de conta caiu de mediana 17 s para 0,86 s. Mas apareceu outro limite:
+
+```console
+ERR 110 /transferencias HTTPError('500 Server Error ...')
+ERR  28 /extrato/:id    HTTPError('500 Server Error ...')
+$ kubectl -n tipsbank-contas logs -l app.kubernetes.io/name=api-contas --since=2m | grep -c "too many clients"
+204
+$ psql -c "SHOW max_connections; SELECT count(*) FROM pg_stat_activity;"
+100
+102
+```
+
+Cada pod abria um pool de até 15 conexões (5 + 10 de overflow, fixo no código). Com o HPA em 10 + 15 pods, o total possível passava de 370, num Postgres com 100. **Escalar a API multiplica as conexões no banco.** Resultado: 1,06% de falhas; o dinheiro continuou íntegro, mas 112 movimentos ficaram sem a linha em `transacoes` (o `INSERT` falhou depois de a api-contas já ter transferido).
+
+![Grafana tentativa 4](img/3.7-08-grafana-hpa-tentativa4.png)
+![Tentativa 4: Locust](img/3.7-09-locust-stats-tentativa4.png)
+![Tentativa 4: Locust charts](img/3.7-10-locust-charts-tentativa4.png)
+
+#### Tentativa 5 — app v1.2.0 e conexões dimensionadas
+
+| Mudança | Detalhe |
+|---|---|
+| Pool por env (`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT`) | 3 + 2 por pod nos ConfigMaps. Regra: Σ maxReplicas × (pool + overflow) ≤ `max_connections` → 10×5 + 15×5 + 1×5 = 130 |
+| Postgres `args: ["-c", "max_connections=150"]` | primary e réplica; a réplica (hot standby) exige valor ≥ ao do primary, então foi aplicada primeiro |
+| Transação registrada como `pendente` **antes** de chamar a api-contas | depois vira `concluida`, `recusada` (404/422) ou `falha` (erro da contas = nada movido). Nunca há movimento sem registro |
+| Pool cheio = espera | o SQLAlchemy enfileira até `pool_timeout` em vez de falhar (back-pressure) |
+
+Teste local com o pool no mínimo de propósito (1 conexão, sem overflow) e 40 transferências em paralelo: 200 × `201`. Trivy: 0 HIGH/CRITICAL. Imagens `api-contas:v1.2.0`, `api-transacoes:v1.2.0` e `v2.2.0` assinadas.
+
+```console
+POST  /contas (setup)    req=  200 fail=   0 med=580
+GET   /extrato/:id       req= 3797 fail=   0 med=510
+POST  /transferencias    req=11330 fail=  14 med=2000
+      Aggregated         req=15327 fail=  14          # 0,09%; os 14 são 503 "pendente" na subida da rampa
+ERR 14 /transferencias HTTPError('503 Server Error: Service Unavailable ...')
+
+# a cada 30 s: depois de 16:01:34, 7 intervalos seguidos com 0 falhas; kills=0; conexões no Postgres no pico: 65/150
+
+ contas | divergentes | soma_saldos | diferenca
+    200 |           0 |  2000000.00 |      0.00
+  status   | transacoes | com_movimento
+ concluida |      11425 |         11425
+ pendente  |         14 |            14
+ movimentos_sem_transacao
+                        0
+```
+
+O print da UI foi tirado ~20 s antes do último contador (13.988 requisições, 14 falhas = 0,10%); os números acima são do fim do teste (API `/stats/requests`). A tabela `transacoes` tem um pouco mais de linhas que as transferências do Locust porque, ao parar, o Locust descarta as respostas que ainda estavam a caminho.
+
+![Grafana tentativa 5: HPA no pico](img/3.7-11-grafana-hpa-v120.png)
+![Tentativa 5: Locust 0,09% de falhas](img/3.7-12-locust-stats-v120.png)
+![Tentativa 5: Locust charts](img/3.7-13-locust-charts-v120.png)
+
+### Critério 2 — réplicas da api-transacoes acima de 5
+
+Linha do tempo da tentativa 5 (gravada a cada 15 s: atual/desejado e métrica do HPA):
+
+```
+15:59:59 | api-contas=2/2(13%)   api-transacoes=3/3(3%)    | pending=0
+16:00:30 | api-contas=2/6(212%)  api-transacoes=3/7(182%)  | pending=8
+16:01:02 | api-contas=9/9(309%)  api-transacoes=9/9(175%)  | pending=2
+16:01:51 | api-contas=9/10(93%)  api-transacoes=14/15(165%)| pending=9
+16:02:07 | api-contas=10/10(84%) api-transacoes=15/15(185%)| pending=9
+```
+
+O HPA levou a api-transacoes ao máximo de 15. Pods **de fato rodando** (kube-state-metrics):
+
+```console
+# sum by (phase) (kube_pod_status_phase{namespace="tipsbank-transacoes", pod=~"api-transacoes-[a-z0-9]+-[a-z0-9]+"} == 1)
+Running 16:00:00=3 16:01:00=7 16:02:00=7 16:03:00=7 16:04:00=7
+Pending                    16:02:00=8 16:03:00=8 16:04:00=8
+# kube_pod_status_ready: 7 pods Ready de 16:02 a 16:05
+```
+
+**7 pods `Ready`** no pico (critério: >5). Os outros 8 ficaram `Pending` por falta de CPU de **request** nos 2 workers de 2 vCPU (a api-contas rodou 9 de 10). Num cluster com Cluster Autoscaler, esses `Pending` criariam nodes; aqui eles mostram o teto físico do lab. O `maxReplicas: 15` do manual fica, porque é o valor certo para o EKS.
+
+### Critério 3 — erro no Locust abaixo de 1%
+
+✅ **0,09%** na tentativa 5 (14 de 15.327), com o dinheiro íntegro.
+
+### Critério 4 — scaleDown de volta em até 10 min
+
+| Rodada | Fim do teste | api-contas no mínimo (2) | api-transacoes no mínimo (3) | Tempo |
+|---|---|---|---|---|
+| Tentativa 1 | 14:59:58 | 15:03:12 | 15:03:27 | **3 min 29 s** |
+| Tentativa 3 | 15:38:24 | ~15:41:45 | ~15:41:45 | **~3 min 20 s** |
+| Tentativa 5 | 16:05:13 | 16:08:28 | 16:09:31 | **4 min 18 s** |
+
+```
+16:05:36 | api-contas=10/10(4%) api-transacoes=15/15(5%) | pending=9    # janela de 120 s
+16:07:10 | api-contas=10/5(4%)  api-transacoes=15/15(7%) | pending=7    # -50%
+16:07:26 | api-contas=5/5(4%)   api-transacoes=15/7(7%)  | pending=0
+16:08:13 | api-contas=5/2(4%)   api-transacoes=7/7(6%)
+16:09:16 | api-contas=2/2(4%)   api-transacoes=7/3(6%)
+16:09:31 | api-contas=2/2(4%)   api-transacoes=3/3(7%)                  # mínimo
+```
+
+### `kubectl top` × requests (pendência do critério 2 da 3.4)
+
+| Container | Request | Repouso (v1.0.0) | Repouso (v1.2.0) | Sob carga (tentativas 1 e 2, por pod) |
+|---|---|---|---|---|
+| api-contas `app` | 100m / 128Mi | 4m / 73Mi | 4m / 70Mi | até 497m (no limit de 500m, na fase do bcrypt) |
+| api-transacoes `app` | 100m / 128Mi | 5m / **147Mi** | 6m / **88Mi** | 165–379m / 54–241Mi |
+| log-forwarder | 10m / 16Mi | 1–5m / 0Mi | 4–7m / 0Mi | — |
+| auditoria `app` | 100m / 128Mi | 3m / 46Mi | — | memória estável (36–37%: o HPA de memória não escalou) |
+| web `app` | 25m / 32Mi | 1m / 3Mi | — | sem carga (o Locust não usa o web) |
+
+O `app` da api-transacoes estava **acima do request de memória** em repouso (147Mi > 128Mi, achado da 3.5). Com o `httpx.Client` único da v1.2.0 caiu para 88Mi.
+
+### Observações para as próximas etapas
+
+| Achado | Impacto | Quando |
+|---|---|---|
+| Transações `pendente` (resultado desconhecido) não são reconciliadas automaticamente | ficam `pendente` mesmo quando o movimento existe na contas (14 na tentativa 5) | conciliação por `tx_id` contra `movimentos` (rotina da app; CronJob é proibido no desafio) |
+| `kubelet-serving` renova o certificado por CSR (~1 ano) e precisa de aprovação | sem aprovar, o Metrics Server para de coletar daquele node | rodar `kubelet-serving-tls.sh --approve`; registrado no script |
+| HPA pede mais pods do que os nodes comportam (8 `Pending` no pico) | réplicas além do teto não ajudam | EKS: nodegroup com Cluster Autoscaler é **proibido** no desafio → dimensionar os nodes para o `maxReplicas` |
+| bcrypt (rounds=10) na abertura de conta custa ~0,1 s de CPU | rajada de cadastros satura a api-contas | escalar antes (HPA) ou fila de cadastro; registrado |
+| Imagens `registry.k8s.io/metrics-server` e `locustio/locust` (base) | compliance #1 (ghcr) | 4.6 (a do Locust já está no ghcr; espelhar a do metrics-server) |
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| `kubectl get hpa -A` com os 3 HPAs e métricas ativas | ✅ 4 HPAs (3 do manual + `web`); `ContainerResource` na api-transacoes; Metrics Server com TLS verificado nos dois sentidos |
+| Réplicas de `api-transacoes` > 5 durante o stress test | ✅ HPA em 15/15; **7 pods Ready** (8 `Pending` por CPU do lab) |
+| Erro no Locust < 1% | ✅ **0,09%** (tentativa 5, 200 usuários, 5 min), com 0 divergência de saldo |
+| scaleDown de volta em até 10 min | ✅ 3 min 20 s a 4 min 18 s nas três medições |

@@ -1,0 +1,35 @@
+# Etapa 3.7 — HPA do api-contas (manual: min 2, max 10, CPU 70%).
+# O Deployment NÃO tem mais "replicas:" no manifest: quem decide é o HPA (senão cada kubectl apply
+# devolveria o número fixo e brigaria com ele). Métricas: Metrics Server (infra/metrics-server).
+#
+# behavior (igual nas APIs):
+# - scaleUp sem janela de estabilização: reage na hora; até dobrar (100%) ou +4 pods a cada 15 s, o que for maior.
+# - scaleDown com janela de 120 s (padrão: 300 s) e no máximo -50% por minuto: depois do pico, volta ao
+#   mínimo em poucos minutos (critério: até 10 min) sem "serrilhar" se a carga oscilar.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-contas
+  namespace: tipsbank-contas
+  labels: {app.kubernetes.io/name: api-contas, app.kubernetes.io/part-of: tipsbank}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: api-contas}
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 70}     # 70% do request de CPU (100m -> 70m por pod)
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - {type: Percent, value: 100, periodSeconds: 15}
+        - {type: Pods, value: 4, periodSeconds: 15}
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
+      policies:
+        - {type: Percent, value: 50, periodSeconds: 60}

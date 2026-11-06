@@ -10,3 +10,8 @@ data:
   AUDITORIA_URL: http://auditoria.tipsbank-auditoria.svc.cluster.local:8080
   APP_VERSION: v1
   LOG_LEVEL: INFO
+  # 3.7 (v1.2.0): pool de conexões por pod. Regra com HPA:
+  #   Σ maxReplicas x (DB_POOL_SIZE + DB_MAX_OVERFLOW) <= max_connections do Postgres (150, postgres.yaml)
+  #   contas 10x5 + transacoes 15x5 + v2 1x5 = 130 (+ replicação e conexões administrativas)
+  DB_POOL_SIZE: "3"
+  DB_MAX_OVERFLOW: "2"

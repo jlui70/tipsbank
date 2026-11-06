@@ -1,0 +1,64 @@
+# Etapa 3.7 — NetworkPolicy zero-trust do namespace tipsbank-loadtest (mesmo modelo da 2.5).
+# Entrada: só o ingress-nginx (UI na 8089). Saída: DNS, api-transacoes:8080 (a carga) e api-contas:8080
+# (criação das contas de teste). O lado de lá (tipsbank-transacoes e tipsbank-contas) também libera o
+# Locust nas próprias policies: NetworkPolicy precisa das duas pontas.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: tipsbank-loadtest
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: tipsbank-loadtest
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: locust-ingress
+  namespace: tipsbank-loadtest
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: locust}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: ingress-nginx}}
+      ports:
+        - {protocol: TCP, port: 8089}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: locust-egress-apis
+  namespace: tipsbank-loadtest
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: locust}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-transacoes}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: api-transacoes}}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-contas}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: api-contas}}
+      ports:
+        - {protocol: TCP, port: 8080}
