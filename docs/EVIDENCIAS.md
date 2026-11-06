@@ -2720,7 +2720,9 @@ Todos são **Burstable** (requests < limits). Nenhum é **Guaranteed**, que exig
 O metrics-server é instalado na etapa 3.7, quando o `kubectl top pod` será registrado sob a carga do Locust. Prévia pelo kubelet, em repouso:
 
 ```console
-$ kubectl get --raw /api/v1/nodes/tipsbank-w1/proxy/stats/summary | jq '.pods[].containers[] | {name, cpu: .cpu.usageNanoCores, mem: .memory.workingSetBytes}'
+$ kubectl get --raw /api/v1/nodes/tipsbank-w1/proxy/stats/summary | jq -r '.pods[] | .podRef as $p | .containers[] |
+    "\($p.namespace)/\($p.name)\t\(.name)\t\((.cpu.usageNanoCores//0)/1e6|floor)m\t\((.memory.workingSetBytes//0)/1048576|floor)Mi"'
+# (trechos; nomes de pod encurtados)
 tipsbank-contas/api-contas            app        3m   68Mi     # request 100m / 128Mi
 tipsbank-transacoes/api-transacoes    app        2m   70Mi     # request 100m / 128Mi
 tipsbank-contas/postgres-primary-0    postgres  21m   39Mi     # request 250m / 512Mi
