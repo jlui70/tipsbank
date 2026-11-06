@@ -4,7 +4,7 @@ kind: Service
 metadata:
   name: auditoria
   namespace: tipsbank-auditoria
-  labels: {app.kubernetes.io/name: auditoria, app.kubernetes.io/part-of: tipsbank}
+  labels: {app.kubernetes.io/name: auditoria, app.kubernetes.io/part-of: tipsbank, tipsbank.io/job: api-auditoria}
 spec:
   type: ClusterIP
   selector: {app.kubernetes.io/name: auditoria}

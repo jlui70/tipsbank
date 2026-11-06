@@ -21,6 +21,9 @@ k8s/**/secret-db.yaml
 # Basic Auth do /contas/admin gerada por k8s/contas/gerar-basic-auth.sh (versionar so o *.example)
 k8s/**/secret-basic-auth.yaml
 k8s/**/.basic-auth-senha
+# Segredos do monitoramento gerados por infra/monitoring/gerar-secrets.sh (versionar so o *.example)
+infra/monitoring/secrets.yaml
+infra/monitoring/.senhas
 
 # --- Terraform / eksctl (se usados para EC2/EKS) ---
 .terraform/

@@ -23,3 +23,10 @@ kind: Namespace
 metadata:
   name: tipsbank-web
   labels: {app.kubernetes.io/part-of: tipsbank, tipsbank.io/area: web}
+---
+# Etapa 3.5: kube-prometheus-stack (Prometheus, Alertmanager, Grafana). Instalado por infra/monitoring/install.sh.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tipsbank-monitoring
+  labels: {app.kubernetes.io/part-of: tipsbank, tipsbank.io/area: monitoring}

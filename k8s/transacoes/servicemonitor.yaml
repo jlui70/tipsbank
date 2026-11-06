@@ -1,0 +1,18 @@
+# Etapa 3.5: o Prometheus (tipsbank-monitoring) coleta /metrics da api-transacoes a cada 15 s.
+# job = valor do label tipsbank.io/job do Service (todas as APIs com prefixo "api-", para o alerta
+# up{job=~"api-.*"} da 3.6). Exige a regra de ingress do Prometheus na networkpolicy.yaml.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: api-transacoes
+  namespace: tipsbank-transacoes
+  labels: {app.kubernetes.io/name: api-transacoes, app.kubernetes.io/part-of: tipsbank}
+spec:
+  jobLabel: tipsbank.io/job
+  selector:
+    matchLabels: {app.kubernetes.io/name: api-transacoes}
+  podTargetLabels: [version]          # v1/v2 do canary (2.4) viram label das séries
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

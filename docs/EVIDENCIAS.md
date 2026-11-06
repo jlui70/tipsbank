@@ -2758,3 +2758,189 @@ Burstable OOMKilled exit=137                     # 137 = 128 + 9 (SIGKILL do ker
 | Nenhum pod BestEffort | ✅ 33/33 Burstable (inclui componentes de sistema; pod de teste da 1.3 removido) |
 | `kubectl top` × requests | ⏳ prévia pela Summary API; registro com `kubectl top` na 3.7 |
 | Extra: compliance #4 (4.6) | ✅ `[]` |
+
+---
+
+## Etapa 3.5 — Observabilidade: kube-prometheus + Grafana
+
+**Data**: 2026-11-06 · **Chart**: `prometheus-community/kube-prometheus-stack` **92.21.2** (operator v0.94.2, Prometheus, Alertmanager 0.34.2, Grafana 13.3.0) · **Arquivos**: [`infra/monitoring/`](../infra/monitoring/) (`install.sh`, `values-kubeadm.yaml`, `gerar-secrets.sh`, `secrets.yaml.example`, `dashboards/tipsbank-apis.yaml`), `k8s/{contas,transacoes,auditoria}/servicemonitor.yaml`, namespace `tipsbank-monitoring` em `k8s/00-namespaces.yaml`
+
+### Instalação (passos 1 e 2)
+
+```console
+$ ./infra/monitoring/install.sh          # namespace + secrets + helm upgrade --install --wait + dashboard
+$ helm -n tipsbank-monitoring status kps | grep -E 'STATUS|REVISION'
+STATUS: deployed
+REVISION: 2
+
+$ kubectl -n tipsbank-monitoring get pods -o wide
+alertmanager-kps-alertmanager-0          2/2     Running   tipsbank-w1
+kps-grafana-567f9cb58f-95k52             3/3     Running   tipsbank-w2
+kps-kube-state-metrics-77bfd5c6d-x5ptg   1/1     Running   tipsbank-w2
+kps-operator-686dfdbf8b-cbwlq            1/1     Running   tipsbank-w2
+kps-prometheus-node-exporter-64j4w       1/1     Running   tipsbank-w1
+kps-prometheus-node-exporter-mr9dd       1/1     Running   tipsbank-cp     # o DaemonSet tolera todos os taints
+kps-prometheus-node-exporter-s5ncd       1/1     Running   tipsbank-w3
+kps-prometheus-node-exporter-wd79m       1/1     Running   tipsbank-w2
+prometheus-kps-prometheus-0              2/2     Running   tipsbank-w1
+```
+
+Decisões no `values-kubeadm.yaml`:
+
+| Decisão | Por quê |
+|---|---|
+| `prometheusOperator.admissionWebhooks.patch.enabled: false` + `certManager.enabled: true` | o chart padrão cria **2 Jobs** (`admission-create`/`admission-patch`) para o certificado do webhook, e **Job é proibido** no desafio. O cert-manager da 2.2 emite o certificado (`Issuer` + `Certificate` `kps-admission`) e o cainjector injeta o CA nos webhooks |
+| `admissionWebhooks.failurePolicy: Ignore` | sem o Job, os webhooks nascem antes do operator: a 1ª instalação (revisão 1) falhou com `failed calling webhook "prometheusrulemutate..." connection refused` nos PrometheusRule do próprio chart. Com `Ignore`, a instalação passa; o operator valida as regras de novo ao reconciliar |
+| `kubeEtcd`, `kubeScheduler`, `kubeControllerManager`, `kubeProxy` desligados (+ regras padrão deles) | no kubeadm, esses componentes escutam só em `127.0.0.1`: os alvos ficariam DOWN e disparariam alertas falsos na 3.6 |
+| `*SelectorNilUsesHelmValues: false` | o Prometheus pega ServiceMonitor/PodMonitor/PrometheusRule de **qualquer** namespace, sem o label `release`: os ServiceMonitors ficam junto de cada API (`k8s/<ns>/`) |
+| `resources` em todos os containers | 3.4 e compliance #4 |
+| Senha do Grafana via `grafana.admin.existingSecret` | o padrão do chart é `prom-operator`. O Secret `grafana-admin` e o Basic Auth são gerados por `infra/monitoring/gerar-secrets.sh` (fora do Git, como os da 1.4 e 2.2) |
+| `retention: 3d`, `retentionSize: 3GB`, PVC 5Gi | lab de 2 workers de 4 GiB |
+
+Nenhum Job criado:
+
+```console
+$ helm template ... -f infra/monitoring/values-kubeadm.yaml | grep -E '^kind:' | sort | uniq -c | grep -E 'Job|Certificate|Issuer'
+      2 kind: Certificate
+      2 kind: Issuer
+$ kubectl get jobs -A
+No resources found
+```
+
+### Passo 3 — Grafana (e Prometheus/Alertmanager) por Ingress com TLS
+
+| Host | Autenticação | Certificado |
+|---|---|---|
+| `grafana.tipsbank.local` | login do Grafana (`admin` + senha do Secret) | `grafana-tipsbank-tls` (CA `tipsbank-ca`) |
+| `prometheus.tipsbank.local` | Basic Auth no Ingress (as UIs não têm login próprio) | `prometheus-tipsbank-tls` |
+| `alertmanager.tipsbank.local` | Basic Auth no Ingress | `alertmanager-tipsbank-tls` |
+
+```console
+$ kubectl -n tipsbank-monitoring get certificate
+NAME                        READY   SECRET                      AGE
+alertmanager-tipsbank-tls   True    alertmanager-tipsbank-tls   31m
+grafana-tipsbank-tls        True    grafana-tipsbank-tls        31m
+kps-admission               True    kps-admission               31m
+kps-root-cert               True    kps-root-cert               31m
+prometheus-tipsbank-tls     True    prometheus-tipsbank-tls     31m
+
+# curl --cacert tipsbank-ca.crt (sem -k)
+grafana:      /  → 302 (redireciona para /login); senha errada na API → 401
+prometheus:   /  sem senha → 401;  /-/healthy com senha → 200
+alertmanager: /  sem senha → 401;  /-/healthy com senha → 200
+```
+
+### Passo 4 — ServiceMonitor por API
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata: {name: api-transacoes, namespace: tipsbank-transacoes}
+spec:
+  jobLabel: tipsbank.io/job
+  selector:
+    matchLabels: {app.kubernetes.io/name: api-transacoes}   # pega os Services da v1 e da v2
+  podTargetLabels: [version]
+  endpoints:
+    - {port: http, path: /metrics, interval: 15s}
+```
+
+- **`jobLabel: tipsbank.io/job`:** o label `job` vem de um label do Service (`api-contas`, `api-transacoes`, `api-auditoria`). Sem isso, o job da auditoria seria `auditoria`, e o alerta `up{job=~"api-.*"}` da 3.6 não a cobriria.
+- **`podTargetLabels: [version]`:** as séries da transacoes ficam com `version="v1"`/`"v2"` (canary da 2.4).
+- **NetworkPolicy (2.5):** os namespaces têm `default-deny`. O ingress de cada API ganhou a origem `tipsbank-monitoring` + `app.kubernetes.io/name: prometheus` na porta 8080. Teste: o Alertmanager, no mesmo namespace mas sem essa liberação, leva timeout:
+
+```console
+$ kubectl -n tipsbank-monitoring exec alertmanager-kps-alertmanager-0 -c alertmanager -- wget -T 3 -O- http://api-contas.tipsbank-contas:8080/metrics
+wget: download timed out
+```
+
+### Passo 5 — PodMonitor do sidecar: não criado
+
+O `log-forwarder` (1.5) é um `busybox` rodando `tail -F`: não abre porta nenhuma e não expõe métricas Prometheus. Um PodMonitor não teria o que coletar. O que existe dele no Prometheus vem do kubelet/cAdvisor (CPU, memória, restarts por container), e já está no dashboard. Para ter métricas do pipeline de logs, o caminho seria trocar o `tail` por um agente que as exporte (por exemplo o Fluent Bit, com `/api/v1/metrics/prometheus`), o que fica fora do escopo.
+
+### Passo 6 — `web`: sem ServiceMonitor (opcional, não feito)
+
+O `nginx-unprivileged` não expõe métricas Prometheus. Como o tráfego do `web` passa pelo ingress-nginx, as métricas do controller cobririam isso se fossem necessárias.
+
+### Passo 7 — Dashboard `TipsBank — APIs`
+
+Dashboard como código: ConfigMap `dashboard-tipsbank-apis` com o label `grafana_dashboard: "1"`, carregado pelo sidecar do Grafana (`infra/monitoring/dashboards/tipsbank-apis.yaml`). 10 painéis:
+
+| Painel | Consulta (resumo) |
+|---|---|
+| APIs no ar | `sum(up{job=~"api-.*"})` |
+| Requests/s (total e **por endpoint**) | `sum by (job, method, path) (rate(http_requests_total{path!~"/health.*\|/metrics"}[2m]))` |
+| % de 5xx | `(sum(rate(...{status=~"5.."}[5m])) or vector(0)) / sum(rate(...[5m]))` |
+| **Latência p50/p95/p99** por API | `histogram_quantile(0.99, sum by (le, job) (rate(http_request_duration_seconds_bucket[5m])))` |
+| **Distribuição de status code** | `sum by (status) (rate(http_requests_total[2m]))` (empilhado) |
+| Eventos de auditoria/s | `sum by (tipo) (rate(auditoria_eventos_total[2m]))` |
+| **CPU e memória por pod** | `container_cpu_usage_seconds_total` / `container_memory_working_set_bytes` (cAdvisor) dos `tipsbank-*` |
+
+A auditoria só exporta `auditoria_eventos_total` e `auditoria_arquivo_bytes` (não tem métricas HTTP), por isso aparece no painel de eventos.
+
+Dados reais: um laço de tráfego de negócio (listar contas, consultar conta, extrato, transferência de R$ 0,01 alternando o sentido, login com senha errada → 401, conta inexistente → 404). Cada consulta dos painéis foi conferida na API do Prometheus antes do print.
+
+### Critério 1 — Prometheus com os alvos das 3 APIs `UP`
+
+![Prometheus: up{job=~"api-.*"}](img/3.5-01-prometheus-targets.png)
+
+```console
+$ kubectl get --raw /api/v1/namespaces/tipsbank-monitoring/services/kps-prometheus:9090/proxy/api/v1/targets?state=active | ...
+api-auditoria  tipsbank-auditoria   auditoria-79bd54455b-29g8z          -   up  http://10.244.63.161:8080/metrics
+api-auditoria  tipsbank-auditoria   auditoria-79bd54455b-f5v9x          -   up  http://10.244.63.152:8080/metrics
+api-auditoria  tipsbank-auditoria   auditoria-79bd54455b-qrfd9          -   up  http://10.244.41.80:8080/metrics
+api-contas     tipsbank-contas      api-contas-8f6d44cc-lm5x4           -   up  http://10.244.63.146:8080/metrics
+api-contas     tipsbank-contas      api-contas-8f6d44cc-pdsxp           -   up  http://10.244.41.90:8080/metrics
+api-transacoes tipsbank-transacoes  api-transacoes-789cc4774f-ffs4r     v1  up  http://10.244.41.85:8080/metrics
+api-transacoes tipsbank-transacoes  api-transacoes-789cc4774f-prvb8     v1  up  http://10.244.63.156:8080/metrics
+api-transacoes tipsbank-transacoes  api-transacoes-v2-748cf768fd-mlnxj  v2  up  http://10.244.41.84:8080/metrics
+```
+
+Os demais alvos (apiserver, coredns, kubelet ×12, node-exporter ×4, kube-state-metrics e os do próprio stack) também estão `up`.
+
+### Critério 2 — Dashboard Grafana com dados reais
+
+![Grafana: TipsBank — APIs](img/3.5-02-grafana-dashboard.png)
+
+O que se lê no print (09:02–09:17):
+
+- **8** alvos UP, **10,5 req/s** sem health checks, **0%** de 5xx, **p99 de 239 ms**.
+- **Requests/s por endpoint:** a carga dobra entre 09:04 e 09:10 (dois laços de tráfego sobrepostos) e aparecem as chamadas **internas** `POST /contas/{id}/saldo`, que a api-transacoes faz na api-contas a cada transferência.
+- **Latência:** a api-transacoes (p50 ~65 ms) é mais lenta que a api-contas (p50 ~12 ms): cada transferência chama a api-contas duas vezes e a auditoria uma.
+- **Status:** 200, 201 (transferências), 401 (login errado), 404 (conta inexistente) e 503 = 0.
+- **Memória:** o container `app` da api-transacoes chegou a **138,7 MiB** sob carga, acima do request de 128Mi (limit 256Mi). Isso é dado para a 3.7.
+
+### Critério 3 — Alertmanager funcional
+
+![Alertmanager com o Watchdog](img/3.5-03-alertmanager.png)
+
+```console
+$ kubectl get --raw /api/v1/namespaces/tipsbank-monitoring/services/kps-alertmanager:9093/proxy/api/v2/status
+cluster: disabled | versão: 0.34.2
+$ ... /api/v2/alerts
+active      Watchdog       severity=none      # sempre disparando: prova que Prometheus → Alertmanager funciona
+suppressed  InfoInhibitor  (3 namespaces)     # inibe alertas "info"
+```
+
+Alertas `info` pendentes no Prometheus: `CPUThrottlingHigh` no sidecar `log-forwarder` (limit de 50m do manual; ~63% dos períodos com throttling, com média de 5m de uso), nos sidecars do Grafana, no node-exporter e no `calico-kube-controllers`. É o efeito de limit de CPU baixo com uso em rajadas (3.4). A reavaliação fica para a 3.6, junto com os alertas.
+
+### Observações para as próximas etapas
+
+| Achado | Impacto | Quando |
+|---|---|---|
+| `/metrics` acessível de fora pelo Ingress (`https://api.tipsbank.local/contas/metrics`) | expõe nomes de rotas e contadores para a internet | Semana 4 (bloquear no Ingress) |
+| Label `path` com o UUID da conta (`/contas/1111…`, `/extrato/…`) | 1 série por conta: alta cardinalidade em produção. O correto é o template da rota (`/contas/{conta_id}`), o que exige mudar a app | registrado |
+| Imagens `quay.io/prometheus*`, `quay.io/kiwigrid`, `docker.io/grafana` | reprovam o compliance #1 | 4.6 (espelhar no ghcr.io) |
+| Sidecars do Grafana sem `livenessProbe` | reprovam o compliance #3 | 4.6 |
+| `tipsbank-monitoring` sem NetworkPolicy | o Kyverno Generate (4.3) pode criar `default-deny` em `tipsbank-*` e cortar o scrape/Grafana | 4.3 |
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| kube-prometheus-stack via Helm, sem Jobs | ✅ revisão 2 `deployed`; webhook com certificado do cert-manager |
+| Grafana via Ingress com TLS | ✅ `grafana.tipsbank.local` (e Prometheus/Alertmanager com Basic Auth) |
+| ServiceMonitor por API | ✅ 3 ServiceMonitors; 8/8 alvos `UP` (`api-contas`, `api-transacoes` v1/v2, `api-auditoria`) |
+| PodMonitor do sidecar | ✅ documentado por que não existe (busybox `tail` sem métricas) |
+| Dashboard com dados reais | ✅ 10 painéis: req/s por endpoint, p50/p95/p99, status, CPU/memória por pod |
+| Alertmanager funcional | ✅ UI com o `Watchdog` |

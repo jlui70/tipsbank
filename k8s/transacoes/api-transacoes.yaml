@@ -8,7 +8,7 @@ kind: Service
 metadata:
   name: api-transacoes
   namespace: tipsbank-transacoes
-  labels: {app.kubernetes.io/name: api-transacoes, app.kubernetes.io/part-of: tipsbank}
+  labels: {app.kubernetes.io/name: api-transacoes, app.kubernetes.io/part-of: tipsbank, tipsbank.io/job: api-transacoes}
 spec:
   type: ClusterIP
   selector: {app.kubernetes.io/name: api-transacoes, version: v1}

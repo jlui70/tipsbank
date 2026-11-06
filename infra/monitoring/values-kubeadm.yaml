@@ -1,0 +1,141 @@
+# kube-prometheus-stack 92.21.2 (app v0.94.2) — values do lab kubeadm (etapa 3.5).
+# Instalação: infra/monitoring/install.sh (helm upgrade --install no namespace tipsbank-monitoring).
+#
+# Decisões:
+# - SEM Jobs (proibidos no desafio): o chart cria 2 Jobs (admission-create/patch) para gerar o
+#   certificado do webhook do operator. Aqui o cert-manager (2.2) emite o certificado e o cainjector
+#   injeta o CA nos webhooks.
+# - ServiceMonitor/PodMonitor/PrometheusRule de QUALQUER namespace, sem exigir o label "release":
+#   os ServiceMonitors das APIs ficam junto delas (k8s/<ns>/servicemonitor.yaml), e os alertas da 3.6 também.
+# - etcd, scheduler, controller-manager e kube-proxy desligados: no kubeadm escutam só em 127.0.0.1,
+#   e os alvos ficariam DOWN para sempre (e disparariam alertas falsos na 3.6).
+# - resources em TODOS os containers (3.4 e compliance #4); valores para um lab de 2 workers de 4 GiB.
+# - UIs via Ingress com TLS da CA do lab (tipsbank-ca, 2.2); Prometheus e Alertmanager não têm login
+#   próprio -> Basic Auth no Ingress (Secret gerado por infra/monitoring/gerar-secrets.sh, fora do Git).
+
+fullnameOverride: kps
+
+crds:
+  enabled: true
+
+# --- alvos que não existem no kubeadm (bind em 127.0.0.1) ---
+kubeEtcd: {enabled: false}
+kubeScheduler: {enabled: false}
+kubeControllerManager: {enabled: false}
+kubeProxy: {enabled: false}
+defaultRules:
+  rules:
+    etcd: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    kubeControllerManager: false
+    kubeProxy: false
+
+# --- operator: webhook com certificado do cert-manager, sem Jobs ---
+prometheusOperator:
+  admissionWebhooks:
+    # Sem o Job "patch", os webhooks já nascem registrados antes de o operator subir: com Fail, o
+    # próprio helm install é recusado (os PrometheusRule do chart passam pelo webhook). Ignore = se o
+    # operator estiver fora, o objeto entra sem validação (o operator valida de novo ao reconciliar).
+    failurePolicy: Ignore
+    patch:
+      enabled: false
+    certManager:
+      enabled: true
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {cpu: 300m, memory: 256Mi}
+  prometheusConfigReloader:
+    resources:
+      requests: {cpu: 10m, memory: 32Mi}
+      limits: {cpu: 100m, memory: 64Mi}
+
+# --- Prometheus ---
+prometheus:
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: tipsbank-ca
+      nginx.ingress.kubernetes.io/auth-type: basic
+      nginx.ingress.kubernetes.io/auth-secret: monitoring-basic-auth
+      nginx.ingress.kubernetes.io/auth-realm: "TipsBank - monitoramento"
+    hosts: [prometheus.tipsbank.local]
+    paths: [/]
+    pathType: Prefix
+    tls:
+      - {secretName: prometheus-tipsbank-tls, hosts: [prometheus.tipsbank.local]}
+  prometheusSpec:
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    scrapeInterval: 15s
+    retention: 3d
+    retentionSize: 3GB
+    resources:
+      requests: {cpu: 200m, memory: 512Mi}
+      limits: {cpu: "1", memory: 1536Mi}
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests: {storage: 5Gi}
+
+# --- Alertmanager ---
+alertmanager:
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: tipsbank-ca
+      nginx.ingress.kubernetes.io/auth-type: basic
+      nginx.ingress.kubernetes.io/auth-secret: monitoring-basic-auth
+      nginx.ingress.kubernetes.io/auth-realm: "TipsBank - monitoramento"
+    hosts: [alertmanager.tipsbank.local]
+    paths: [/]
+    pathType: Prefix
+    tls:
+      - {secretName: alertmanager-tipsbank-tls, hosts: [alertmanager.tipsbank.local]}
+  alertmanagerSpec:
+    resources:
+      requests: {cpu: 10m, memory: 32Mi}
+      limits: {cpu: 100m, memory: 128Mi}
+
+# --- Grafana ---
+grafana:
+  testFramework:
+    enabled: false          # o teste do chart é um Pod solto (helm test); não é usado
+  admin:
+    existingSecret: grafana-admin      # gerado por infra/monitoring/gerar-secrets.sh (senha fora do Git)
+    userKey: admin-user
+    passwordKey: admin-password
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: tipsbank-ca
+    hosts: [grafana.tipsbank.local]
+    path: /
+    tls:
+      - {secretName: grafana-tipsbank-tls, hosts: [grafana.tipsbank.local]}
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 384Mi}
+  sidecar:
+    resources:
+      requests: {cpu: 10m, memory: 64Mi}
+      limits: {cpu: 100m, memory: 128Mi}
+    dashboards:
+      searchNamespace: ALL      # ConfigMaps com label grafana_dashboard=1 em qualquer namespace
+
+kube-state-metrics:
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+    limits: {cpu: 100m, memory: 128Mi}
+
+prometheus-node-exporter:
+  resources:
+    requests: {cpu: 10m, memory: 24Mi}
+    limits: {cpu: 200m, memory: 64Mi}
