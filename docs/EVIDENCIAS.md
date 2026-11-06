@@ -2328,3 +2328,148 @@ Todos os pods novos ficaram com `RESTARTS 0`.
 | `describe pod` com as 3 probes | ✅ startup/liveness/readiness nas 4 APIs; Postgres com `pg_isready` (liveness + readiness); web com `/healthz` |
 | `Killing` + `Started` ao matar o processo | ✅ teste B (processo travado): `Killing: Container app failed liveness probe, will be restarted` → `Started`. Teste A (SIGTERM): reinício sem `Killing` |
 | Nenhuma API em CrashLoopBackOff durante o deploy | ✅ rollout das 4 APIs sem CrashLoopBackOff, todas com `RESTARTS 0` |
+
+---
+
+## Etapa 3.2 — Rollout strategy e rollback
+
+**Data**: 2026-11-06 · **Arquivos**: [`k8s/transacoes/api-transacoes.yaml`](../k8s/transacoes/api-transacoes.yaml), [`apps/api-transacoes/Dockerfile.v1.9.9-quebrada`](../apps/api-transacoes/Dockerfile.v1.9.9-quebrada); `preStop` também em `api-contas`, `auditoria`, `api-transacoes-v2` e `web`
+
+### Estratégia (passos 1 e 5)
+
+```yaml
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5       # guarda os 5 ReplicaSets anteriores para o rollout undo
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1               # sobe 1 pod novo por vez, além das 2 réplicas
+      maxUnavailable: 0         # nunca derruba um pod antigo antes de um novo ficar Ready
+```
+
+Com 2 réplicas, o padrão (25%/25%) já arredondava para `maxSurge: 1` (para cima) e `maxUnavailable: 0` (para baixo). Deixar explícito tira a dependência do arredondamento: com 4 réplicas, o padrão permitiria 1 pod a menos durante o rollout.
+
+### Encerramento gracioso: `preStop` (achado da 3.1)
+
+Na 3.1, um rollout com tráfego contínuo teve falhas no momento em que os pods antigos terminavam. O pod recebe SIGTERM e o uvicorn/nginx fecha as conexões **ao mesmo tempo** em que o ingress-nginx e o kube-proxy ainda estão tirando o pod dos endpoints. Um `preStop` atrasa o SIGTERM em 5 s. Como as imagens Distroless não têm `sleep`, foi usada a ação nativa do Kubernetes:
+
+```yaml
+          lifecycle:
+            preStop:
+              sleep: {seconds: 5}
+```
+
+O `rollout restart` das 4 apps (api-contas, auditoria, api-transacoes e web) foi feito com um laço de GET a cada 0,2 s em `/contas`, `/transacoes` e `/auditoria/health/ready` e na SPA:
+
+| Rollout | Requisições | Falhas |
+|---|---|---|
+| antes (sem `preStop`) | 848 | **5** (2 × `502` e 1 × timeout na auditoria; 2 × timeout no web) |
+| aplicando o `preStop` | 972 | 7: os pods que terminaram eram os **antigos**, ainda sem `preStop` |
+| depois (`rollout restart` com `preStop` ativo) | 1164 | **0** |
+
+### Critério 1 — rollout quebrado não derruba tráfego (passos 2 e 3)
+
+A `v1.9.9` é a v1.0.0 com um bug proposital no `ENTRYPOINT` (`main:aplicacao` em vez de `main:app`): o uvicorn sai com erro logo no startup. Ela foi publicada no ghcr.io (`sha256:7f6533fd…`, sem assinatura: é uma imagem de teste).
+
+```console
+$ docker run --rm ghcr.io/jlui70/tipsbank-api-transacoes:v1.9.9
+ERROR:    Error loading ASGI app. Attribute "aplicacao" not found in module "main".
+```
+
+Deploy com o mesmo laço de tráfego rodando:
+
+```console
+$ kubectl -n tipsbank-transacoes set image deploy/api-transacoes \
+    app=ghcr.io/jlui70/tipsbank-api-transacoes:v1.9.9@sha256:7f6533fd0a6d7454363bcb9645313f9b4d4b8f7257b9892ba99280e7aecb4a8a
+$ kubectl -n tipsbank-transacoes rollout status deploy/api-transacoes --timeout=90s
+Waiting for deployment "api-transacoes" rollout to finish: 1 out of 2 new replicas have been updated...
+error: timed out waiting for the condition
+
+$ kubectl -n tipsbank-transacoes get pods -l app.kubernetes.io/name=api-transacoes,version=v1
+NAME                              READY   STATUS             RESTARTS      AGE
+api-transacoes-68d65d5866-5fl5c   2/2     Running            0             7m14s    # v1.0.0
+api-transacoes-68d65d5866-hgf6w   2/2     Running            0             7m3s     # v1.0.0
+api-transacoes-b55f697b4-mcknj    1/2     CrashLoopBackOff   3 (38s ago)   91s      # v1.9.9
+
+$ kubectl -n tipsbank-transacoes logs api-transacoes-b55f697b4-mcknj -c app --tail=1
+{"level":"ERROR","service":"api-transacoes","logger":"uvicorn.error","msg":"Error loading ASGI app. Attribute "aplicacao" not found in module "main"."}
+
+Warning   Unhealthy   Startup probe failed: Get "http://10.244.63.139:8080/health/startup": dial tcp 10.244.63.139:8080: connect: connection refused
+Warning   BackOff     Back-off restarting failed container app in pod api-transacoes-b55f697b4-mcknj_tipsbank-transacoes(...)
+
+$ kubectl -n tipsbank-transacoes get deploy api-transacoes -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}{"\n"}{end}'
+Available=True MinimumReplicasAvailable
+Progressing=True ReplicaSetUpdated
+```
+
+O rollout **parou** no primeiro pod novo: com `maxSurge: 1`, só um pod da v1.9.9 foi criado e, com `maxUnavailable: 0`, nenhum pod antigo foi removido, porque o novo nunca ficou Ready. Os 2 pods da v1.0.0 continuaram atendendo. Se nada fosse feito, depois de `progressDeadlineSeconds` (600 s, o padrão) a condição `Progressing` viraria `False / ProgressDeadlineExceeded`, que é o sinal que um pipeline de CD usa para falhar o deploy.
+
+```console
+# tráfego durante deploy quebrado + rollback (07:49:41 → 07:52:58)
+    656 api.tipsbank.local/auditoria/health/ready 200
+    656 api.tipsbank.local/contas/health/ready 200
+    656 api.tipsbank.local/transacoes/health/ready 200
+    656 app.tipsbank.local/ 200                       # 2624/2624, zero falhas
+```
+
+### Critério 2 — `kubectl rollout history` com pelo menos 3 revisões
+
+Cada mudança recebeu a anotação `kubernetes.io/change-cause` (é a coluna CHANGE-CAUSE):
+
+```console
+$ kubectl -n tipsbank-transacoes rollout history deploy/api-transacoes
+REVISION  CHANGE-CAUSE
+4         2.4: teste de rollout undo (restart)
+5         2.4: teste de rollout undo (restart)
+6         2.4: teste de rollout undo (restart)
+7         3.2: maxSurge 1 / maxUnavailable 0 / revisionHistoryLimit 5 + preStop sleep 5s
+9         3.2: v1.9.9 QUEBRADA (crash no startup)
+10        3.2: rollout undo (volta para v1.0.0)
+
+$ kubectl -n tipsbank-transacoes rollout history deploy/api-transacoes --revision=9 | grep Image
+    Image:	ghcr.io/jlui70/tipsbank-api-transacoes:v1.9.9@sha256:7f6533fd0a6d7454363bcb9645313f9b4d4b8f7257b9892ba99280e7aecb4a8a
+```
+
+`revisionHistoryLimit: 5`: são 6 ReplicaSets (o atual + 5 antigos com 0 réplicas). Os mais velhos (revisões 1–3) foram apagados pelo controller. A revisão 8 "sumiu" porque o `undo` reaproveitou o ReplicaSet dela, que virou a revisão 10.
+
+```console
+$ kubectl -n tipsbank-transacoes get rs -l app.kubernetes.io/name=api-transacoes,version=v1
+NAME                        DESIRED   CURRENT   READY   AGE
+api-transacoes-596f64786f   0         0         0       60m
+api-transacoes-6867f9cbfb   0         0         0       34m
+api-transacoes-68d65d5866   2         2         2       9m9s
+api-transacoes-6d994b4987   0         0         0       10m
+api-transacoes-768f5b4c86   0         0         0       12m
+api-transacoes-b55f697b4    0         0         0       3m26s
+```
+
+### Critério 3 — `kubectl rollout undo` volta a versão e o pod fica Ready (passo 4)
+
+```console
+$ kubectl -n tipsbank-transacoes rollout undo deploy/api-transacoes
+deployment.apps/api-transacoes rolled back
+$ kubectl -n tipsbank-transacoes rollout status deploy/api-transacoes
+deployment "api-transacoes" successfully rolled out
+
+$ kubectl -n tipsbank-transacoes get pods -l app.kubernetes.io/name=api-transacoes,version=v1
+NAME                              READY   STATUS        RESTARTS      AGE
+api-transacoes-68d65d5866-5fl5c   2/2     Running       0             7m15s
+api-transacoes-68d65d5866-hgf6w   2/2     Running       0             7m4s
+api-transacoes-b55f697b4-mcknj    1/2     Terminating   3 (39s ago)   92s
+
+$ kubectl -n tipsbank-transacoes get deploy api-transacoes -o jsonpath='{.spec.template.spec.containers[0].image}'
+ghcr.io/jlui70/tipsbank-api-transacoes:v1.0.0@sha256:415945fea3f0cd8e69fb4e736e6f071bde7ad948783a22b09c30aac7c12a2c6e
+```
+
+O rollback foi instantâneo: o template voltou a ser igual ao do ReplicaSet `68d65d5866`, cujos pods nunca saíram do ar. O controller só removeu o pod quebrado. Depois do `undo`, `kubectl diff -f k8s/transacoes/api-transacoes.yaml` não mostra diferença: o cluster está de novo igual ao Git (o `set image` foi um teste imperativo, nunca entrou no manifest).
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| `maxSurge: 1`, `maxUnavailable: 0`, `revisionHistoryLimit: 5` explícitos | ✅ |
+| Rollout quebrado não derruba tráfego | ✅ rollout parado em 1 pod `CrashLoopBackOff`; 2624/2624 requisições 200 |
+| `rollout history` com ≥ 3 revisões | ✅ 6 revisões listadas, com CHANGE-CAUSE |
+| `rollout undo` volta a versão, pod Ready | ✅ imagem v1.0.0, 2/2 pods `2/2 Running` |
+| Extra: rollout sem erro com `preStop` | ✅ 5/848 falhas → 0/1164 |

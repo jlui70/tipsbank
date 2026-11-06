@@ -1,0 +1,7 @@
+# Etapa 3.2: versão PROPOSITALMENTE QUEBRADA, para testar rollout + rollback.
+# Parte da v1.0.0 (mesmas camadas) e só muda o ENTRYPOINT: "main:aplicacao" não existe
+# (o objeto FastAPI se chama "app") -> o uvicorn sai com erro logo no startup.
+# Build: docker build -f apps/api-transacoes/Dockerfile.v1.9.9-quebrada -t ghcr.io/jlui70/tipsbank-api-transacoes:v1.9.9 apps/api-transacoes
+FROM ghcr.io/jlui70/tipsbank-api-transacoes:v1.0.0@sha256:415945fea3f0cd8e69fb4e736e6f071bde7ad948783a22b09c30aac7c12a2c6e
+
+ENTRYPOINT ["python3", "-m", "uvicorn", "main:aplicacao", "--host", "0.0.0.0", "--port", "8080"]

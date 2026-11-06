@@ -46,6 +46,9 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: {drop: [ALL]}
+          lifecycle:
+            preStop:
+              sleep: {seconds: 5}   # 3.2: segura o SIGTERM até o ingress-nginx/kube-proxy tirarem o pod dos endpoints
           startupProbe:
             httpGet: {path: /health/startup, port: http}
             periodSeconds: 5
