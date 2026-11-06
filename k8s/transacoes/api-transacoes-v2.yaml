@@ -72,7 +72,7 @@ spec:
             httpGet: {path: /health/live, port: http}
             periodSeconds: 10
           resources:
-            requests: {cpu: 50m, memory: 128Mi}
+            requests: {cpu: 100m, memory: 128Mi}   # 3.4: valores do manual (uso medido: ~3m / ~70Mi)
             limits: {cpu: 500m, memory: 256Mi}
           volumeMounts:
             - {name: app-logs, mountPath: /var/log/app}
@@ -89,7 +89,7 @@ spec:
             exec: {command: [pidof, tail]}
             periodSeconds: 30
           resources:
-            requests: {cpu: 5m, memory: 8Mi}
+            requests: {cpu: 10m, memory: 16Mi}     # 3.4: valores do manual
             limits: {cpu: 50m, memory: 32Mi}
           volumeMounts:
             - {name: app-logs, mountPath: /var/log/app, readOnly: true}

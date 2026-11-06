@@ -2644,3 +2644,115 @@ Taints:             compliance=strict:NoSchedule
 | Réplicas de uma mesma API em nodes diferentes | ✅ podAntiAffinity preferred; rollout 1276/1276 `200` |
 | Replica streaming real | ✅ `state streaming`, insert pela API visível na replica, escrita recusada |
 | Migração do primary sem perda | ✅ `2|381|10500.00` antes e depois; PV antigo em `Retain` |
+
+---
+
+## Etapa 3.4 — Resources, Limits e QoS
+
+**Data**: 2026-11-06 · **Arquivos**: `api-contas`, `api-transacoes`, `api-transacoes-v2`, `auditoria`, `postgres.yaml`, `postgres-replica.yaml`; [`infra/kubeadm/system-resources.sh`](../infra/kubeadm/system-resources.sh)
+
+### Valores (passo 1)
+
+| Container | requests | limits | Uso medido (repouso) |
+|---|---|---|---|
+| APIs (`app`: contas, transacoes v1/v2, auditoria) | `100m` / `128Mi` | `500m` / `256Mi` | 1–3m / 45–70Mi |
+| sidecar `log-forwarder` | `10m` / `16Mi` | `50m` / `32Mi` | 3–5m / <1Mi |
+| `postgres` (primary e replica) | `250m` / `512Mi` | `1` / `1Gi` | 16–21m / 18–39Mi |
+| `web` (sem valor no manual; mantido da 1.4) | `25m` / `32Mi` | `200m` / `64Mi` | 0m / 3Mi |
+| initContainer `basebackup` (replica) | `50m` / `64Mi` | `500m` / `256Mi` | roda só no 1º boot |
+
+Antes desta etapa, as APIs tinham `50m` de CPU no request, o sidecar `5m/8Mi` e o Postgres `100m/256Mi`–`500m/512Mi`. Todos já eram Burstable desde a 1.4.
+
+O uso foi medido pela **Summary API do kubelet** (`kubectl get --raw /api/v1/nodes/<node>/proxy/stats/summary`), a mesma fonte que o metrics-server (3.7) agrega.
+
+### Componentes de sistema: BestEffort fora do TipsBank
+
+O critério "nenhum pod BestEffort" vale para o cluster. Antes:
+
+```console
+BestEffort  default/nginx                              # pod de teste da 1.3 → apagado (autorizado)
+BestEffort  kube-system/calico-kube-controllers
+BestEffort  kube-system/kube-proxy (×4)
+BestEffort  local-path-storage/local-path-provisioner
+# + calico-node: Burstable, mas só com requests.cpu (sem limits → reprova o comando #4 da 4.6)
+```
+
+`infra/kubeadm/system-resources.sh` aplica `kubectl set resources` nos 4 objetos (precisa rodar de novo após reinstalar o Calico, um `kubeadm upgrade` ou reinstalar o local-path):
+
+| Objeto | requests | limits | Uso medido |
+|---|---|---|---|
+| `ds/kube-proxy` | `10m` / `64Mi` | `200m` / `256Mi` | 0–1m / 56Mi |
+| `ds/calico-node` | `250m` / `128Mi` | `1` / `512Mi` | 42–50m / 116Mi |
+| `deploy/calico-kube-controllers` | `25m` / `64Mi` | `200m` / `256Mi` | 24m / 48Mi |
+| `deploy/local-path-provisioner` | `10m` / `64Mi` | `100m` / `256Mi` | 0m / 51Mi |
+
+### Aplicação com tráfego contínuo
+
+| Mudança | Requisições | Falhas |
+|---|---|---|
+| 4 Deployments de API | 996 | 0 |
+| `postgres-primary` + `postgres-replica` (pods recriados) | 1156 | 16 × `503` em `/contas` e `/transacoes` durante **~3 s** (08:34:51–08:34:54) |
+| `system-resources.sh` (kube-proxy e calico-node em 4 nodes) | 924 | 0 |
+
+Os 503 são a readiness das APIs (3.1) dizendo "sem banco" enquanto o único primary reinicia: é o esperado, e por isso o Postgres não tem `preStop`. A réplica reconectou sozinha (`state streaming`, `sent_lsn = replay_lsn`).
+
+### Critério 1 — nenhum pod com `QoSClass: BestEffort`
+
+```console
+$ kubectl get pods -A -o jsonpath='{range .items[*]}{.status.qosClass}{"\n"}{end}' | sort | uniq -c
+     33 Burstable
+
+$ kubectl get pods -A -o json | jq -r '[.items[] | select(.status.qosClass=="BestEffort") | .metadata.namespace+"/"+.metadata.name]'
+[]
+
+$ kubectl -n tipsbank-transacoes describe pod -l app.kubernetes.io/name=api-transacoes,version=v1 | grep -m1 'QoS Class'
+QoS Class:                   Burstable
+
+# bônus: comando de compliance #4 (4.6) já limpo
+$ kubectl get deploy,sts,ds -A -o json | jq '[.items[] | select(.spec.template.spec.containers[].resources.limits == null) | .metadata.name]'
+[]
+```
+
+Todos são **Burstable** (requests < limits). Nenhum é **Guaranteed**, que exigiria requests = limits em CPU e memória em todos os containers do pod. Com os valores do manual, o Postgres também é Burstable.
+
+### Critério 2 — uso real × requests (parcial: `kubectl top` chega na 3.7)
+
+O metrics-server é instalado na etapa 3.7, quando o `kubectl top pod` será registrado sob a carga do Locust. Prévia pelo kubelet, em repouso:
+
+```console
+$ kubectl get --raw /api/v1/nodes/tipsbank-w1/proxy/stats/summary | jq '.pods[].containers[] | {name, cpu: .cpu.usageNanoCores, mem: .memory.workingSetBytes}'
+tipsbank-contas/api-contas            app        3m   68Mi     # request 100m / 128Mi
+tipsbank-transacoes/api-transacoes    app        2m   70Mi     # request 100m / 128Mi
+tipsbank-contas/postgres-primary-0    postgres  21m   39Mi     # request 250m / 512Mi
+```
+
+Em repouso, o uso de memória das APIs fica em ~55% do request e o de CPU em ~3%. O request de CPU dimensiona o **pico**, e é sobre ele que o HPA da 3.7 calcula a porcentagem de uso.
+
+### Alocação por node
+
+```console
+$ kubectl describe nodes | grep -E '^Name:|^  cpu  |^  memory  '      # Requests      Limits
+tipsbank-w1   cpu  1065m (53%)   5100m (254%)    memory  1440Mi (37%)  3328Mi (87%)
+tipsbank-w2   cpu  1025m (51%)   4450m (222%)    memory  1212Mi (31%)  3252Mi (85%)
+tipsbank-w3   cpu   510m (25%)   2200m (110%)    memory   704Mi (25%)  1792Mi (63%)
+```
+
+O scheduler usa só os **requests** (todos abaixo de 55%). A soma dos limits de CPU passa de 100% (overcommit): CPU é comprimível, e no pior caso há *throttling*. A soma dos limits de **memória** ficou abaixo de 100% em todos os nodes: mesmo com todos no limite, não falta memória no node.
+
+### Extra — o limit de memória é aplicado
+
+```console
+# pod descartável: requests 10m/32Mi, limits 100m/32Mi; "head -c 100m /dev/zero | tail" acumula 100 MB
+$ kubectl get pod teste-oom
+teste-oom   0/1     OOMKilled   0          20s
+Burstable OOMKilled exit=137                     # 137 = 128 + 9 (SIGKILL do kernel)
+```
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| Resources em todos os containers (incluindo sidecar) com os valores do manual | ✅ APIs, sidecar e Postgres (primary + replica) |
+| Nenhum pod BestEffort | ✅ 33/33 Burstable (inclui componentes de sistema; pod de teste da 1.3 removido) |
+| `kubectl top` × requests | ⏳ prévia pela Summary API; registro com `kubectl top` na 3.7 |
+| Extra: compliance #4 (4.6) | ✅ `[]` |
