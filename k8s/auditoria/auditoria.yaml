@@ -48,7 +48,7 @@ spec:
             capabilities: {drop: [ALL]}
           startupProbe:
             httpGet: {path: /health/startup, port: http}
-            periodSeconds: 2
+            periodSeconds: 5
             failureThreshold: 30
           readinessProbe:
             httpGet: {path: /health/ready, port: http}

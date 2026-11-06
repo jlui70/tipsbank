@@ -2206,3 +2206,125 @@ Sem a policy, um pod comprometido conseguiria pegar as credenciais do nó (a rol
 | Saída para `169.254.169.254` no EKS (complemento, 2026-11-05) | ✅ antes: token IMDSv2 de 56 bytes; depois: timeout. App 200 e transferência 201 |
 | `default-deny` + DNS nos 4 namespaces | ✅ 16 policies; app funcionando (150/150 ciclos) |
 | `ipBlock` com `except` | ✅ 443 externo só para a internet pública (faixas privadas e link-local no `except`), só para a api-transacoes |
+
+---
+
+# SEMANA 3 — Resiliência, Scheduling, Autoscaling e Observabilidade
+
+## Etapa 3.1 — Probes completas
+
+**Data**: 2026-11-06 · **Arquivos**: [`k8s/contas/api-contas.yaml`](../k8s/contas/api-contas.yaml), [`k8s/transacoes/api-transacoes.yaml`](../k8s/transacoes/api-transacoes.yaml), [`k8s/transacoes/api-transacoes-v2.yaml`](../k8s/transacoes/api-transacoes-v2.yaml), [`k8s/auditoria/auditoria.yaml`](../k8s/auditoria/auditoria.yaml), [`k8s/contas/postgres.yaml`](../k8s/contas/postgres.yaml), [`k8s/web/web.yaml`](../k8s/web/web.yaml)
+
+As probes já existiam desde a 1.4. Nesta etapa, o `startupProbe.periodSeconds` das 4 APIs passou de 2 para **5** (passo 2 do manual: `failureThreshold: 30` × 5 s = **2,5 min** para subir).
+
+| Endpoint (app) | Probe | O que verifica |
+|---|---|---|
+| `/health/startup` | startup | o uvicorn subiu e o `lifespan` terminou (schema criado no Postgres) |
+| `/health/live` | liveness | o processo responde. **Não** consulta dependências: se o Postgres cair, a API não deve ser reiniciada em cascata |
+| `/health/ready` | readiness | api-contas e api-transacoes fazem `SELECT now()` no Postgres; a auditoria verifica se `/data` (NFS) é gravável. Falhou → sai do Service, sem reiniciar |
+
+```console
+$ kubectl get deploy,sts -A -o json | jq -r '...'   # probe: caminho/comando, periodSeconds × failureThreshold
+WORKLOAD           CONTAINER      STARTUP                LIVENESS            READINESS
+auditoria          app            /health/startup 5s×30  /health/live 10s×3  /health/ready 5s×3
+api-contas         app            /health/startup 5s×30  /health/live 10s×3  /health/ready 5s×3
+api-transacoes     app            /health/startup 5s×30  /health/live 10s×3  /health/ready 5s×3
+api-transacoes     log-forwarder  -                      tail 30s×3          -
+api-transacoes-v2  app            /health/startup 5s×30  /health/live 10s×3  /health/ready 5s×3
+api-transacoes-v2  log-forwarder  -                      tail 30s×3          -
+web                app            -                      /healthz 10s×3      /healthz 5s×3
+postgres-primary   postgres       -                      pg_isready 10s×3    pg_isready 5s×3
+```
+
+- **Postgres** (passo 4): `exec` com `pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"` (via `sh -c` para expandir as variáveis do Secret). A liveness tem `initialDelaySeconds: 30` para não matar o banco durante o `initdb` do primeiro boot.
+- **web** (passo 5): `/healthz` na porta 8080 (`location = /healthz { return 200 "ok\n"; }` no `nginx.conf`).
+- **Sidecar `log-forwarder`**: só liveness (`pidof tail`); ele não recebe tráfego, então readiness não se aplica.
+
+### Critério 1 — `kubectl describe pod` com as 3 probes
+
+```console
+$ kubectl -n tipsbank-contas describe pod api-contas-7ccf999f58-qrzxd | grep -E 'Liveness|Readiness|Startup'
+    Liveness:   http-get http://:http/health/live delay=0s timeout=1s period=10s #success=1 #failure=3
+    Readiness:  http-get http://:http/health/ready delay=0s timeout=1s period=5s #success=1 #failure=3
+    Startup:    http-get http://:http/health/startup delay=0s timeout=1s period=5s #success=1 #failure=30
+```
+
+### Critério 2 — matar o processo → `Killing` + `Started`
+
+O passo 6 sugere `kubectl exec ... kill 1`, mas as imagens são **Distroless** e não têm o binário `kill`:
+
+```console
+$ kubectl -n tipsbank-contas exec api-contas-7ccf999f58-qrzxd -c app -- kill 1
+error: ... exec: "kill": executable file not found in $PATH
+```
+
+O PID 1 do container é o próprio `python3 -m uvicorn main:app`. Foram feitos dois testes no mesmo pod:
+
+**Teste A: sinal de dentro do container (equivalente ao `kill 1`), com o `python3` da imagem**
+
+```console
+$ kubectl -n tipsbank-contas exec api-contas-7ccf999f58-qrzxd -c app -- python3 -c "import os,signal; os.kill(1, signal.SIGKILL)"
+api-contas-7ccf999f58-qrzxd   1/1   Running   0     93s          # ignorado: o kernel protege o PID 1 do namespace
+
+$ kubectl -n tipsbank-contas exec api-contas-7ccf999f58-qrzxd -c app -- python3 -c "import os,signal; os.kill(1, signal.SIGTERM)"
+api-contas-7ccf999f58-qrzxd   1/1   Running   1 (8s ago)   102s
+lastState: {"terminated":{"exitCode":0,"reason":"Completed",...}}
+
+Normal    Created     Container created
+Normal    Started     Container started
+Warning   Unhealthy   Startup probe failed: ... connect: connection refused   # startup segurando a liveness enquanto o uvicorn sobe
+```
+
+O container reinicia (`RESTARTS 1`), mas **sem** evento `Killing`: quem encerrou foi o próprio processo (desligamento gracioso do uvicorn ao receber SIGTERM), e o kubelet só aplicou a `restartPolicy: Always`.
+
+**Teste B: processo travado → a liveness detecta e o kubelet mata**
+
+É o cenário que a liveness existe para resolver: o processo está vivo, mas não responde. Ele foi congelado com `SIGSTOP` a partir do nó (`tipsbank-w1`), onde o PID 1 do container aparece com o PID real do host:
+
+```console
+$ CID=$(kubectl -n tipsbank-contas get pod api-contas-7ccf999f58-qrzxd -o jsonpath='{.status.containerStatuses[?(@.name=="app")].containerID}' | sed 's|containerd://||')
+$ ssh ubuntu@192.168.122.11 "sudo ctr -n k8s.io task ls | grep $CID"      # → PID 29958 no nó
+$ ssh ubuntu@192.168.122.11 "sudo kill -STOP 29958; ps -o pid,stat,cmd -p 29958"
+  29958 Tsl  python3 -m uvicorn main:app --host 0.0.0.0 --port 8080      # T = stopped
+
+07:20:45  1/1   Running   1            # congelado
+07:21:06  0/1   Running   1            # readiness falhou: saiu do Service
+07:21:47  0/1   Running   2 (1s ago)   # reiniciado pela liveness
+
+$ kubectl -n tipsbank-contas get events --field-selector involvedObject.name=api-contas-7ccf999f58-qrzxd --sort-by=.lastTimestamp
+Warning   Unhealthy   Liveness probe failed: Get "http://10.244.41.117:8080/health/live": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+Normal    Killing     Container app failed liveness probe, will be restarted
+Warning   Unhealthy   Readiness probe failed: ... context deadline exceeded
+Normal    Created     Container created
+Normal    Started     Container started
+```
+
+A readiness tirou o pod do Service **antes** da liveness reiniciar o container (5 s × 3 < 10 s × 3). Entre o `Killing` e o `Started` passaram ~30 s, o `terminationGracePeriodSeconds` padrão: o processo congelado não reage ao SIGTERM, então o kubelet espera o prazo e manda SIGKILL. Depois o pod voltou para `1/1 Running`, com `RESTARTS 2`.
+
+### Critério 3 — nenhuma API em CrashLoopBackOff durante o deploy
+
+A própria mudança do `periodSeconds` gerou um rollout nas 4 APIs (9 pods recriados). Um `kubectl get pods -w` gravou todos os estados durante o rollout:
+
+```console
+$ kubectl apply -f k8s/contas/api-contas.yaml -f k8s/auditoria/auditoria.yaml -f k8s/transacoes/api-transacoes.yaml -f k8s/transacoes/api-transacoes-v2.yaml
+07:18:48 → 07:19:12  4 × deployment "..." successfully rolled out
+
+# estados vistos no watch (contagem)
+     12 Completed
+     24 ContainerCreating
+     16 Pending
+     39 Running
+     20 Terminating                      # nenhum CrashLoopBackOff / Error
+```
+
+Todos os pods novos ficaram com `RESTARTS 0`.
+
+> **Observação para a 3.2:** durante esse rollout, o tráfego contínuo pelo Ingress (`/health/ready` das 3 APIs, a cada ~0,4 s) teve **4 falhas em 111**: 2 × `502` na auditoria e 2 × timeout na api-contas. É a corrida do encerramento: o pod antigo recebe SIGTERM e para de aceitar conexões antes de o ingress-nginx tirá-lo da lista de endpoints. Não é um problema de probe; vai ser tratado na 3.2 (critério "rollout não derruba tráfego").
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| `describe pod` com as 3 probes | ✅ startup/liveness/readiness nas 4 APIs; Postgres com `pg_isready` (liveness + readiness); web com `/healthz` |
+| `Killing` + `Started` ao matar o processo | ✅ teste B (processo travado): `Killing: Container app failed liveness probe, will be restarted` → `Started`. Teste A (SIGTERM): reinício sem `Killing` |
+| Nenhuma API em CrashLoopBackOff durante o deploy | ✅ rollout das 4 APIs sem CrashLoopBackOff, todas com `RESTARTS 0` |
