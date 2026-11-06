@@ -3584,3 +3584,154 @@ O `app` da api-transacoes estava **acima do request de memória** em repouso (14
 | Réplicas de `api-transacoes` > 5 durante o stress test | ✅ HPA em 15/15; **7 pods Ready** (8 `Pending` por CPU do lab) |
 | Erro no Locust < 1% | ✅ **0,09%** (tentativa 5, 200 usuários, 5 min), com 0 divergência de saldo |
 | scaleDown de volta em até 10 min | ✅ 3 min 20 s a 4 min 18 s nas três medições |
+
+---
+
+## Etapa 3.8 — DaemonSet de coleta
+
+**Data**: 2026-11-06 · **Arquivo**: [`infra/monitoring/node-agent.yaml`](../infra/monitoring/node-agent.yaml) (DaemonSet `node-agent` em `tipsbank-monitoring`)
+
+O `node-exporter` (1ª opção do manual) já roda desde a 3.5 como parte do kube-prometheus-stack, então foi usada a 2ª opção: um agente `busybox` que, a cada 30 s, grava uma linha JSON com o node, o uso e o espaço livre do disco, a carga e a memória.
+
+| Decisão | Por quê |
+|---|---|
+| Toleration **só** para `compliance=strict:NoSchedule` | é o taint do `tipsbank-w3` (Postgres, 3.3). O taint do control-plane continua valendo: o critério é "um pod por **worker**" (o node-exporter roda nos 4 nodes porque tolera qualquer `NoSchedule`) |
+| Disco do node via `hostPath: /` montado **somente leitura** em `/host` | o `df` dentro do container mostraria o overlay do container; o node-exporter monta o rootfs do mesmo jeito. `/proc/loadavg` e `/proc/meminfo` já são do kernel do node |
+| Nome do node pela Downward API (`spec.nodeName`) | o hostname do container é o nome do pod |
+| `runAsUser: 65534`, root read-only, `drop: [ALL]`, sem token de ServiceAccount, sem porta | o agente não precisa de rede nem da API do Kubernetes |
+| liveness: arquivo `/tmp/heartbeat` com menos de 2 min | detecta o laço travado (4 ciclos perdidos) |
+| `requests 5m/8Mi`, `limits 50m/32Mi` | 3.4 (QoS Burstable) |
+| `updateStrategy` com `maxUnavailable: 1` | numa troca de versão, um node fica sem o agente por vez |
+
+### O efeito da toleration
+
+Primeiro, uma cópia **sem** a toleration (só para a demonstração; não está no Git):
+
+```console
+$ sed '/      tolerations:/,+1d' infra/monitoring/node-agent.yaml > node-agent-sem-toleration.yaml
+$ kubectl apply -f node-agent-sem-toleration.yaml
+$ kubectl -n tipsbank-monitoring get ds node-agent
+NAME         DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR   AGE
+node-agent   2         2         2       2            2           <none>          4s
+node-agent-hp6nk Running tipsbank-w1
+node-agent-s69sd Running tipsbank-w2
+```
+
+`DESIRED` é 2, e não aparece pod `Pending` no w3: o controller do DaemonSet nem considera um node cujo taint o pod não tolera.
+
+```console
+$ kubectl get nodes -o 'custom-columns=NOME:.metadata.name,TAINT:.spec.taints[*].key,VALOR:.spec.taints[*].value,EFEITO:.spec.taints[*].effect'
+NOME          TAINT                                   VALOR    EFEITO
+tipsbank-cp   node-role.kubernetes.io/control-plane   <none>   NoSchedule
+tipsbank-w1   <none>                                  <none>   <none>
+tipsbank-w2   <none>                                  <none>   <none>
+tipsbank-w3   compliance                              strict   NoSchedule
+```
+
+### Critério — `DESIRED == CURRENT == READY` = número de workers
+
+```console
+$ kubectl apply -f infra/monitoring/node-agent.yaml          # com a toleration
+$ kubectl get ds -A
+NAMESPACE             NAME                           DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR            AGE
+kube-system           calico-node                    4         4         4       4            4           kubernetes.io/os=linux   2d23h
+kube-system           kube-proxy                     4         4         4       4            4           kubernetes.io/os=linux   2d23h
+tipsbank-monitoring   kps-prometheus-node-exporter   4         4         4       4            4           kubernetes.io/os=linux   7h31m
+tipsbank-monitoring   node-agent                     3         3         3       3            3           <none>                   38s
+
+$ kubectl -n tipsbank-monitoring get pods -l app.kubernetes.io/name=node-agent -o wide
+NAME               READY   STATUS    RESTARTS   AGE   IP              NODE
+node-agent-7gfxq   1/1     Running   0          12s   10.244.41.74    tipsbank-w1
+node-agent-8pzbq   1/1     Running   0          21s   10.244.64.200   tipsbank-w3     # o node com taint
+node-agent-hlpnk   1/1     Running   0          3s    10.244.63.161   tipsbank-w2
+
+$ kubectl get nodes --no-headers -l '!node-role.kubernetes.io/control-plane' | wc -l
+3
+```
+
+Os `AGE` diferentes (12 s, 21 s, 3 s) são o `maxUnavailable: 1`: ao ganhar a toleration, o DaemonSet trocou os pods de w1 e w2 um de cada vez e criou o do w3.
+
+### O que o agente registra
+
+```console
+$ kubectl -n tipsbank-monitoring logs -l app.kubernetes.io/name=node-agent --prefix --tail=2
+[pod/node-agent-8pzbq/agent] {"ts":"2026-11-06T19:19:50Z","node":"tipsbank-w3","disco_uso":"15%","disco_livre":"23.8G","load":"0.05 0.16 0.56","mem_uso":"25%"}
+[pod/node-agent-8pzbq/agent] {"ts":"2026-11-06T19:20:21Z","node":"tipsbank-w3","disco_uso":"15%","disco_livre":"23.8G","load":"0.03 0.14 0.54","mem_uso":"26%"}
+[pod/node-agent-hlpnk/agent] {"ts":"2026-11-06T19:19:37Z","node":"tipsbank-w2","disco_uso":"28%","disco_livre":"20.1G","load":"0.40 0.74 2.71","mem_uso":"40%"}
+[pod/node-agent-hlpnk/agent] {"ts":"2026-11-06T19:20:08Z","node":"tipsbank-w2","disco_uso":"28%","disco_livre":"20.1G","load":"0.24 0.67 2.63","mem_uso":"40%"}
+[pod/node-agent-7gfxq/agent] {"ts":"2026-11-06T19:19:28Z","node":"tipsbank-w1","disco_uso":"27%","disco_livre":"20.6G","load":"0.78 0.92 3.04","mem_uso":"50%"}
+[pod/node-agent-7gfxq/agent] {"ts":"2026-11-06T19:19:59Z","node":"tipsbank-w1","disco_uso":"27%","disco_livre":"20.6G","load":"0.61 0.86 2.96","mem_uso":"50%"}
+
+# conferência direto no node tipsbank-w3 (ssh)
+$ df -P / | awk 'NR==2{print $5, $4}'; cut -d' ' -f1-3 /proc/loadavg
+15% 24968816
+0.11 0.16 0.54
+```
+
+O load de 15 min (~3,0) em w1 e w2 é o resto do stress test da 3.7, que terminou ~15 min antes.
+
+Isolamento do pod:
+
+```console
+$ kubectl -n tipsbank-monitoring exec node-agent-8pzbq -- id
+uid=65534(nobody) gid=65534(nobody) groups=65534(nobody)
+$ kubectl -n tipsbank-monitoring exec node-agent-8pzbq -- sh -c 'touch /host/tmp/teste-3.8; touch /teste; ls /var/run/secrets'
+touch: /host/tmp/teste-3.8: Read-only file system      # não altera o disco do node
+touch: /teste: Read-only file system                   # nem o próprio root
+ls: /var/run/secrets: No such file or directory        # sem token da API
+```
+
+### Observações para as próximas etapas
+
+| Achado | Impacto | Quando |
+|---|---|---|
+| `hostPath` (mesmo read-only) costuma ser bloqueado por políticas de segurança | o Kyverno da 4.1 pode recusar o DaemonSet | PolicyException só para o `node-agent` (e para o node-exporter, que também monta o rootfs) |
+| Imagem `busybox` do Docker Hub | compliance #1 (ghcr) | 4.6, junto com o `log-forwarder`, que usa a mesma imagem |
+| Logs só no stdout | sem agregador de logs (Loki é proibido no desafio), o histórico fica na rotação de logs do kubelet | registrado |
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| DaemonSet em cada worker | ✅ `node-agent` em w1, w2 e w3 |
+| Toleration para `compliance=strict` | ✅ sem ela: DESIRED 2; com ela: 3 |
+| `DESIRED == CURRENT == READY` = número de workers | ✅ 3 = 3 = 3 = 3 workers |
+
+---
+
+## Checkpoint Semana 3
+
+Conferido no cluster em 2026-11-06, depois da 3.8:
+
+```console
+# 1. probes no container app
+api-contas: /health/startup /health/ready /health/live
+api-transacoes: /health/startup /health/ready /health/live
+api-transacoes-v2: /health/startup /health/ready /health/live
+auditoria: /health/startup /health/ready /health/live
+# 2. rollout
+{"rollingUpdate":{"maxSurge":1,"maxUnavailable":0},"type":"RollingUpdate"} revisionHistoryLimit=5
+# 3. AntiAffinity, taint e QoS
+postgres-primary-0 tipsbank-w3
+postgres-replica-0 tipsbank-w1
+     47 Burstable                     # nenhum BestEffort, incluindo os pods novos da 3.7 e 3.8
+# 4. alertas
+TipsBankApiDown TipsBankP99Alto TipsBankErroAltoApi TipsBankPodCrashLoop
+# 5 e 6. HPAs
+auditoria memory: 37%/75%
+api-contas cpu: 4%/70%
+api-transacoes cpu: 7%/70%
+web cpu: 4%/70%
+# 7. DaemonSet
+node-agent   3     3     3     3     3     <none>
+```
+
+| Item do checkpoint (MANUAL-ALUNO) | Status | Evidência |
+|---|---|---|
+| 3 probes em todas as APIs | ✅ | [3.1](#etapa-31--probes-completas); timeouts calibrados no stress test da [3.7](#etapa-37--hpa--metrics-server--locust-stress-test) |
+| Rollout strategy + rollback testado | ✅ | [3.2](#etapa-32--rollout-strategy-e-rollback); rollback de novo na [3.6](#etapa-36--prometheusrule-com-alertas-de-slo) |
+| AntiAffinity + Taints/Tolerations + QoS classes corretas | ✅ | [3.3](#etapa-33--affinity-antiaffinity-taints-e-tolerations), [3.4](#etapa-34--resources-limits-e-qos) |
+| kube-prometheus-stack + 4 alertas disparando | ✅ | [3.5](#etapa-35--observabilidade-kube-prometheus--grafana), [3.6](#etapa-36--prometheusrule-com-alertas-de-slo) |
+| 3 HPAs com métricas diferentes | ✅ | [3.7](#etapa-37--hpa--metrics-server--locust-stress-test): CPU, ContainerResource e memória (+ web) |
+| Locust gerando 200 users, HPA reagindo | ✅ | [3.7](#etapa-37--hpa--metrics-server--locust-stress-test): 0,09% de falhas na rodada final |
+| DaemonSet rodando em todos os workers | ✅ | 3.8 (acima) |
