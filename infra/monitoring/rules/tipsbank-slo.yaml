@@ -1,0 +1,66 @@
+# Etapa 3.6 — alertas de SLO do TipsBank (PrometheusRule lida pelo Prometheus do kube-prometheus-stack).
+# O Prometheus aceita PrometheusRule de qualquer namespace e sem o label "release"
+# (ruleSelectorNilUsesHelmValues: false em infra/monitoring/values-kubeadm.yaml).
+#
+# Decisões:
+# - job = label tipsbank.io/job dos Services (api-contas, api-transacoes, api-auditoria), 3.5.
+# - Latência e erro excluem /metrics e /health/*: são tráfego do Prometheus e do kubelet (probes),
+#   não do cliente. Sem isso, o tráfego de probes "dilui" a taxa de erro e puxa o p99 para baixo.
+# - Agregação por job: um alerta por API, e não um por pod/path (o label path tem UUIDs).
+# - Limitação conhecida do TipsBankApiDown (expressão do manual): ele vê alvo que EXISTE e não
+#   responde. Se o Deployment for a 0 réplicas, o alvo some e "up" deixa de existir (não vira 0);
+#   esse caso é coberto pelo KubeDeploymentReplicasMismatch do próprio chart.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: tipsbank-slo
+  namespace: tipsbank-monitoring
+  labels: {app.kubernetes.io/name: tipsbank-slo, app.kubernetes.io/part-of: tipsbank}
+spec:
+  groups:
+    - name: tipsbank-slo
+      interval: 30s
+      rules:
+        - alert: TipsBankApiDown
+          expr: up{job=~"api-.*"} == 0
+          for: 2m
+          labels: {severity: critical, team: tipsbank}
+          annotations:
+            summary: "{{ $labels.job }} fora do ar ({{ $labels.pod }})"
+            description: >-
+              O Prometheus não consegue coletar /metrics de {{ $labels.pod }}
+              ({{ $labels.namespace }}) há mais de 2 minutos.
+
+        - alert: TipsBankP99Alto
+          expr: |
+            histogram_quantile(0.99,
+              sum by (job, le) (
+                rate(http_request_duration_seconds_bucket{job=~"api-.*", path!~"/metrics|/health/.*"}[5m])
+              )
+            ) > 0.5
+          for: 5m
+          labels: {severity: warning, team: tipsbank}
+          annotations:
+            summary: "p99 de {{ $labels.job }} acima de 500 ms"
+            description: "p99 de {{ $labels.job }} = {{ $value | humanizeDuration }} (SLO: 500 ms) há mais de 5 minutos."
+
+        - alert: TipsBankErroAltoApi
+          expr: |
+            sum by (job) (rate(http_requests_total{job=~"api-.*", status=~"5..", path!~"/metrics|/health/.*"}[5m]))
+              /
+            sum by (job) (rate(http_requests_total{job=~"api-.*", path!~"/metrics|/health/.*"}[5m]))
+              > 0.05
+          for: 3m
+          labels: {severity: critical, team: tipsbank}
+          annotations:
+            summary: "{{ $labels.job }} com {{ $value | humanizePercentage }} de respostas 5xx"
+            description: "Taxa de 5xx de {{ $labels.job }} acima de 5% há mais de 3 minutos."
+
+        - alert: TipsBankPodCrashLoop
+          expr: increase(kube_pod_container_status_restarts_total{namespace=~"tipsbank-.*"}[10m]) > 3
+          labels: {severity: warning, team: tipsbank}
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }} reiniciando sem parar"
+            description: >-
+              O container {{ $labels.container }} de {{ $labels.pod }} reiniciou
+              {{ $value | printf "%.0f" }} vezes nos últimos 10 minutos.

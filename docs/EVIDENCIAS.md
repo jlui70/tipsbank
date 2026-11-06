@@ -2944,3 +2944,285 @@ Alertas `info` pendentes no Prometheus: `CPUThrottlingHigh` no sidecar `log-forw
 | PodMonitor do sidecar | ✅ documentado por que não existe (busybox `tail` sem métricas) |
 | Dashboard com dados reais | ✅ 10 painéis: req/s por endpoint, p50/p95/p99, status, CPU/memória por pod |
 | Alertmanager funcional | ✅ UI com o `Watchdog` |
+
+---
+
+## Etapa 3.6 — PrometheusRule com alertas de SLO
+
+**Data**: 2026-11-06 · **Arquivo**: [`infra/monitoring/rules/tipsbank-slo.yaml`](../infra/monitoring/rules/tipsbank-slo.yaml) (PrometheusRule `tipsbank-slo` no namespace `tipsbank-monitoring`)
+
+### As 4 regras
+
+| Alerta | Expressão | `for` | Severity |
+|---|---|---|---|
+| `TipsBankApiDown` | `up{job=~"api-.*"} == 0` | 2m | critical |
+| `TipsBankP99Alto` | `histogram_quantile(0.99, sum by (job, le) (rate(http_request_duration_seconds_bucket{job=~"api-.*", path!~"/metrics\|/health/.*"}[5m]))) > 0.5` | 5m | warning |
+| `TipsBankErroAltoApi` | `sum by (job) (rate(http_requests_total{…, status=~"5.."}[5m])) / sum by (job) (rate(http_requests_total{…}[5m])) > 0.05` (mesmo filtro de `path`) | 3m | critical |
+| `TipsBankPodCrashLoop` | `increase(kube_pod_container_status_restarts_total{namespace=~"tipsbank-.*"}[10m]) > 3` | — | warning |
+
+Decisões:
+
+| Decisão | Por quê |
+|---|---|
+| Latência e erro **sem** `/metrics` e `/health/*` | esse tráfego é do Prometheus e do kubelet (probes), não do cliente: ele dilui a taxa de erro e puxa o p99 para baixo |
+| Agregação `by (job)` | um alerta por API, e não um por pod/path (o label `path` tem UUIDs, ver 3.5) |
+| `team: tipsbank` em todos | label para roteamento no Alertmanager (receivers ficam para quando houver canal de notificação) |
+| `job` = label `tipsbank.io/job` dos Services (3.5) | é o que dá o prefixo `api-` que o `up{job=~"api-.*"}` do manual espera |
+| PrometheusRule sem o label `release` | o Prometheus aceita regras de qualquer namespace (`ruleSelectorNilUsesHelmValues: false`, 3.5) |
+
+### Critério 1 — os 4 alertas em `kubectl get prometheusrule -A`
+
+```console
+$ kubectl get prometheusrule -A | grep -E "NAMESPACE|tipsbank-slo"
+NAMESPACE             NAME                                               AGE
+tipsbank-monitoring   tipsbank-slo                                       33m
+
+$ kubectl -n tipsbank-monitoring get prometheusrule tipsbank-slo \
+    -o jsonpath='{range .spec.groups[0].rules[*]}{.alert}{"  for="}{.for}{"  severity="}{.labels.severity}{"\n"}{end}'
+TipsBankApiDown  for=2m  severity=critical
+TipsBankP99Alto  for=5m  severity=warning
+TipsBankErroAltoApi  for=3m  severity=critical
+TipsBankPodCrashLoop  for=  severity=warning
+
+# o Prometheus carregou e avalia as 4 (health=ok); estado depois dos testes:
+$ kubectl get --raw "/api/v1/namespaces/tipsbank-monitoring/services/kps-prometheus:9090/proxy/api/v1/rules?rule_group[]=tipsbank-slo" | ...
+TipsBankApiDown ok inactive
+TipsBankP99Alto ok inactive
+TipsBankErroAltoApi ok inactive
+TipsBankPodCrashLoop ok inactive
+```
+
+### Critério 2 — cada alerta disparado provocando a condição
+
+Durante os 4 testes rodou um laço de tráfego de negócio pelo Ingress (o mesmo da 3.5). Linha de base antes do 1º teste: 8 alvos `up=1`, p99 de 215 ms (api-contas) e 249 ms (api-transacoes), nenhum 5xx, nenhum restart.
+
+| Teste | Falha provocada | Início | pending | firing | Desfeito |
+|---|---|---|---|---|---|
+| ApiDown | NetPol da auditoria sem a regra do Prometheus | 13:42:17 | 13:42:53 | **13:44:46** | 13:47:50 |
+| P99Alto | lock `ACCESS EXCLUSIVE` na tabela `contas` (1 s sim, 1 s não) | 13:45:02 | 13:46:28 | **13:51:19** (contas), **13:51:55** (transações) | 13:55:03 (fim do laço) |
+| ErroAltoApi | banco `tipsbank` em somente leitura | 13:55:16 | 13:55:56 | **13:59:00** | 14:02:16 |
+| PodCrashLoop | rollout da imagem quebrada v1.9.9 (3.2) | 14:03:02 | — | **14:05:25** | 14:08:38 (`rollout undo`) |
+
+#### Teste 1 — `TipsBankApiDown`: alvo existe, mas não responde
+
+"Matar" a API escalando para 0 não serve para esta expressão: sem pod, o alvo some e a série `up` deixa de existir (não vira 0). A falha provocada foi a de rede: tirar o Prometheus da NetworkPolicy da auditoria. Os pods continuam saudáveis e atendendo o Ingress; só o scrape é bloqueado.
+
+```console
+$ kubectl -n tipsbank-auditoria patch networkpolicy auditoria-ingress --type=json -p '[
+    {"op":"test","path":"/spec/ingress/0/from/2/namespaceSelector/matchLabels/kubernetes.io~1metadata.name","value":"tipsbank-monitoring"},
+    {"op":"remove","path":"/spec/ingress/0/from/2"}]'
+networkpolicy.networking.k8s.io/auditoria-ingress patched
+
+$ kubectl -n tipsbank-auditoria get pods        # continuam 1/1, 0 restarts
+$ curl -sk -o /dev/null -w '%{http_code}\n' https://api.tipsbank.local/auditoria/eventos
+200
+
+# Alertmanager (API v2):
+TipsBankApiDown critical auditoria-79bd54455b-29g8z active 2026-11-06T16:44:46.182Z
+TipsBankApiDown critical auditoria-79bd54455b-qrfd9 active 2026-11-06T16:44:46.182Z
+TipsBankApiDown critical auditoria-79bd54455b-f5v9x active 2026-11-06T16:44:46.182Z
+
+$ kubectl apply -f k8s/auditoria/networkpolicy.yaml     # desfaz: volta ao estado do Git
+networkpolicy.networking.k8s.io/auditoria-ingress configured
+# 40 s depois: up{job="api-auditoria"} = 1 nos 3 pods, alerta resolvido
+```
+
+![Alertmanager: TipsBankApiDown](img/3.6-01-apidown.png)
+
+O `test` no patch garante que o item removido é mesmo o do `tipsbank-monitoring` (se a ordem da lista mudar, o patch falha em vez de remover a regra errada).
+
+#### Teste 2 — `TipsBankP99Alto`: contenção de lock no banco
+
+```console
+$ kubectl -n tipsbank-contas exec postgres-primary-0 -c postgres -- sh -c '
+    fim=$(( $(date +%s) + 600 )); n=0
+    while [ $(date +%s) -lt $fim ]; do
+      psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -qAt \
+        -c "BEGIN; LOCK TABLE contas IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(1); COMMIT;" >/dev/null
+      n=$((n+1)); sleep 1
+    done; echo "locks=$n"'
+locks=296
+```
+
+Enquanto o lock está preso, toda consulta à tabela `contas` espera na fila. O p99 subiu de ~230 ms para:
+
+```
+13:46:28  pending api-contas       p99: api-contas 0,90 s   api-transacoes 0,48 s
+13:46:59  pending api-transacoes   p99: api-contas 0,95 s   api-transacoes 1,40 s
+13:51:19  firing  api-contas       p99: api-contas 1,99 s   api-transacoes 2,23 s
+13:51:55  firing  api-transacoes
+```
+
+A api-transacoes sofre mais que a api-contas: cada transferência chama a api-contas duas vezes (débito e crédito) e soma as duas esperas. Nenhuma requisição falhou: o tráfego continuou só com 200/201/401/404 (lento, mas certo).
+
+![Alertmanager: TipsBankP99Alto](img/3.6-02-p99.png)
+
+#### Teste 3 — `TipsBankErroAltoApi`: banco sem escrita
+
+Simula um primary que ficou somente leitura (falha de failover, disco cheio etc.): as leituras funcionam, as escritas falham.
+
+```console
+$ kubectl -n tipsbank-contas exec postgres-primary-0 -c postgres -- sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+    -c "ALTER DATABASE tipsbank SET default_transaction_read_only = on;" \
+    -c "SELECT count(pg_terminate_backend(pid)) AS conexoes_derrubadas FROM pg_stat_activity
+        WHERE datname = '\''tipsbank'\'' AND backend_type = '\''client backend'\'' AND pid <> pg_backend_pid();" \
+    -c "SELECT client_addr, state FROM pg_stat_replication;"'
+ALTER DATABASE
+ conexoes_derrubadas
+---------------------
+                  14
+ client_addr  |   state
+--------------+-----------
+ 10.244.41.78 | streaming          # a réplica não foi afetada (walsender não é "client backend")
+```
+
+O `ALTER DATABASE … SET` só vale para conexões novas: por isso as conexões das APIs foram derrubadas (o pool do SQLAlchemy tem `pool_pre_ping` e reconecta).
+
+```
+13:55:56  pending api-transacoes   5xx: 10%
+13:59:00  firing  api-transacoes   5xx: 41%
+```
+
+![Alertmanager: TipsBankErroAltoApi](img/3.6-03-erro5xx.png)
+
+**Achado: a api-contas devolve 500, mas a métrica dela não conta.** O alerta disparou só para a api-transacoes. Requisições nos 2 minutos de falha:
+
+```console
+# sum by (job,status) (increase(http_requests_total{path=~"/contas/.*/saldo|/transferencias"}[2m]))
+api-transacoes 201 96
+api-transacoes 500 64
+api-contas     200 194          # nenhum 500 na métrica...
+
+# ...mas o log mostra os 500 (o --tail=-1 é necessário: com -l o padrão é --tail=10 por pod)
+$ kubectl -n tipsbank-contas logs -l app.kubernetes.io/name=api-contas -c app --since=2m --tail=-1 --prefix \
+    | grep -E "POST /contas/.*/saldo.* 500|ReadOnlySqlTransaction" | tail -6
+[pod/api-contas-8f6d44cc-pdsxp/app] INFO:     10.244.41.84:59992 - "POST /contas/11111111-1111-1111-1111-111111111111/saldo HTTP/1.1" 500 Internal Server Error
+[pod/api-contas-8f6d44cc-pdsxp/app] psycopg.errors.ReadOnlySqlTransaction: cannot execute SELECT FOR UPDATE in a read-only transaction
+[pod/api-contas-8f6d44cc-pdsxp/app] sqlalchemy.exc.InternalError: (psycopg.errors.ReadOnlySqlTransaction) cannot execute SELECT FOR UPDATE in a read-only transaction
+...
+```
+
+Motivo: em `apps/api-contas/main.py`, o contador é incrementado num middleware **depois** de `await call_next(request)`. Uma exceção **não tratada** (aqui, a do Postgres) sobe pelo `call_next`, o middleware é interrompido antes do `.inc()`, e o 500 é gerado mais acima, pelo `ServerErrorMiddleware` do Starlette. Erros com `HTTPException` (404, 422, 503) são contados normalmente. A api-transacoes conta o 500 porque transforma a resposta da api-contas em `HTTPException(status_code=500)`. A correção é na app (`try/finally` no middleware ou handler de exceção) e fica registrada abaixo.
+
+Desfazer: o próprio `ALTER DATABASE … RESET` falha **dentro** do banco somente leitura (`ERROR: cannot execute ALTER DATABASE in a read-only transaction`). Ele foi rodado a partir do banco de manutenção `postgres`:
+
+```console
+$ kubectl -n tipsbank-contas exec postgres-primary-0 -c postgres -- sh -c '
+    psql -U "$POSTGRES_USER" -d postgres -c "ALTER DATABASE tipsbank RESET default_transaction_read_only;" \
+      -c "SELECT count(pg_terminate_backend(pid)) AS conexoes_derrubadas FROM pg_stat_activity WHERE datname = '\''tipsbank'\'' AND backend_type = '\''client backend'\'';" &&
+    psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SHOW default_transaction_read_only;"'
+ALTER DATABASE
+ conexoes_derrubadas
+---------------------
+                  14
+off
+```
+
+Consistência: as transferências falharam no **débito** (o 1º passo), então nenhum saldo foi alterado pela metade. Primary e réplica, depois do teste:
+
+```console
+SELECT id, titular, saldo FROM contas ORDER BY 1;
+ 11111111-1111-1111-1111-111111111111 | Jeferson Fernando | 9616.33
+ 185b2ed8-1485-4924-bbbc-377607b08c25 | Teste Replica 3.3 |   33.33      # conta de teste da 3.3
+ 22222222-2222-2222-2222-222222222222 | LinuxTips SA      |  883.67
+# 9616.33 + 883.67 = 10500.00, o mesmo total de antes (3.3); réplica com os mesmos valores
+```
+
+#### Teste 4 — `TipsBankPodCrashLoop`: imagem que não sobe
+
+A mesma v1.9.9 da 3.2 (`ENTRYPOINT` com `main:aplicacao`, que não existe):
+
+```console
+$ kubectl -n tipsbank-transacoes set image deploy/api-transacoes \
+    app=ghcr.io/jlui70/tipsbank-api-transacoes:v1.9.9@sha256:7f6533fd0a6d7454363bcb9645313f9b4d4b8f7257b9892ba99280e7aecb4a8a
+$ kubectl -n tipsbank-transacoes annotate deploy/api-transacoes \
+    kubernetes.io/change-cause="3.6: v1.9.9 QUEBRADA (teste do alerta TipsBankPodCrashLoop)" --overwrite
+
+$ kubectl -n tipsbank-transacoes get pods -l app.kubernetes.io/name=api-transacoes
+NAME                                 READY   STATUS             RESTARTS      AGE
+api-transacoes-69cf84c-x7d7d         1/2     CrashLoopBackOff   4 (30s ago)   2m27s
+api-transacoes-789cc4774f-ffs4r      2/2     Running            0             5h31m
+api-transacoes-789cc4774f-prvb8      2/2     Running            0             5h31m
+api-transacoes-v2-748cf768fd-mlnxj   2/2     Running            0             5h31m
+
+$ kubectl -n tipsbank-transacoes describe pod -l pod-template-hash=69cf84c | grep -E "Image:|Last State|Reason|Exit Code|Restart Count|BackOff"
+    Image:         ghcr.io/jlui70/tipsbank-api-transacoes:v1.9.9@sha256:7f6533fd…
+      Reason:       CrashLoopBackOff
+    Last State:     Terminated
+      Reason:       Error
+      Exit Code:    1
+    Restart Count:  4
+  Warning  BackOff    26s (x12 over 2m14s)  kubelet  spec.containers{app}: Back-off restarting failed container app ...
+
+$ kubectl -n tipsbank-transacoes logs -l pod-template-hash=69cf84c -c app --previous --tail=3
+{"ts":"2026-11-06 17:05:00,497","level":"ERROR","service":"api-transacoes","logger":"uvicorn.error","msg":"Error loading ASGI app. Attribute "aplicacao" not found in module "main"."}
+```
+
+Restarts ao longo do teste (backoff do kubelet: 10 s, 20 s, 40 s, 80 s…): 1 às 14:03:19, 2 às 14:03:29, 3 às 14:04:01, **4 às 14:05:04 → firing às 14:05:25**.
+
+![Alertmanager: TipsBankPodCrashLoop](img/3.6-04-crashloop.png)
+
+![Terminal: pod em CrashLoopBackOff, Exit Code 1 e a causa no log](img/3.6-04b-crashloop-terminal.png)
+
+No print do Alertmanager, `job="kube-state-metrics"`, `instance` e `service` são de **quem exporta** a métrica (o kube-state-metrics), não do pod com problema. O que identifica o pod são `namespace`, `pod` e `container`.
+
+Graças ao `maxSurge: 1 / maxUnavailable: 0` da 3.2, o rollout parou no pod novo e os 2 pods da v1.0.0 seguiram atendendo: nenhum 5xx no tráfego durante o teste.
+
+```console
+$ kubectl -n tipsbank-transacoes rollout undo deploy/api-transacoes
+deployment.apps/api-transacoes rolled back
+deployment "api-transacoes" successfully rolled out
+$ kubectl -n tipsbank-transacoes rollout history deploy/api-transacoes | tail -3
+12        3.3: podAntiAffinity preferred (hostname)
+14        3.6: v1.9.9 QUEBRADA (teste do alerta TipsBankPodCrashLoop)
+15        3.6: rollback da v1.9.9 (volta para v1.0.0)      # a revisão 13 (3.4) virou a 15: mesmo ReplicaSet 789cc4774f
+```
+
+O alerta só saiu de `firing` às **14:13:50**, 5 min depois de o pod quebrado ser apagado. `increase(...[10m])` olha as amostras dos últimos 10 min: a série do pod parou de existir às 14:08, mas as amostras antigas ficam dentro da janela até ela "rolar". É o comportamento normal de alertas com janela: o alerta "lembra" do problema por um tempo.
+
+### Estado final
+
+```console
+# todos os TipsBank* inactive às 14:13:50; o que sobra ativo no Alertmanager:
+CPUThrottlingHigh info tipsbank-transacoes api-transacoes-789cc4774f-ffs4r active
+CPUThrottlingHigh info tipsbank-transacoes api-transacoes-789cc4774f-prvb8 active
+CPUThrottlingHigh info tipsbank-transacoes api-transacoes-v2-748cf768fd-mlnxj active
+CPUThrottlingHigh info kube-system calico-kube-controllers-55947b86cb-g7rpz suppressed
+CPUThrottlingHigh info tipsbank-monitoring kps-prometheus-node-exporter-64j4w suppressed
+InfoInhibitor none kube-system  suppressed
+InfoInhibitor none tipsbank-monitoring  suppressed
+Watchdog none   active
+```
+
+Nodes 4/4 `Ready`, todos os pods prontos, 8/8 alvos `up`, banco com `read_only = off`, réplica em `streaming`. Tráfego total do laço nos 4 testes: 9471×200, 2300×201, 631×401, 451×404 e 857×500. Todos os 500 saíram na janela do Teste 3.
+
+### Reavaliação do `CPUThrottlingHigh` (pendência da 3.5)
+
+```console
+# fração dos períodos de CPU (100 ms) com throttling, últimos 5 min
+log-forwarder  api-transacoes-789cc4774f-ffs4r     0,63
+log-forwarder  api-transacoes-789cc4774f-prvb8     0,63
+log-forwarder  api-transacoes-v2-748cf768fd-mlnxj  0,65
+calico-kube-controllers                            0,64
+node-exporter  kps-prometheus-node-exporter-64j4w  0,33
+# uso médio real de CPU do log-forwarder: ~2 milicores (limit: 50m)
+```
+
+O sidecar usa **4% do limit** e mesmo assim tem throttling em ~63% dos períodos. Não é falta de CPU: o `tail -F` acorda em rajadas curtas a cada linha de log, e o CFS conta como "throttled" qualquer período em que a rajada passou da cota (50m = 5 ms a cada 100 ms), mesmo que dure microssegundos. Com uso médio tão abaixo do limit, o atraso é desprezível.
+
+Decisão: **manter o limit de 50m do manual** e manter a regra padrão (severity `info`, que o `InfoInhibitor` já trata como ruído). Silenciar no Alertmanager seria estado manual fora do Git, e desligar a regra também esconderia throttling real nas APIs. Na 3.7 o mesmo dado será visto sob carga do Locust.
+
+### Observações para as próximas etapas
+
+| Achado | Impacto | Quando |
+|---|---|---|
+| api-contas não conta no `http_requests_total` os 500 de exceção não tratada | o `TipsBankErroAltoApi` não vê falha de banco na api-contas (só vê pela api-transacoes, que a chama) | correção na app (`try/finally` no middleware); registrado |
+| `TipsBankApiDown` não vê Deployment com 0 réplicas (o alvo some, `up` não vira 0) | API "sumida" não alerta por esta regra | coberto pelo `KubeDeploymentReplicasMismatch` do chart; `absent()` por job seria a alternativa |
+| Alertmanager só com o receiver `null` | os alertas aparecem na UI, mas ninguém é notificado | quando houver canal (Slack/e-mail); o label `team: tipsbank` já está nas regras para o roteamento |
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| Os 4 alertas em `kubectl get prometheusrule -A` | ✅ `tipsbank-slo` com `TipsBankApiDown`, `TipsBankP99Alto`, `TipsBankErroAltoApi`, `TipsBankPodCrashLoop`; `health=ok` no Prometheus |
+| Todos disparam quando a condição é provocada | ✅ 4/4 em `firing` no Alertmanager (prints `3.6-01` a `3.6-04`), cada falha desfeita e o alerta resolvido |
