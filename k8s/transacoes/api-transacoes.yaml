@@ -43,6 +43,15 @@ spec:
         runAsGroup: 65532
         fsGroup: 65532
         seccompProfile: {type: RuntimeDefault}
+      # 3.3: PREFERE espalhar as réplicas por nodes diferentes (preferred: se não houver node
+      # livre, o pod sobe mesmo assim no mesmo node — não trava o deploy nem o HPA da 3.7)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector: {matchLabels: {app.kubernetes.io/name: api-transacoes}}
+                topologyKey: kubernetes.io/hostname
       containers:
         - name: app              # nome fixo: o HPA ContainerResource (Semana 3) referencia "app"
           image: ghcr.io/jlui70/tipsbank-api-transacoes:v1.0.0@sha256:415945fea3f0cd8e69fb4e736e6f071bde7ad948783a22b09c30aac7c12a2c6e

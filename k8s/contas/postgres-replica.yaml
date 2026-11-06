@@ -1,0 +1,116 @@
+# Etapa 3.3 — Postgres replica: réplica streaming (hot standby, somente leitura) do postgres-primary.
+# - initContainer: no primeiro boot (PVC vazio) copia o primary com pg_basebackup -R
+#   (-R grava standby.signal + primary_conninfo: o Postgres sobe como réplica).
+# - AntiAffinity OBRIGATÓRIA com o primary: nunca no mesmo node (um node que cai não leva os dois).
+# - Tolera o taint compliance=strict (é um pod do Postgres), mas a AntiAffinity a tira do tipsbank-w3,
+#   onde está o primary: ela vai para o tipsbank-w1 ou o tipsbank-w2.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-replica
+  namespace: tipsbank-contas
+  labels: {app.kubernetes.io/name: postgres-replica, app.kubernetes.io/part-of: tipsbank}
+spec:
+  clusterIP: None
+  selector: {app.kubernetes.io/name: postgres-replica}
+  ports:
+    - {name: postgres, port: 5432, targetPort: postgres}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-replica
+  namespace: tipsbank-contas
+  labels: {app.kubernetes.io/name: postgres-replica, app.kubernetes.io/part-of: tipsbank, role: db}
+spec:
+  serviceName: postgres-replica
+  replicas: 1                  # 1 slot de replicação no primary (postgres_replica_0)
+  selector:
+    matchLabels: {app.kubernetes.io/name: postgres-replica}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: postgres-replica, app.kubernetes.io/part-of: tipsbank, role: db}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70          # usuário postgres da imagem alpine
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile: {type: RuntimeDefault}
+      tolerations:
+        - {key: compliance, operator: Equal, value: strict, effect: NoSchedule}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: {matchLabels: {app.kubernetes.io/name: postgres-primary}}
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: basebackup
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - |
+              if [ -s "$PGDATA/PG_VERSION" ]; then
+                echo "PGDATA já inicializado: pulando o pg_basebackup"; exit 0
+              fi
+              exec pg_basebackup -h postgres-primary-0.postgres-primary.tipsbank-contas.svc.cluster.local \
+                -U replicator -D "$PGDATA" -R -X stream -S postgres_replica_0 -P -v
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: PGPASSWORD                 # lida pelo pg_basebackup (e gravada no primary_conninfo pelo -R)
+              valueFrom: {secretKeyRef: {name: postgres-credentials, key: REPLICATION_PASSWORD}}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+          securityContext:
+            runAsUser: 70
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - {name: postgres, containerPort: 5432}
+          env:
+            - name: POSTGRES_USER                # só para as probes (pg_isready); o banco já vem do primary
+              valueFrom: {secretKeyRef: {name: postgres-credentials, key: POSTGRES_USER}}
+            - name: POSTGRES_DB
+              valueFrom: {secretKeyRef: {name: postgres-credentials, key: POSTGRES_DB}}
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: run, mountPath: /var/run/postgresql}
+            - {name: tmp, mountPath: /tmp}
+          securityContext:
+            runAsUser: 70
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          readinessProbe:
+            exec: {command: [sh, -c, 'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"']}
+            periodSeconds: 5
+          livenessProbe:
+            exec: {command: [sh, -c, 'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"']}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 2Gi}

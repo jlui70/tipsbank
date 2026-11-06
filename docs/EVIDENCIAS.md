@@ -2473,3 +2473,174 @@ O rollback foi instantâneo: o template voltou a ser igual ao do ReplicaSet `68d
 | `rollout history` com ≥ 3 revisões | ✅ 6 revisões listadas, com CHANGE-CAUSE |
 | `rollout undo` volta a versão, pod Ready | ✅ imagem v1.0.0, 2/2 pods `2/2 Running` |
 | Extra: rollout sem erro com `preStop` | ✅ 5/848 falhas → 0/1164 |
+
+---
+
+## Etapa 3.3 — Affinity, AntiAffinity, Taints e Tolerations
+
+**Data**: 2026-11-06 · **Arquivos**: [`infra/kubeadm/add-worker.sh`](../infra/kubeadm/add-worker.sh), [`k8s/contas/postgres.yaml`](../k8s/contas/postgres.yaml), [`k8s/contas/postgres-replica.yaml`](../k8s/contas/postgres-replica.yaml), [`sql/00-replicacao.sh`](../sql/00-replicacao.sh), [`k8s/contas/configmap-postgres-init.yaml`](../k8s/contas/configmap-postgres-init.yaml), [`k8s/contas/networkpolicy.yaml`](../k8s/contas/networkpolicy.yaml), [`k8s/gerar-secrets.sh`](../k8s/gerar-secrets.sh); `affinity` em `api-contas`, `api-transacoes`, `auditoria` e `web`
+
+### Decisão: um 3º worker dedicado
+
+Com só 2 workers, o manual entra em conflito consigo mesmo:
+
+- **Passo 3 vs. passo 1:** com o taint num dos 2 workers, todas as APIs ficam no outro, e a anti-affinity do passo 1 não tem para onde espalhar.
+- **Passo 2 vs. passo 4:** o passo 2 exige primary e replica em nodes **diferentes** (`required`), mas o passo 4 manda "os pods do Postgres" para **o** node com taint, e há um só.
+
+Solução: um worker novo, `tipsbank-w3` (192.168.122.14, 2 vCPU / 3 GiB), criado com a mesma receita da 1.3 (`infra/kubeadm/add-worker.sh`), com taint e label `compliance=strict`. É o padrão de produção: um *node pool* dedicado a dados regulados.
+
+| Pod | Toleration | Regra de node | Onde ficou |
+|---|---|---|---|
+| `postgres-primary` | `compliance=strict:NoSchedule` | `nodeAffinity` **required** `compliance In [strict]` | `tipsbank-w3` |
+| `postgres-replica` | `compliance=strict:NoSchedule` | `podAntiAffinity` **required** com o primary (`hostname`) | `tipsbank-w1` (não pode ir para o w3, onde está o primary) |
+| APIs e web | nenhuma | `podAntiAffinity` **preferred** entre réplicas (`hostname`) | `tipsbank-w1` + `tipsbank-w2` |
+
+A toleration só **permite** entrar no node com taint; é a `nodeAffinity` que **obriga** o primary a ir para lá.
+
+```console
+$ ./infra/kubeadm/add-worker.sh tipsbank-w3 192.168.122.14 52:54:00:7b:00:14
+...
+This node has joined the cluster:
+OK: tipsbank-w3 (192.168.122.14) entrou no cluster          # 08:07:15 → 08:09:02
+
+$ kubectl taint node tipsbank-w3 compliance=strict:NoSchedule
+node/tipsbank-w3 tainted
+$ kubectl label node tipsbank-w3 compliance=strict
+node/tipsbank-w3 labeled
+```
+
+### Passo 1 — `podAntiAffinity` preferred nos Deployments com mais de 1 réplica
+
+```yaml
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector: {matchLabels: {app.kubernetes.io/name: api-contas}}
+                topologyKey: kubernetes.io/hostname
+```
+
+Em `api-contas` (2), `api-transacoes` (2), `auditoria` (3) e `web` (2). `preferred` e não `required`: com mais réplicas que nodes (auditoria 3 em 2 nodes, ou o HPA da 3.7 escalando), o pod sobe mesmo assim. Aplicado com tráfego contínuo: **1276/1276 `200`** (o `preStop` da 3.2 fazendo efeito).
+
+```console
+NAMESPACE             NAME                                NODE
+tipsbank-auditoria    auditoria-59b55d4894-5rjz9          tipsbank-w1
+tipsbank-auditoria    auditoria-59b55d4894-k9wjw          tipsbank-w2
+tipsbank-auditoria    auditoria-59b55d4894-mnrkl          tipsbank-w1      # 3 réplicas em 2 nodes: 2+1
+tipsbank-contas       api-contas-945fcb5dc-g4z4s          tipsbank-w2
+tipsbank-contas       api-contas-945fcb5dc-sqvlv          tipsbank-w1
+tipsbank-transacoes   api-transacoes-56bfc4d9b9-28r9h     tipsbank-w2
+tipsbank-transacoes   api-transacoes-56bfc4d9b9-n9pwz     tipsbank-w1
+tipsbank-transacoes   api-transacoes-v2-5f876c888-sc8cc   tipsbank-w1      # 1 réplica (canary)
+tipsbank-web          web-67f8bf4b47-7qvpx                tipsbank-w2
+tipsbank-web          web-67f8bf4b47-mrqlm                tipsbank-w1
+```
+
+### Passo 2 — `postgres-replica`: réplica streaming real
+
+- **No primary (primeiro boot):** `sql/00-replicacao.sh` (no ConfigMap `postgres-init`, executado antes do `init.sql`) cria o role `replicator` (`REPLICATION`, não superusuário), o slot físico `postgres_replica_0` e a linha `host replication replicator all scram-sha-256` no `pg_hba.conf`. A senha (`REPLICATION_PASSWORD`) é gerada pelo `k8s/gerar-secrets.sh` e fica fora do Git, como as outras.
+- **Na replica:** um initContainer roda `pg_basebackup -R -X stream -S postgres_replica_0` quando o PVC está vazio; o `-R` grava `standby.signal` + `primary_conninfo`, e o Postgres sobe em **hot standby** (só leitura).
+- **NetworkPolicy:** `postgres-ingress` aceita também a replica; a nova `postgres-replica-egress-primary` deixa a replica sair só para o primary:5432. Ninguém entra na replica (vale o `default-deny`).
+
+**Migração do primary para o w3.** O volume `local-path` fica preso ao node onde foi criado (`tipsbank-w1`), e o usuário de replicação precisa ser criado no initdb. Por isso, o primary foi recriado:
+
+```console
+$ Q="select (select count(*) from contas), (select count(*) from transacoes), (select sum(saldo) from contas)"
+$ kubectl exec postgres-primary-0 -- psql -Atc "$Q"                                     # antes
+2|381|10500.00
+$ kubectl exec postgres-primary-0 -- pg_dump -Fc ... > tipsbank-antes-3.3.dump        # 15,6 KB
+$ kubectl patch pv pvc-6cce5c49-... -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'   # plano B: dados antigos ficam no disco do w1
+$ kubectl delete sts postgres-primary && kubectl delete pvc data-postgres-primary-0
+$ kubectl apply -f k8s/contas/postgres.yaml
+/usr/local/bin/docker-entrypoint.sh: running /docker-entrypoint-initdb.d/00-replicacao.sh
+CREATE ROLE
+/usr/local/bin/docker-entrypoint.sh: running /docker-entrypoint-initdb.d/init.sql
+$ kubectl exec -i postgres-primary-0 -- pg_restore --clean --if-exists --no-owner --exit-on-error ... < tipsbank-antes-3.3.dump
+$ kubectl exec postgres-primary-0 -- psql -Atc "$Q"                                     # depois (já no w3)
+2|381|10500.00                                                            # DADOS IGUAIS
+```
+
+A replica:
+
+```console
+$ kubectl logs postgres-replica-0 -c basebackup | tail -2
+pg_basebackup: renaming backup_manifest.tmp to backup_manifest
+pg_basebackup: base backup completed
+$ kubectl logs postgres-replica-0 -c postgres | tail -2
+LOG:  database system is ready to accept read-only connections
+LOG:  started streaming WAL from primary at 0/3000000 on timeline 1
+
+# no primary
+$ psql -xc "select client_addr, usename, state, sync_state, sent_lsn, replay_lsn from pg_stat_replication"
+client_addr      | 10.244.41.74          # postgres-replica-0
+usename          | replicator
+state            | streaming
+sync_state       | async
+sent_lsn         | 0/3000550
+replay_lsn       | 0/3000550             # replica em dia
+```
+
+Prova de ponta a ponta: uma conta criada **pela API** (que grava no primary) aparece na replica, e a replica recusa escrita:
+
+```console
+$ curl -sk -X POST https://api.tipsbank.local/contas/contas -d '{"titular":"Teste Replica 3.3","documento":"33333333303","senha":"...","saldo_inicial":33.33}'
+{"id":"185b2ed8-...","titular":"Teste Replica 3.3","documento":"33333333303","saldo":"33.33"} [201]
+
+$ kubectl exec postgres-replica-0 -- psql -c "select pg_is_in_recovery()" -c "select titular, documento, saldo from contas where documento='33333333303'"
+ pg_is_in_recovery
+ t
+      titular      |  documento  | saldo
+ Teste Replica 3.3 | 33333333303 | 33.33
+
+$ kubectl exec postgres-replica-0 -- psql -c "delete from contas where documento='33333333303'"
+ERROR:  cannot execute DELETE in a read-only transaction
+
+# NetworkPolicy: api-contas → replica:5432
+BLOQUEADO timed out
+```
+
+### Critério 1 — primary e replica em nodes diferentes
+
+```console
+$ kubectl get pods -o wide -n tipsbank-contas | grep postgres
+postgres-primary-0           1/1     Running   0          4m55s   10.244.64.197   tipsbank-w3   <none>           <none>
+postgres-replica-0           1/1     Running   0          3m17s   10.244.41.74    tipsbank-w1   <none>           <none>
+```
+
+### Critério 2 — pods sem toleration não vão para o node com taint
+
+No `tipsbank-w3` só rodam o `postgres-primary-0` e os DaemonSets de sistema (`calico-node`, `kube-proxy`, que toleram qualquer taint). A `api-contas` escalada para 6 réplicas, e um pod que **pede** o w3 (`nodeSelector: {compliance: strict}`) sem toleration:
+
+```console
+$ kubectl -n tipsbank-contas scale deploy/api-contas --replicas=6
+$ kubectl -n tipsbank-contas get pods -l app.kubernetes.io/name=api-contas -o wide --no-headers | awk '{print $7}' | sort | uniq -c
+      3 tipsbank-w1
+      3 tipsbank-w2                       # nenhuma no w3
+
+$ kubectl get pod teste-sem-toleration
+teste-sem-toleration   0/1     Pending   0          8s
+Warning   FailedScheduling   0/4 nodes are available: 2 node(s) didn't match Pod's node affinity/selector, 2 node(s) had untolerated taint(s). ...
+```
+
+(Pod de teste apagado e `api-contas` de volta a 2 réplicas.)
+
+### Critério 3 — `kubectl describe node` confirma o taint
+
+```console
+$ kubectl describe node tipsbank-w3 | grep -E '^Name|compliance|^Taints'
+Name:               tipsbank-w3
+                    compliance=strict
+Taints:             compliance=strict:NoSchedule
+```
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| primary e replica em nodes diferentes | ✅ `tipsbank-w3` × `tipsbank-w1` (AntiAffinity required) |
+| APIs sem toleration fora do node com taint | ✅ 6 réplicas em w1/w2; pod forçado `Pending` com `untolerated taint` |
+| `describe node` com o taint | ✅ `compliance=strict:NoSchedule` |
+| Réplicas de uma mesma API em nodes diferentes | ✅ podAntiAffinity preferred; rollout 1276/1276 `200` |
+| Replica streaming real | ✅ `state streaming`, insert pela API visível na replica, escrita recusada |
+| Migração do primary sem perda | ✅ `2|381|10500.00` antes e depois; PV antigo em `Retain` |

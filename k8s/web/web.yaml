@@ -33,6 +33,15 @@ spec:
         runAsUser: 101
         runAsGroup: 101
         seccompProfile: {type: RuntimeDefault}
+      # 3.3: PREFERE espalhar as réplicas por nodes diferentes (preferred: se não houver node
+      # livre, o pod sobe mesmo assim no mesmo node — não trava o deploy nem o HPA da 3.7)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector: {matchLabels: {app.kubernetes.io/name: web}}
+                topologyKey: kubernetes.io/hostname
       containers:
         - name: app
           image: ghcr.io/jlui70/tipsbank-web:v1.0.0@sha256:852f48826838c0de6a5dd73880ef13c151464f6f26bdc2ae90f5d9423b966ded

@@ -1,4 +1,6 @@
 # Postgres primary: Headless Service + StatefulSet (Day-7) com PVC de 2Gi na StorageClass default (Day-6).
+# Etapa 3.3: roda no node dedicado tipsbank-w3 (taint compliance=strict:NoSchedule + label compliance=strict)
+# e é a origem da réplica streaming (postgres-replica.yaml).
 apiVersion: v1
 kind: Service
 metadata:
@@ -32,6 +34,15 @@ spec:
         runAsGroup: 70
         fsGroup: 70
         seccompProfile: {type: RuntimeDefault}
+      # 3.3: a toleration PERMITE entrar no node com taint; a nodeAffinity OBRIGA a ir para ele
+      tolerations:
+        - {key: compliance, operator: Equal, value: strict, effect: NoSchedule}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: compliance, operator: In, values: [strict]}
       containers:
         - name: postgres
           image: postgres:16-alpine
@@ -44,6 +55,8 @@ spec:
               valueFrom: {secretKeyRef: {name: postgres-credentials, key: POSTGRES_PASSWORD}}
             - name: POSTGRES_DB
               valueFrom: {secretKeyRef: {name: postgres-credentials, key: POSTGRES_DB}}
+            - name: REPLICATION_PASSWORD         # usado só pelo 00-replicacao.sh no primeiro boot
+              valueFrom: {secretKeyRef: {name: postgres-credentials, key: REPLICATION_PASSWORD}}
             - name: PGDATA                       # subdiretório: o initdb exige diretório vazio
               value: /var/lib/postgresql/data/pgdata
           volumeMounts:
@@ -68,7 +81,7 @@ spec:
             limits: {cpu: 500m, memory: 512Mi}
       volumes:
         - name: init
-          configMap: {name: postgres-init}
+          configMap: {name: postgres-init, defaultMode: 0555}   # .sh executável: o entrypoint executa (sem isso faz "source")
         - name: run
           emptyDir: {}
         - name: tmp

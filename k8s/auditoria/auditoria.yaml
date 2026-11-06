@@ -31,6 +31,15 @@ spec:
         runAsGroup: 65532
         fsGroup: 65532
         seccompProfile: {type: RuntimeDefault}
+      # 3.3: PREFERE espalhar as réplicas por nodes diferentes (preferred: se não houver node
+      # livre, o pod sobe mesmo assim no mesmo node — não trava o deploy nem o HPA da 3.7)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector: {matchLabels: {app.kubernetes.io/name: auditoria}}
+                topologyKey: kubernetes.io/hostname
       containers:
         - name: app              # nome fixo: o HPA ContainerResource (Semana 3) referencia "app"
           image: ghcr.io/jlui70/tipsbank-auditoria:v1.0.0@sha256:64768d4d27788fe6e390ffb27e1cca5ae068a79a1779e98eb6702ba1ab2af3b2

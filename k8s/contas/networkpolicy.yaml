@@ -84,5 +84,23 @@ spec:
         - podSelector: {matchLabels: {app.kubernetes.io/name: api-contas, role: app}}
         - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-transacoes}}
           podSelector: {matchLabels: {app.kubernetes.io/name: api-transacoes, role: app}}
+        - podSelector: {matchLabels: {app.kubernetes.io/name: postgres-replica}}   # 3.3: replicação streaming
+      ports:
+        - {protocol: TCP, port: 5432}
+---
+# 3.3: a réplica só sai para o primary (pg_basebackup + streaming do WAL). Ninguém entra nela
+# (sem policy de ingress = vale o default-deny): a app não lê da réplica.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-replica-egress-primary
+  namespace: tipsbank-contas
+  labels: {app.kubernetes.io/part-of: tipsbank}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: postgres-replica}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector: {matchLabels: {app.kubernetes.io/name: postgres-primary}}
       ports:
         - {protocol: TCP, port: 5432}
