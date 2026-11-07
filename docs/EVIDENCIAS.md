@@ -3937,3 +3937,216 @@ Isso teria travado o scale-down do HPA, todo rollout e a limpeza de PVCs. A corr
 | `kubectl get cpol` mostra 3 policies Ready | ✅ READY `True` nas 3, em Enforce (`status.ready` depreciado: ver nota) |
 | 3 tentativas de pods "ruins" com a mensagem do Kyverno | ✅ `nginx:latest`, `runAsUser: 0`, Deployment sem `team`/`env` (+ 13 casos de borda) |
 | Todos os pods existentes do TipsBank passam | ✅ `fail=0` em todos os namespaces enforce; 0 workloads sem labels |
+
+---
+
+## Etapa 4.2 — Kyverno: Mutate (injetar securityContext)
+
+**Data**: 2026-11-07 · **Arquivos**: [`infra/kyverno/policies/mutate-security-context.yaml`](../infra/kyverno/policies/mutate-security-context.yaml), [`infra/kyverno/policies/disallow-security-context-optout.yaml`](../infra/kyverno/policies/disallow-security-context-optout.yaml), [`infra/kyverno/exceptions/`](../infra/kyverno/exceptions/)
+
+### Antes: quem ainda não declarava os 3 campos?
+
+```console
+$ kubectl get pods -A -o json | jq -r '... containers sem readOnlyRootFilesystem=true, allowPrivilegeEscalation=false ou runAsNonRoot=true (fora de kube-system/kyverno)'
+ingress-nginx        ingress-nginx-controller  c:controller     RO=false  APE=false  NR=true
+tipsbank-monitoring  kps-prometheus-node       c:node-exporter  RO=true   APE=null   NR=true
+```
+
+Só 2 containers, porque os manifests do TipsBank já declaravam os 3 campos desde a 1.4. O `ingress-nginx` declara `readOnlyRootFilesystem: false` **de propósito**: o controller reescreve o `/etc/nginx` a cada mudança de Ingress.
+
+### Decisões
+
+| Decisão | Por quê |
+|---|---|
+| `+(campo)`: só adiciona o que está **ausente** | Não sobrescreve uma escolha declarada pelo time (ex.: `runAsUser: 101` continua 101) |
+| Policy Validate complementar **`disallow-security-context-optout`** (Enforce) | Sem ela, o mutate seria contornado escrevendo `readOnlyRootFilesystem: false`. Opt-out explícito (`readOnlyRootFilesystem: false`, `allowPrivilegeEscalation: true`, `runAsNonRoot: false` ou `privileged: true`) só com PolicyException |
+| Só `Pod`, só `CREATE`, **sem autogen** (`pod-policies.kyverno.io/autogen-controllers: none`) | Com autogen, o Kyverno reescreveria o template de Deployments/StatefulSets em todo `apply`/`helm upgrade`, disparando rollouts que ninguém pediu. O Git continua sendo a fonte da verdade; o mutate é rede de segurança. No `UPDATE` de Pod o securityContext é imutável |
+| `containers` **e** `initContainers` | O initContainer roda com os mesmos privilégios no mesmo node |
+| Exceção `ingress-nginx-controller` (só a regra de opt-out) | Ver [`exceptions/ingress-nginx-controller.yaml`](../infra/kyverno/exceptions/ingress-nginx-controller.yaml): continua uid 101, `allowPrivilegeEscalation: false`, `drop: [ALL]` + `NET_BIND_SERVICE`. Tornar read-only exige mapear todos os paths do nginx em emptyDir, e testar isso derrubaria o tráfego do lab (SPOF da 4.1) |
+| Exceção do helper do local-path ampliada para o mutate | Ele roda com uid 0; se ganhasse `runAsNonRoot: true`, o kubelet recusaria o pod e nenhum PVC seria criado |
+| Exceções aplicadas **antes** das policies (`install.sh`) | Senão, no intervalo entre os dois `apply`, PVC e Ingress ficam bloqueados |
+
+### Critério 1 — Pod sem securityContext recebe o contexto mutado
+
+```console
+$ kubectl -n teste-mutate run nginx --image=nginx:1.27
+pod/nginx created
+
+$ kubectl -n teste-mutate get pod nginx -o json | jq '{spec_securityContext: .spec.securityContext, container: .spec.containers[0] | {name, image, securityContext}}'
+{
+  "spec_securityContext": {},
+  "container": {
+    "name": "nginx",
+    "image": "nginx:1.27",
+    "securityContext": {
+      "allowPrivilegeEscalation": false,
+      "readOnlyRootFilesystem": true,
+      "runAsNonRoot": true
+    }
+  }
+}
+
+$ kubectl -n teste-mutate get pod nginx
+NAME    READY   STATUS                       RESTARTS   AGE
+nginx   0/1     CreateContainerConfigError   0          15s
+$ kubectl -n teste-mutate get events --field-selector involvedObject.name=nginx
+Warning   Failed   pod/nginx   Error: container has runAsNonRoot and image will run as root (pod: "nginx_teste-mutate(...)", container: nginx)
+```
+
+O pod foi **criado** (o mutate injetou `runAsNonRoot`, então a `disallow-root-user` aceitou), mas a imagem oficial do nginx roda como root e o **kubelet** recusou iniciar. O Kyverno não precisa conhecer o USER de cada imagem: o kubelet confere na hora de rodar. É defesa em camadas.
+
+O efeito do root filesystem read-only, com uma imagem não-root:
+
+```console
+$ kubectl -n teste-mutate run nginx-unpriv --image=nginxinc/nginx-unprivileged:1.27-alpine
+$ kubectl -n teste-mutate logs nginx-unpriv
+nginx: [emerg] mkdir() "/tmp/proxy_temp" failed (30: Read-only file system)
+$ kubectl -n teste-mutate get pod nginx-unpriv
+nginx-unpriv   0/1     Error     2 (18s ago)   26s
+
+# mesmo Pod com emptyDir em /tmp (o padrão do web do TipsBank desde a 1.4)
+$ kubectl -n teste-mutate exec nginx-unpriv-tmp -- sh -c 'id; touch /teste; touch /tmp/ok && echo "/tmp gravavel"; wget -qO- 127.0.0.1:8080 | grep -o "<title>.*</title>"'
+uid=101(nginx) gid=101(nginx) groups=101(nginx)
+touch: /teste: Read-only file system
+/tmp gravavel
+<title>Welcome to nginx!</title>
+```
+
+Os demais comportamentos (`kubectl run --dry-run=server`, que mostra o objeto já mutado):
+
+```console
+opt-out: readOnlyRootFilesystem false                      NEGADO: 'Opt-out do securityContext seguro exige PolicyException (TipsBank compliance): ...
+opt-out: allowPrivilegeEscalation true                     NEGADO: 'Opt-out do securityContext seguro exige PolicyException (TipsBank compliance): ...
+explicito preservado (runAsUser 101 + campos ausentes)     ACEITO {"runAsUser":101,"runAsNonRoot":true,"readOnlyRootFilesystem":true,"allowPrivilegeEscalation":false}
+initContainer tambem e mutado                              {"runAsNonRoot":true,"readOnlyRootFilesystem":true,"allowPrivilegeEscalation":false}
+excecao: ingress Deployment (UPDATE, RO false)             deployment.apps/ingress-nginx-controller configured (server dry run)
+excecao nao vale fora do ingress (mesmo nome, outro ns)    Opt-out do securityContext seguro exige PolicyException (TipsBank compliance)
+excecao do helper: nao recebe runAsNonRoot                 {"runAsUser":0}
+```
+
+A exceção do ingress também vale para Pods criados pelo ReplicaSet com `generateName` (nome ainda vazio na admissão): o pod do w2 foi apagado e recriado em 25 s, com `readOnlyRootFilesystem: false` preservado.
+
+### Critério 2 — as 3 APIs funcionando com root filesystem read-only
+
+Os 5 Deployments (api-contas, api-transacoes v1 e v2, auditoria, web) e o DaemonSet do node-exporter receberam `rollout restart`, então todos os pods passaram pelo mutate. Uma sonda HTTPS chamava as 3 APIs e o web via Ingress a cada 0,2 s:
+
+```console
+    297 api/auditoria/health/ready 200
+    297 api/contas/health/ready 200
+    297 api/transacoes/health/ready 200
+    297 web 200                                  # 1188/1188, nenhuma falha
+```
+
+```console
+$ kubectl get pods ... securityContext de cada container
+api-contas-8db7fb897-dqvs5          app            RO=true  APE=false  NR=true  uid=65532
+api-transacoes-85c4b49df5-bmzk2     app            RO=true  APE=false  NR=true  uid=65532
+api-transacoes-85c4b49df5-bmzk2     log-forwarder  RO=true  APE=false  NR=true  uid=65532
+api-transacoes-v2-5bd75f74df-mmwkn  app            RO=true  APE=false  NR=true  uid=65532
+auditoria-79f8944cb9-szppw          app            RO=true  APE=false  NR=true  uid=65532
+web-8ff57ff65-ltcm7                 app            RO=true  APE=false  NR=true  uid=101
+kps-prometheus-node-exporter        node-exporter  {"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"runAsNonRoot":true}   # APE veio do mutate
+```
+
+Transferência ponta a ponta (api-transacoes → api-contas → Postgres → auditoria no NFS):
+
+```console
+$ curl -sk -X POST https://app.tipsbank.local/api/transacoes/transferencias -H 'content-type: application/json' \
+    -d '{"origem_id":"8511f0ff-...","destino_id":"0379be89-...","valor":"1.00"}'
+{"id":"ba14dc75-a058-4eb7-a253-55c3f4317f15",...,"valor":"1.00","status":"concluida"}
+HTTP 201
+
+$ kubectl -n tipsbank-auditoria exec deploy/auditoria -- python3 -c '...'
+/data/eventos-2026-11-07.jsonl
+{"id": "4a98bf09-...", "recebido_em": "2026-11-07T11:55:16.867437+00:00", "tipo": "transferencia", "transacao_id": "ba14dc75-a058-4eb7-a253-55c3f4317f15", ...
+raiz: [Errno 30] Read-only file system: '/teste-ro'      # a raiz e read-only; o PV NFS em /data e gravavel
+```
+
+O Postgres **não** foi reiniciado só para a demonstração: o restart dá ~3 s de 503 (3.4). O template dos dois StatefulSets passou pelo webhook em dry-run e só ganharia `runAsNonRoot: true`, coerente com o uid 70:
+
+```console
+{"sts":"postgres-primary","c":[{"name":"postgres","sc":{"runAsUser":70,"runAsNonRoot":true,"readOnlyRootFilesystem":true,"allowPrivilegeEscalation":false}}]}
+{"sts":"postgres-replica","c":[{"name":"basebackup","sc":{"runAsUser":70,"runAsNonRoot":true,...}},{"name":"postgres","sc":{"runAsUser":70,"runAsNonRoot":true,...}}]}
+```
+
+E o provisionamento de volumes continua funcionando com o mutate ligado: um PVC foi criado, gravado (`gravado-no-pvc`) e apagado (`Volume pvc-b8696af2… has been deleted on tipsbank-w1`).
+
+### Achado: `kubectl debug --profile=sysadmin` entrava **privilegiado**
+
+Ao testar o `kubectl debug` (o container efêmero entra pelo subresource `pods/ephemeralcontainers` e não passa pelo mutate), apareceu uma brecha:
+
+```console
+$ kubectl -n teste-debug debug alvo --image=busybox:latest -- true
+disallow-latest-tag:
+  exigir-tag-sem-latest: 'Imagem sem tag ou com :latest e proibida (TipsBank compliance): debugger-hl2nd=busybox:latest'   # coberto
+
+$ kubectl -n teste-debug debug alvo --image=busybox:1.37 --profile=sysadmin -- true
+$ kubectl -n teste-debug get pod alvo -o json | jq -c '[.spec.ephemeralContainers[] | {name,image,securityContext}]'
+[{"name":"debugger-dxdzg","image":"busybox:1.37","securityContext":{"privileged":true}}]                                    # ENTROU
+```
+
+Nenhuma policy proibia `privileged: true`. Num Pod comum isso falhava por acaso: o mutate põe `allowPrivilegeEscalation: false`, e a API rejeita essa combinação com privileged. Container privilegiado vê os devices do node, o que na prática é acesso ao host. Fora do kube-system, nenhum pod usa privileged:
+
+```console
+$ kubectl get pods -A -o json | jq -r '... select(.securityContext.privileged==true) ...'
+kube-system/calico-node-* (upgrade-ipam, install-cni, ebpf-bootstrap, calico-node)
+kube-system/kube-proxy-*
+teste-debug/alvo debugger-dxdzg        # o do teste
+```
+
+`privileged: true` entrou na `disallow-security-context-optout`. Depois da correção:
+
+```console
+$ kubectl -n teste-debug2 debug alvo --image=busybox:1.37 --profile=sysadmin -- true
+disallow-security-context-optout:
+  proibir-optout: 'Opt-out do securityContext seguro exige PolicyException (TipsBank compliance): readOnlyRootFilesystem false,
+  allowPrivilegeEscalation true, runAsNonRoot false ou privileged true em: debugger-ldjfq'
+$ kubectl -n teste-debug2 debug alvo --image=busybox:1.37 --profile=general -- id      # debug comum continua permitido
+```
+
+Debug privilegiado em produção vira *break-glass*: uma PolicyException temporária, criada pela plataforma e registrada.
+
+### Estado final
+
+```console
+$ kubectl get cpol
+NAME                               ADMISSION   BACKGROUND   READY   AGE     MESSAGE
+disallow-latest-tag                true        true         True    34m     Ready
+disallow-root-user                 true        true         True    34m     Ready
+disallow-security-context-optout   true        true         True    5m39s   Ready
+mutate-security-context            true        true         True    5m39s   Ready
+require-labels                     true        true         True    34m     Ready
+
+$ kubectl get polex -n kyverno
+NAME                       AGE
+helper-pod-local-path      22m
+ingress-nginx-controller   5m41s
+
+$ PolicyReports por namespace
+cert-manager         pass=51   fail=0   skip=0
+ingress-nginx        pass=16   fail=0   skip=5      # skip = a excecao do controller, visivel no relatorio
+kube-system          pass=89   fail=20  skip=0      # nivel Audit (4.1)
+local-path-storage   pass=13   fail=0   skip=0
+tipsbank-auditoria   pass=53   fail=0   skip=0
+tipsbank-contas      pass=75   fail=0   skip=0
+tipsbank-loadtest    pass=25   fail=0   skip=0
+tipsbank-monitoring  pass=107  fail=0   skip=0
+tipsbank-transacoes  pass=90   fail=0   skip=0
+tipsbank-web         pass=45   fail=0   skip=0
+```
+
+### Observações para as próximas etapas
+
+| Achado | Impacto | Quando |
+|---|---|---|
+| Pods que ainda não reiniciaram (Postgres, kps, locust, cert-manager) só recebem o mutate no próximo restart | Nenhum precisa: todos já declaram os 3 campos ou foram conferidos em dry-run | registrado |
+| Pod Security Standards "baseline" ainda sem policy: `hostPath`, `hostNetwork`, `hostPID`, `capabilities.add` | node-exporter e node-agent usam hostPath/hostPID legitimamente; exigiria exceções nominais. Fica como decisão | 4.6 |
+| Quem pode `kubectl debug`/`exec` em produção | RBAC | 4.4 |
+| Exceção do ingress-nginx depende do controller aposentado | Revisar na troca do controller | pós-desafio |
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| Pod criado sem securityContext recebe o contexto mutado | ✅ `nginx:1.27` com os 3 campos injetados (e barrado pelo kubelet por rodar como root) |
+| As 3 APIs continuam funcionando com root filesystem read-only | ✅ rollout das 3 APIs + web com 1188/1188 200; transferência 201 com evento gravado na auditoria; escrita na raiz recusada |

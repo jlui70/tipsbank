@@ -4,7 +4,8 @@
 # no no (dono root) e precisa apagar dados de outros UIDs (PGDATA do postgres, uid 70).
 # Controles compensatorios:
 #   - so Pods cujo nome comeca com helper-pod- E no namespace local-path-storage;
-#   - so as 2 regras de root; disallow-latest-tag continua valendo (imagem com digest);
+#   - so as 2 regras de root e o mutate (que injetaria runAsNonRoot: true e o kubelet
+#     recusaria o uid 0); disallow-latest-tag e o opt-out continuam valendo;
 #   - template do helper versionado em infra/kubeadm/local-path-helper-pod.yaml:
 #     allowPrivilegeEscalation false, readOnlyRootFilesystem, sem token de SA, limits;
 #   - PolicyException so e aceita no namespace kyverno (features.policyExceptions);
@@ -20,6 +21,8 @@ spec:
   exceptions:
     - policyName: disallow-root-user
       ruleNames: [proibir-runasuser-0, exigir-nao-root]
+    - policyName: mutate-security-context
+      ruleNames: [containers, init-containers]
   match:
     any:
       - resources:

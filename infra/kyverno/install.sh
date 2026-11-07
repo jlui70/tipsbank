@@ -22,6 +22,8 @@ for c in background reports; do
 done
 kubectl -n kyverno rollout status deploy --timeout=180s
 
-kubectl apply -f "$DIR/policies/"
+# Excecoes ANTES das policies: senao, entre um apply e outro, o helper do
+# local-path e o ingress-nginx ficam bloqueados (PVC e Ingress parados).
 kubectl apply -f "$DIR/exceptions/"
+kubectl apply -f "$DIR/policies/"
 kubectl get cpol

@@ -1,0 +1,60 @@
+# Etapa 4.2 (complemento do Mutate) — Validate: proibe o opt-out EXPLICITO.
+# O mutate so preenche campos ausentes; sem esta regra, bastaria escrever
+# readOnlyRootFilesystem: false para escapar. Excecao so por PolicyException
+# (ns kyverno), com justificativa.
+# Inclui privileged: true. Em Pod normal o mutate (APE false) ja tornaria o Pod
+# invalido, mas o ephemeral container do `kubectl debug --profile=sysadmin` nao
+# passa pelo mutate e entrava privilegiado (achado no teste da 4.2). Debug
+# privilegiado em producao = break-glass com PolicyException temporaria.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-security-context-optout
+  annotations:
+    policies.kyverno.io/title: Proibir desligar o securityContext seguro
+    policies.kyverno.io/category: TipsBank Compliance
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Recusa containers com readOnlyRootFilesystem false, allowPrivilegeEscalation
+      true, runAsNonRoot false ou privileged true declarados explicitamente.
+spec:
+  background: true
+  rules:
+    - name: proibir-optout
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              operations: [CREATE, UPDATE]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kyverno]
+      validate:
+        failureAction: Enforce
+        failureActionOverrides:
+          - action: Audit
+            namespaces: [kube-system]
+        cel:
+          variables:
+            - name: containers
+              expression: >-
+                object.spec.containers
+                + object.spec.?initContainers.orValue([])
+                + object.spec.?ephemeralContainers.orValue([])
+            - name: ruins
+              expression: >-
+                variables.containers.filter(c,
+                  c.?securityContext.?readOnlyRootFilesystem.orValue(true) == false
+                  || c.?securityContext.?allowPrivilegeEscalation.orValue(false) == true
+                  || c.?securityContext.?runAsNonRoot.orValue(true) == false
+                  || c.?securityContext.?privileged.orValue(false) == true)
+                .map(c, c.name)
+          expressions:
+            - expression: size(variables.ruins) == 0
+              messageExpression: >-
+                'Opt-out do securityContext seguro exige PolicyException (TipsBank compliance):
+                readOnlyRootFilesystem false, allowPrivilegeEscalation true, runAsNonRoot false
+                ou privileged true em: '
+                + variables.ruins.join(', ')

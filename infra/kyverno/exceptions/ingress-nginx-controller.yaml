@@ -1,0 +1,30 @@
+# Excecao formal (etapa 4.2): ingress-nginx controller com root filesystem gravavel.
+#
+# Justificativa: o controller gera /etc/nginx/nginx.conf (e arquivos em /etc/nginx,
+# /tmp) em runtime a cada mudanca de Ingress; o chart declara
+# readOnlyRootFilesystem: false. Tornar read-only exigiria mapear todos os paths
+# gravaveis do nginx em emptyDir — e testar isso derrubaria o trafego do lab
+# (/etc/hosts aponta so para o w1; ver EVIDENCIAS 4.1).
+# Controles compensatorios:
+#   - so a regra de opt-out; root, latest e labels continuam valendo;
+#   - o container continua runAsNonRoot (uid 101), allowPrivilegeEscalation false,
+#     capabilities drop ALL + so NET_BIND_SERVICE (padrao do chart);
+#   - so o Deployment/ReplicaSet/Pods ingress-nginx-controller* no ns ingress-nginx.
+# Dono: plataforma. Revisao: no proximo upgrade do controller (ou na troca dele,
+# o projeto ingress-nginx foi aposentado em 03/2026).
+apiVersion: kyverno.io/v2
+kind: PolicyException
+metadata:
+  name: ingress-nginx-controller
+  namespace: kyverno
+  labels: {app: ingress-nginx, team: plataforma, env: producao}
+spec:
+  exceptions:
+    - policyName: disallow-security-context-optout
+      ruleNames: [proibir-optout, autogen-proibir-optout]
+  match:
+    any:
+      - resources:
+          kinds: [Pod, Deployment, ReplicaSet]
+          namespaces: [ingress-nginx]
+          names: ["ingress-nginx-controller*"]

@@ -1,0 +1,76 @@
+# Etapa 4.2 — Mutate: todo container de Pod novo recebe, SE NAO DECLAROU:
+#   runAsNonRoot: true, readOnlyRootFilesystem: true, allowPrivilegeEscalation: false
+#
+# Decisoes:
+# - +(campo) = "adiciona so se ausente": nao sobrescreve o que o time declarou.
+#   O opt-out explicito (ex.: readOnlyRootFilesystem: false) e barrado pela
+#   policy validate disallow-security-context-optout, salvo PolicyException.
+# - Só Pods, só CREATE. Sem autogen (anotacao abaixo): o Kyverno NAO reescreve o
+#   template de Deployments/StatefulSets. Senao, qualquer `kubectl apply` ou
+#   `helm upgrade` mudaria o template sem ninguem pedir e dispararia um rollout
+#   fora de hora; e o securityContext de um Pod existente e imutavel (UPDATE falharia).
+# - Mutate roda ANTES do validate: um Pod sem securityContext ganha runAsNonRoot e
+#   passa na disallow-root-user; se a imagem roda como root, o kubelet recusa
+#   iniciar (CreateContainerConfigError). Defesa em camadas.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: mutate-security-context
+  annotations:
+    pod-policies.kyverno.io/autogen-controllers: none
+    policies.kyverno.io/title: Injetar securityContext seguro
+    policies.kyverno.io/category: TipsBank Compliance
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Adiciona runAsNonRoot, readOnlyRootFilesystem e allowPrivilegeEscalation=false
+      em containers e initContainers que nao declararam esses campos.
+spec:
+  rules:
+    - name: containers
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              operations: [CREATE]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kyverno]
+      mutate:
+        foreach:
+          - list: request.object.spec.containers
+            patchStrategicMerge:
+              spec:
+                containers:
+                  - name: "{{ element.name }}"
+                    securityContext:
+                      +(runAsNonRoot): true
+                      +(readOnlyRootFilesystem): true
+                      +(allowPrivilegeEscalation): false
+    - name: init-containers
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              operations: [CREATE]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kyverno]
+      preconditions:
+        all:
+          - key: "{{ length(request.object.spec.initContainers || `[]`) }}"
+            operator: GreaterThan
+            value: 0
+      mutate:
+        foreach:
+          - list: request.object.spec.initContainers
+            patchStrategicMerge:
+              spec:
+                initContainers:
+                  - name: "{{ element.name }}"
+                    securityContext:
+                      +(runAsNonRoot): true
+                      +(readOnlyRootFilesystem): true
+                      +(allowPrivilegeEscalation): false
