@@ -1,0 +1,53 @@
+# Complemento de seguranca: /eventos da auditoria SOMENTE LEITURA pelo Ingress.
+# GET/HEAD passam (o SPA le a trilha); POST/PUT/DELETE recebem 403 do porteiro
+# (k8s/auditoria/porteiro.yaml). A api-transacoes continua gravando eventos direto no
+# Service auditoria:8080, sem passar pelo Ingress.
+# Path mais longo que o /auditoria(/|$)(.*) dos Ingress principais -> esta location vence.
+# upstream-hash-by igual ao dos outros Ingress da auditoria (balanceamento e por Service, 2.2).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auditoria-eventos-leitura
+  namespace: tipsbank-auditoria
+  labels: {app.kubernetes.io/name: auditoria, app.kubernetes.io/part-of: tipsbank, team: auditoria}
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$1
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$http_x_cliente"
+    nginx.ingress.kubernetes.io/auth-url: "http://auditoria-porteiro.tipsbank-auditoria.svc.cluster.local:8080/auth"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [api.tipsbank.local]
+      secretName: api-tipsbank-tls
+  rules:
+    - host: api.tipsbank.local
+      http:
+        paths:
+          - path: /auditoria/(eventos.*)
+            pathType: ImplementationSpecific
+            backend: {service: {name: auditoria, port: {number: 8080}}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auditoria-spa-eventos-leitura
+  namespace: tipsbank-auditoria
+  labels: {app.kubernetes.io/name: auditoria, app.kubernetes.io/part-of: tipsbank, team: auditoria}
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$1
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$http_x_cliente"
+    nginx.ingress.kubernetes.io/auth-url: "http://auditoria-porteiro.tipsbank-auditoria.svc.cluster.local:8080/auth"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [app.tipsbank.local]
+      secretName: app-tipsbank-tls
+  rules:
+    - host: app.tipsbank.local
+      http:
+        paths:
+          - path: /api/auditoria/(eventos.*)
+            pathType: ImplementationSpecific
+            backend: {service: {name: auditoria, port: {number: 8080}}}

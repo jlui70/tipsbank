@@ -20,7 +20,11 @@ if [[ "$CTX" != "eks-tipsbank" && -z "${FORCAR:-}" ]]; then
   exit 1
 fi
 
-for f in web/ingress.yaml contas/ingress.yaml transacoes/ingress.yaml auditoria/ingress.yaml ${CANARY:+transacoes/ingress-canary.yaml}; do
+# contas/ingress-bloqueio-interno.yaml e auditoria/ingress-eventos-somente-leitura.yaml: bloqueio dos
+# endpoints internos (complemento de seguranca da 4.4). No EKS o porteiro (auditoria/porteiro.yaml)
+# precisa estar aplicado antes, senao o /eventos fica fechado (fail-closed).
+for f in web/ingress.yaml contas/ingress.yaml contas/ingress-bloqueio-interno.yaml transacoes/ingress.yaml \
+         auditoria/ingress.yaml auditoria/ingress-eventos-somente-leitura.yaml ${CANARY:+transacoes/ingress-canary.yaml}; do
   echo "---"
   sed -e "s/\.tipsbank\.local/.$DOMINIO/g" \
       -e '/cert-manager.io\/cluster-issuer: tipsbank-ca/d' \

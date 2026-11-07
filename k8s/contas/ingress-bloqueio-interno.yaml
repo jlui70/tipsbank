@@ -1,0 +1,61 @@
+# Complemento de seguranca (achado em 2026-11-07): endpoints INTERNOS da api-contas expostos
+# pelo Ingress, sem autenticacao, desde a 2.1 (o Ingress encaminha todos os paths):
+#   POST /contas/{id}/saldo       credito/debito direto (criava dinheiro em qualquer conta)
+#   POST /transferencias-internas debito+credito atomico (so a api-transacoes deve chamar)
+# Quem chama esses endpoints e a api-transacoes, DIRETO pelo Service (NetworkPolicy
+# transacoes -> contas:8080, 2.5); o SPA nao usa nenhum dos dois. Entao o Ingress nega
+# esses paths para QUALQUER origem (403), sem mudar a aplicacao e sem snippet:
+#   - denylist-source-range 0.0.0.0/0 vale so para as locations DESTE Ingress;
+#   - com use-regex, o ingress-nginx ordena as locations pelo tamanho do path: estas,
+#     mais longas, vencem o /api/contas(/|$)(.*) do Ingress principal;
+#   - regex sem ancora no fim e case-insensitive (~*): /saldo/, /SALDO, ?x=1 tambem caem;
+#     o nginx normaliza a URI (//, /./, %2F) antes de casar a location.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-contas-bloqueio-interno
+  namespace: tipsbank-contas
+  labels: {app.kubernetes.io/name: api-contas, app.kubernetes.io/part-of: tipsbank, team: contas}
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/denylist-source-range: "0.0.0.0/0,::/0"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [api.tipsbank.local]
+      secretName: api-tipsbank-tls
+  rules:
+    - host: api.tipsbank.local
+      http:
+        paths:
+          - path: /contas/contas/[^/]+/saldo
+            pathType: ImplementationSpecific
+            backend: {service: {name: api-contas, port: {number: 8080}}}
+          - path: /contas/transferencias-internas
+            pathType: ImplementationSpecific
+            backend: {service: {name: api-contas, port: {number: 8080}}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-contas-spa-bloqueio-interno
+  namespace: tipsbank-contas
+  labels: {app.kubernetes.io/name: api-contas, app.kubernetes.io/part-of: tipsbank, team: contas}
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/denylist-source-range: "0.0.0.0/0,::/0"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [app.tipsbank.local]
+      secretName: app-tipsbank-tls
+  rules:
+    - host: app.tipsbank.local
+      http:
+        paths:
+          - path: /api/contas/contas/[^/]+/saldo
+            pathType: ImplementationSpecific
+            backend: {service: {name: api-contas, port: {number: 8080}}}
+          - path: /api/contas/transferencias-internas
+            pathType: ImplementationSpecific
+            backend: {service: {name: api-contas, port: {number: 8080}}}

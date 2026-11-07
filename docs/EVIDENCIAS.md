@@ -4717,3 +4717,79 @@ $ sudo grep -c 'POSTGRES_PASSWORD\|DB_URL' /var/log/kubernetes/audit/audit.log
 | Trilha de acesso ao banco | não | `log_connections` / `log_disconnections` |
 | Trilha de ações no cluster | não | audit log do API server (exec, leitura de Secret, RBAC, CSR, Kyverno...) |
 | Impacto no tráfego | — | só os ~3 s de 503 do restart do primary; o resto, 100% 200 |
+
+#### 3. Achado crítico: endpoints internos expostos pelo Ingress (corrigido)
+
+Durante o teste de idempotência acima, `/transferencias-internas` foi chamado **de fora do cluster, pelo Ingress, sem autenticação**, e a API aceitou. Levantamento das rotas (`@app.post` no código) × o que o SPA chama (`app.js`):
+
+| Endpoint (desde a 2.1, o Ingress encaminhava **todos** os paths) | Quem deveria chamar | O que um atacante na internet conseguia |
+|---|---|---|
+| `POST /contas/{id}/saldo` | (legado; a `api-transacoes` v1.2.0 usa a de baixo) | **criar dinheiro**: crédito de qualquer valor em qualquer conta, ou débito na conta de outro |
+| `POST /transferencias-internas` | só a `api-transacoes`, pelo Service | mover dinheiro entre contas quaisquer, sem registro em `transacoes` |
+| `POST /auditoria/eventos` | só a `api-transacoes`, pelo Service | **forjar a trilha de auditoria** (o SPA só faz `GET /eventos` e `GET /arquivos`) |
+
+Prova (na conta de teste, desfeita na hora):
+
+```console
+$ curl -sk -X POST https://app.tipsbank.local/api/contas/contas/223f6310-.../saldo -d '{"operacao":"credito","valor":"0.01"}'
+{"id":"223f6310-...","titular":"Teste 4.4 roles",...,"saldo":"11.01"} HTTP 200          # sem nenhuma credencial
+$ curl -sk -X POST .../saldo -d '{"operacao":"debito","valor":"0.01"}'
+{...,"saldo":"11.00"} HTTP 200
+```
+
+**Correção só no Ingress, sem mudar a aplicação e sem `server-snippet`** (desligado: é o vetor do CVE-2025-1974, IngressNightmare):
+
+| Endpoint | Como | Arquivo |
+|---|---|---|
+| `/contas/{id}/saldo` e `/transferencias-internas` | Ingress próprio para esses paths (nos 2 hosts) com `denylist-source-range: 0.0.0.0/0,::/0` → **403 para qualquer origem**. Path regex mais longo vence o `/api/contas(/\|$)(.*)` | [`k8s/contas/ingress-bloqueio-interno.yaml`](../k8s/contas/ingress-bloqueio-interno.yaml) |
+| `/auditoria/eventos` | o ingress-nginx não filtra por **método** sem snippet. Então `auth-url` → **porteiro**: a nossa imagem `tipsbank-web` (assinada) com outro `nginx.conf`, que responde 200 para `GET`/`HEAD` e 403 para o resto. 2 réplicas + PDB, NetPol (só o ingress-nginx fala com ele), SA sem token, log de cada decisão | [`k8s/auditoria/porteiro.yaml`](../k8s/auditoria/porteiro.yaml), [`k8s/auditoria/ingress-eventos-somente-leitura.yaml`](../k8s/auditoria/ingress-eventos-somente-leitura.yaml) |
+
+Testes, inclusive tentativas de contornar o bloqueio:
+
+```console
+app  POST /api/contas/contas/ID/saldo                                  403
+app  POST /api/contas/contas/ID/saldo/ (barra final)                   403
+app  POST /api/contas/contas/ID/SALDO (maiusculas)                     403
+app  POST /api/contas//contas/ID/saldo (barra dupla)                   403
+app  POST /api/contas/contas/ID/%73aldo (encoding)                     403
+app  POST /api/contas/./transferencias-internas                        403
+app  POST /api/contas/transferencias-internas                          403
+api  POST /contas/contas/ID/saldo                                      403
+api  POST /contas/transferencias-internas                              403
+app  GET  /api/contas/contas/ID                                        200      # o que o SPA usa continua
+app  GET  /api/contas/contas                                           200
+app  POST /api/contas/login (corpo invalido -> 422)                    422
+
+app  POST /api/auditoria/eventos (forjar)                  403
+app  PUT  /api/auditoria/eventos                           403
+app  POST /api/auditoria/EVENTOS                           403
+app  POST /api/auditoria//eventos                          403
+app  POST /api/auditoria/eventos/                          403
+api  POST /auditoria/eventos (forjar)                      403
+app  POST /api/auditoria/eventos?x=1                       403
+app  POST X-Original-Method: GET (spoof)                   403      # o controller sobrescreve o cabecalho
+app  GET  /api/auditoria/eventos                           200
+app  GET  /api/auditoria/eventos?dia=...                   200
+app  GET  /api/auditoria/arquivos                          200
+api  GET  /auditoria/eventos                               200
+
+$ kubectl -n tipsbank-auditoria logs -l app.kubernetes.io/name=auditoria-porteiro
+decisao=403 metodo=POST uri=https://app.tipsbank.local/api/auditoria/EVENTOS origem=192.168.122.1 ts=2026-11-07T13:44:24+00:00
+decisao=200 metodo=GET uri=https://app.tipsbank.local/api/auditoria/eventos origem=192.168.122.1 ts=...
+```
+
+O fluxo interno legítimo continua funcionando, porque não passa pelo Ingress:
+
+```console
+$ curl -sk -X POST https://app.tipsbank.local/api/transacoes/transferencias -d '{...,"valor":"1.00"}'
+{"id":"b3c196ad-...","status":"concluida"}            # transacoes -> contas /transferencias-internas (Service)
+saldo destino: 12.00
+evento na auditoria: ['transferencia b3c196ad-...']    # transacoes -> auditoria POST /eventos (Service)
+```
+
+**Fail-closed:** com o porteiro em 0 réplicas, `POST /eventos` e `GET /eventos` pelo Ingress respondem **500** (fechado, nunca aberto). Com as réplicas de volta, `GET` → 200. Por isso o porteiro tem 2 réplicas em nodes diferentes e PDB `minAvailable: 1`. O porteiro passou em todas as policies do Kyverno (Deployment `pass=6 fail=0`). O [`ingress-eks.sh`](../infra/eks/ingress-eks.sh) também passou a gerar os Ingress de bloqueio.
+
+| Risco residual | Mitigação possível |
+|---|---|
+| As APIs internas confiam em qualquer chamada que chegue pelo Service (sem autenticação serviço-a-serviço) | Já restrito por NetworkPolicy: só a `api-transacoes` alcança contas e auditoria (2.5). O passo seguinte seria mTLS entre serviços (service mesh, proibido no desafio) ou token na aplicação (exigiria mudar a app) |
+| `GET /eventos` e `GET /contas` continuam públicos (leitura de dados de clientes) | É o comportamento do SPA de demonstração, que não tem sessão/autenticação real; fica registrado |
