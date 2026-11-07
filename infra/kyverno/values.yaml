@@ -1,0 +1,81 @@
+# Kyverno (etapa 4.1) — chart kyverno/kyverno 3.9.2 (app v1.19.2)
+#
+# Regras do desafio: Job/CronJob proibidos -> desligados os 3 hooks do chart:
+#   crds.migration (Job post-upgrade) e webhooksCleanup (2 Jobs pre-delete).
+#   Consequencia: no `helm uninstall` os webhooks NAO sao removidos sozinhos
+#   (ver infra/kyverno/uninstall.sh).
+#
+# Niveis de compliance (decisao 2026-11-07):
+#   Enforce  -> tipsbank-*, ingress-nginx, cert-manager, local-path-storage
+#   Audit    -> kube-system (so PolicyReport; o webhook nunca recebe kube-system,
+#               entao um Kyverno fora do ar nao impede o cluster de se recuperar)
+#   Excluido -> kyverno (evita auto-bloqueio com failurePolicy Fail)
+
+crds:
+  migration:
+    enabled: false
+
+webhooksCleanup:
+  enabled: false
+
+# Labels de dono em todos os recursos do chart (require-labels)
+customLabels:
+  app: kyverno
+  team: plataforma
+  env: producao
+
+config:
+  # O filtro padrao '[*/*,kube-system,*]' esconde o kube-system ate do
+  # background scan. Removido para o nivel "Audit" gerar PolicyReport.
+  # O bloqueio continua impossivel ali: webhooks.namespaceSelector (padrao do
+  # chart) exclui kube-system da admissao.
+  resourceFiltersExclude:
+    - '[*/*,kube-system,*]'
+
+admissionController:
+  # 2 replicas (w1/w2) + PDB automatico: com failurePolicy Fail, uma replica so
+  # = qualquer reinicio do Kyverno bloqueia deploys no banco inteiro.
+  replicas: 2
+  container:
+    resources:
+      limits:
+        cpu: 500m
+        memory: 384Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+
+backgroundController:
+  resources:
+    limits:
+      cpu: 300m
+      memory: 256Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+cleanupController:
+  resources:
+    limits:
+      cpu: 200m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+reportsController:
+  resources:
+    limits:
+      cpu: 300m
+      memory: 256Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+features:
+  # Excecoes formais (PolicyException) so no namespace kyverno: quem pode criar
+  # objetos ali e a equipe de plataforma (RBAC da 4.4); dev de produto nao
+  # consegue se auto-isentar criando excecao no proprio namespace.
+  policyExceptions:
+    enabled: true
+    namespace: kyverno

@@ -16,7 +16,8 @@ kind: Deployment
 metadata:
   name: api-contas
   namespace: tipsbank-contas
-  labels: {app.kubernetes.io/name: api-contas, app.kubernetes.io/part-of: tipsbank, role: app}
+  labels: {app.kubernetes.io/name: api-contas, app.kubernetes.io/part-of: tipsbank, role: app,
+           app: api-contas, team: contas, env: producao}
 spec:
   # replicas: definido pelo HPA (hpa.yaml, etapa 3.7). Não volte a fixar aqui.
   selector:

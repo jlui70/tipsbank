@@ -11,6 +11,9 @@
 # - resources/requests menores que o padrão (100m/200Mi): cluster de 4 nodes, ~40 pods.
 # - Sem Jobs no chart (conferido com helm template).
 
+# Dono do workload (require-labels, etapa 4.1; kube-system = nivel Audit).
+commonLabels: {app: metrics-server, team: plataforma, env: producao}
+
 apiService:
   create: true
   insecureSkipTLSVerify: false

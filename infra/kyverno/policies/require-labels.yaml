@@ -1,0 +1,51 @@
+# Etapa 4.1 — Validate: todo workload tem dono identificado.
+#   app  = qual sistema;  team = quem atende o incidente;  env = ambiente.
+# Em banco, workload sem dono e risco operacional: alerta sem destino,
+# custo sem centro de custo, mudanca sem responsavel.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-labels
+  annotations:
+    policies.kyverno.io/title: Exigir labels app, team e env
+    policies.kyverno.io/category: TipsBank Compliance
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Deployment, StatefulSet, DaemonSet
+    policies.kyverno.io/description: >-
+      Deployments, StatefulSets e DaemonSets precisam das labels app, team e env
+      (env em producao, homologacao ou desenvolvimento).
+spec:
+  background: true
+  rules:
+    - name: exigir-app-team-env
+      match:
+        any:
+          - resources:
+              kinds: [Deployment, StatefulSet, DaemonSet]
+              # So CREATE/UPDATE: no DELETE o `object` vem vazio e a expressao CEL
+              # falharia -> com Enforce, NENHUM pod poderia ser apagado (HPA, rollout).
+              operations: [CREATE, UPDATE]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kyverno]
+      validate:
+        failureAction: Enforce
+        failureActionOverrides:
+          - action: Audit
+            namespaces: [kube-system]
+        cel:
+          variables:
+            - name: labels
+              expression: object.metadata.?labels.orValue({})
+            - name: faltando
+              expression: >-
+                ['app', 'team', 'env'].filter(k, !(k in variables.labels) || variables.labels[k] == '')
+          expressions:
+            - expression: size(variables.faltando) == 0
+              messageExpression: >-
+                'Labels obrigatorias ausentes (TipsBank compliance): ' + variables.faltando.join(', ')
+            - expression: >-
+                !('env' in variables.labels) || variables.labels['env'] in
+                ['producao', 'homologacao', 'desenvolvimento']
+              message: "env deve ser producao, homologacao ou desenvolvimento"

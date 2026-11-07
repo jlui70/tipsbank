@@ -4,6 +4,8 @@
 # Diferença principal para o values-kubeadm.yaml: na nuvem existe LoadBalancer. O Service
 # type: LoadBalancer faz a AWS criar um NLB, e o "IP do controller" vira o hostname do NLB.
 controller:
+  # Dono do workload (require-labels, etapa 4.1).
+  labels: {app: ingress-nginx, team: plataforma, env: producao}
   kind: Deployment
   replicaCount: 2
 

@@ -1,0 +1,33 @@
+# Template do helper pod do local-path-provisioner (vai na chave helperPod.yaml do
+# ConfigMap local-path-config). Etapa 4.1 — o template upstream usa
+# docker.io/library/busybox SEM TAG (= latest) e nenhum securityContext; com as
+# policies em Enforce isso travaria o provisionamento de TODO PVC.
+#
+# Este pod cria/apaga o diretorio do volume no no (/opt/local-path-provisioner),
+# que pertence ao root, e apaga arquivos de outros donos (postgres uid 70):
+# precisa de root. E a UNICA excecao formal de root fora do kube-system
+# (PolicyException helper-pod-local-path, infra/kyverno/exceptions/), com
+# capabilities reduzidas ao minimo para mkdir/rm.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: helper-pod
+spec:
+  priorityClassName: system-node-critical
+  automountServiceAccountToken: false
+  tolerations:
+    - key: node.kubernetes.io/disk-pressure
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: helper-pod
+      image: busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
+        limits: {cpu: 100m, memory: 64Mi}

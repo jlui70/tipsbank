@@ -16,7 +16,8 @@ kind: Deployment
 metadata:
   name: auditoria
   namespace: tipsbank-auditoria
-  labels: {app.kubernetes.io/name: auditoria, app.kubernetes.io/part-of: tipsbank, role: app}
+  labels: {app.kubernetes.io/name: auditoria, app.kubernetes.io/part-of: tipsbank, role: app,
+           app: auditoria, team: auditoria, env: producao}
 spec:
   # replicas: definido pelo HPA (hpa.yaml, etapa 3.7). Não volte a fixar aqui.
   selector:

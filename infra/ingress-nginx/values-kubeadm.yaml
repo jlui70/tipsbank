@@ -4,6 +4,8 @@
 # Sem LoadBalancer no kubeadm: o controller escuta direto nas portas 80/443 dos workers (hostPort).
 # O "IP do controller" é o IP do worker: 192.168.122.11 ou 192.168.122.12.
 controller:
+  # Dono do workload (require-labels, etapa 4.1).
+  labels: {app: ingress-nginx, team: plataforma, env: producao}
   kind: Deployment
   replicaCount: 2                  # 1 por worker (o control-plane tem taint NoSchedule)
 

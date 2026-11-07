@@ -21,7 +21,8 @@ kind: StatefulSet
 metadata:
   name: postgres-replica
   namespace: tipsbank-contas
-  labels: {app.kubernetes.io/name: postgres-replica, app.kubernetes.io/part-of: tipsbank, role: db}
+  labels: {app.kubernetes.io/name: postgres-replica, app.kubernetes.io/part-of: tipsbank, role: db,
+           app: postgres-replica, team: contas, env: producao}
 spec:
   serviceName: postgres-replica
   replicas: 1                  # 1 slot de replicação no primary (postgres_replica_0)

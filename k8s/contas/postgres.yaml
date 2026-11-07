@@ -18,7 +18,8 @@ kind: StatefulSet
 metadata:
   name: postgres-primary
   namespace: tipsbank-contas
-  labels: {app.kubernetes.io/name: postgres-primary, app.kubernetes.io/part-of: tipsbank, role: db}
+  labels: {app.kubernetes.io/name: postgres-primary, app.kubernetes.io/part-of: tipsbank, role: db,
+           app: postgres-primary, team: contas, env: producao}
 spec:
   serviceName: postgres-primary
   replicas: 1

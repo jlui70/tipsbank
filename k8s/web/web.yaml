@@ -16,7 +16,8 @@ kind: Deployment
 metadata:
   name: web
   namespace: tipsbank-web
-  labels: {app.kubernetes.io/name: web, app.kubernetes.io/part-of: tipsbank, role: frontend}
+  labels: {app.kubernetes.io/name: web, app.kubernetes.io/part-of: tipsbank, role: frontend,
+           app: web, team: web, env: producao}
 spec:
   # replicas: definido pelo HPA (hpa.yaml, etapa 3.7). Não volte a fixar aqui.
   selector:

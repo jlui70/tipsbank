@@ -15,6 +15,10 @@
 
 fullnameOverride: kps
 
+# Dono do workload (require-labels, etapa 4.1). Vale para operator e CRs
+# Prometheus/Alertmanager (o operator copia para os StatefulSets). Subcharts abaixo.
+commonLabels: {team: plataforma, env: producao}
+
 crds:
   enabled: true
 
@@ -105,6 +109,7 @@ alertmanager:
 
 # --- Grafana ---
 grafana:
+  extraLabels: {app: grafana, team: plataforma, env: producao}
   testFramework:
     enabled: false          # o teste do chart é um Pod solto (helm test); não é usado
   admin:
@@ -131,11 +136,13 @@ grafana:
       searchNamespace: ALL      # ConfigMaps com label grafana_dashboard=1 em qualquer namespace
 
 kube-state-metrics:
+  customLabels: {app: kube-state-metrics, team: plataforma, env: producao}
   resources:
     requests: {cpu: 10m, memory: 32Mi}
     limits: {cpu: 100m, memory: 128Mi}
 
 prometheus-node-exporter:
+  commonLabels: {app: node-exporter, team: plataforma, env: producao}
   resources:
     requests: {cpu: 10m, memory: 24Mi}
     limits: {cpu: 200m, memory: 64Mi}

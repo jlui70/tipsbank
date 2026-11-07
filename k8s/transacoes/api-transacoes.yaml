@@ -20,7 +20,8 @@ kind: Deployment
 metadata:
   name: api-transacoes
   namespace: tipsbank-transacoes
-  labels: {app.kubernetes.io/name: api-transacoes, app.kubernetes.io/part-of: tipsbank, role: app, version: v1}
+  labels: {app.kubernetes.io/name: api-transacoes, app.kubernetes.io/part-of: tipsbank, role: app, version: v1,
+           app: api-transacoes, team: transacoes, env: producao}
 spec:
   # replicas: definido pelo HPA (hpa.yaml, etapa 3.7). Não volte a fixar aqui.
   revisionHistoryLimit: 5       # 3.2: guarda os 5 ReplicaSets anteriores para o rollout undo

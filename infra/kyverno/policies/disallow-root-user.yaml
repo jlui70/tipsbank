@@ -1,0 +1,98 @@
+# Etapa 4.1 — Validate: nenhum container roda como root.
+# Regra 1: runAsUser 0 explicito em qualquer nivel (pod, container, init, ephemeral).
+# Regra 2: todo container precisa ser comprovadamente nao-root: UID efetivo > 0
+#          (container ou herdado do pod) ou runAsNonRoot: true. Sem isso, um
+#          `image: nginx` sem securityContext rodaria como o USER da imagem (root).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-root-user
+  annotations:
+    policies.kyverno.io/title: Proibir execucao como root
+    policies.kyverno.io/category: TipsBank Compliance
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Containers rodando como UID 0 ampliam o impacto de qualquer RCE (escape de
+      container, escrita em volumes do host). Exige UID efetivo > 0 ou
+      runAsNonRoot em todo container, init e ephemeral.
+spec:
+  background: true
+  rules:
+    - name: proibir-runasuser-0
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              # So CREATE/UPDATE: no DELETE o `object` vem vazio e a expressao CEL
+              # falharia -> com Enforce, NENHUM pod poderia ser apagado (HPA, rollout).
+              operations: [CREATE, UPDATE]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kyverno]
+      validate:
+        failureAction: Enforce
+        failureActionOverrides:
+          - action: Audit
+            namespaces: [kube-system]
+        cel:
+          variables:
+            - name: containers
+              expression: >-
+                object.spec.containers
+                + object.spec.?initContainers.orValue([])
+                + object.spec.?ephemeralContainers.orValue([])
+            - name: podUid
+              expression: object.spec.?securityContext.?runAsUser
+            - name: podNonRoot
+              expression: object.spec.?securityContext.?runAsNonRoot.orValue(false)
+          expressions:
+            - expression: >-
+                variables.containers.all(c,
+                  c.?securityContext.?runAsUser.orValue(variables.podUid.orValue(1)) != 0)
+              messageExpression: >-
+                'runAsUser: 0 proibido (TipsBank compliance). Containers: '
+                + variables.containers.filter(c,
+                    c.?securityContext.?runAsUser.orValue(variables.podUid.orValue(1)) == 0)
+                  .map(c, c.name).join(', ')
+    - name: exigir-nao-root
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              # So CREATE/UPDATE: no DELETE o `object` vem vazio e a expressao CEL
+              # falharia -> com Enforce, NENHUM pod poderia ser apagado (HPA, rollout).
+              operations: [CREATE, UPDATE]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kyverno]
+      validate:
+        failureAction: Enforce
+        failureActionOverrides:
+          - action: Audit
+            namespaces: [kube-system]
+        cel:
+          variables:
+            - name: containers
+              expression: >-
+                object.spec.containers
+                + object.spec.?initContainers.orValue([])
+                + object.spec.?ephemeralContainers.orValue([])
+            - name: podUid
+              expression: object.spec.?securityContext.?runAsUser
+            - name: podNonRoot
+              expression: object.spec.?securityContext.?runAsNonRoot.orValue(false)
+            - name: semGarantia
+              expression: >-
+                variables.containers.filter(c,
+                  !(c.?securityContext.?runAsUser.orValue(variables.podUid.orValue(0)) > 0
+                    || c.?securityContext.?runAsNonRoot.orValue(variables.podNonRoot)))
+                .map(c, c.name)
+          expressions:
+            - expression: size(variables.semGarantia) == 0
+              messageExpression: >-
+                'Container sem garantia de nao-root: defina securityContext.runAsUser > 0
+                ou runAsNonRoot: true (TipsBank compliance). Containers: '
+                + variables.semGarantia.join(', ')

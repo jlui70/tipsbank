@@ -8,7 +8,8 @@ kind: Deployment
 metadata:
   name: locust
   namespace: tipsbank-loadtest
-  labels: {app.kubernetes.io/name: locust, app.kubernetes.io/part-of: tipsbank}
+  labels: {app.kubernetes.io/name: locust, app.kubernetes.io/part-of: tipsbank,
+           app: locust, team: plataforma, env: producao}
 spec:
   replicas: 1                     # modo standalone (master e worker no mesmo processo): 200 usuários cabem
   revisionHistoryLimit: 3

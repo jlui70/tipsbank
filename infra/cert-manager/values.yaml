@@ -1,4 +1,9 @@
 # cert-manager v1.21.3 (etapa 2.2). Imagens em quay.io/jetstack (aceito pelo compliance #1).
+# Dono do workload (require-labels, etapa 4.1). O 'app' ja vem do chart
+# (cert-manager / cainjector / webhook).
+global:
+  commonLabels: {team: plataforma, env: producao}
+
 crds:
   enabled: true        # instala as CRDs junto (Certificate, Issuer, ClusterIssuer...)
   keep: true           # helm uninstall não apaga as CRDs (nem os certificados emitidos)

@@ -1,0 +1,19 @@
+# Patch (strategic merge) no Deployment upstream do local-path-provisioner — etapa 4.1.
+# O provisioner so conversa com a API (cria PV e helper pods): nao precisa de root.
+metadata:
+  labels: {app: local-path-provisioner, team: plataforma, env: producao}
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: local-path-provisioner
+          securityContext:
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}

@@ -3735,3 +3735,205 @@ node-agent   3     3     3     3     3     <none>
 | 3 HPAs com métricas diferentes | ✅ | [3.7](#etapa-37--hpa--metrics-server--locust-stress-test): CPU, ContainerResource e memória (+ web) |
 | Locust gerando 200 users, HPA reagindo | ✅ | [3.7](#etapa-37--hpa--metrics-server--locust-stress-test): 0,09% de falhas na rodada final |
 | DaemonSet rodando em todos os workers | ✅ | 3.8 (acima) |
+
+---
+
+# SEMANA 4 — Compliance, RBAC, Helm e Entrega Final
+
+## Etapa 4.1 — Kyverno: Validate (proibir root, proibir latest)
+
+**Data**: 2026-11-07 · **Kyverno**: v1.19.2 (chart `kyverno/kyverno` 3.9.2, Helm v4.3.1) · **Arquivos**: [`infra/kyverno/`](../infra/kyverno/) (`install.sh`, `uninstall.sh`, `values.yaml`, `policies/`, `exceptions/`), [`infra/kubeadm/install-local-path.sh`](../infra/kubeadm/install-local-path.sh) + `local-path-*.yaml`, [`infra/kubeadm/system-compliance.sh`](../infra/kubeadm/system-compliance.sh), labels nos manifests de `k8s/` e nos values dos charts
+
+### Antes de instalar: a 4.1 lida como auditoria
+
+Antes de escrever as policies, os 7 comandos da 4.6 rodaram contra o cluster, como uma pré-auditoria. O alcance das policies saiu dessa leitura: num banco, uma exclusão silenciosa não passa na auditoria, mas uma **exceção formal** (registrada, justificada e com controle compensatório) passa.
+
+| Nível | Namespaces | Modo | Por quê |
+|---|---|---|---|
+| **Enforce** | todos, exceto os 2 abaixo: `tipsbank-*`, `ingress-nginx`, `cert-manager`, `local-path-storage`, `default` e **qualquer namespace novo** | bloqueia | É tudo que o banco instala e opera. Namespace novo já nasce protegido (padrão seguro) |
+| **Audit** | `kube-system` | só PolicyReport | etcd, apiserver, kube-proxy e calico-node rodam como root de verdade. Em Enforce, um `kubeadm upgrade` ou um rollout do Calico seria bloqueado, e é desses pods que o cluster depende para se recuperar. O webhook nem recebe kube-system (`namespaceSelector` do chart); o background scan continua reportando |
+| **Excluído** | `kyverno` | — | Evita auto-bloqueio: com `failurePolicy: Fail`, um Kyverno que não consegue subir travaria o cluster |
+
+Exceção nominal: **uma só**, para o helper pod do local-path (ver abaixo).
+
+### Instalação sem Jobs
+
+```console
+$ helm template kyverno kyverno/kyverno --version 3.9.2 | grep '^kind: Job' -A3 | grep name:
+  name: kyverno-migrate-resources     # crds.migration (hook post-upgrade)
+  name: kyverno-rm-webhooks           # webhooksCleanup (hook pre-delete)
+  name: kyverno-scale-to-zero         # webhooksCleanup (hook pre-delete)
+
+$ ./infra/kyverno/install.sh          # crds.migration.enabled=false, webhooksCleanup.enabled=false
+$ helm list -n kyverno
+NAME     NAMESPACE  REVISION  STATUS    CHART          APP VERSION
+kyverno  kyverno    1         deployed  kyverno-3.9.2  v1.19.2
+```
+
+| Decisão em `values.yaml` | Por quê |
+|---|---|
+| Os 3 Jobs desligados | Job é proibido no desafio. Sem o hook de pre-delete, o `helm uninstall` não apaga os webhooks; o [`uninstall.sh`](../infra/kyverno/uninstall.sh) faz isso (senão a API recusa Pods sem ninguém para responder) |
+| admission-controller com **2 réplicas** (+ PDB automático) | `failurePolicy: Fail`: com 1 réplica, qualquer reinício do Kyverno bloquearia deploys no banco inteiro |
+| `resourceFiltersExclude: '[*/*,kube-system,*]'` | O filtro padrão escondia o kube-system até do background scan; sem ele, o nível "Audit" gera relatório |
+| `policyExceptions.namespace: kyverno` | PolicyException só vale criada no ns `kyverno` (equipe de plataforma). Um time de produto não consegue se auto-isentar criando exceção no próprio namespace |
+| limits em todos os containers; liveness `tcpSocket :8000` no background e no reports controller (patch no `install.sh`, o chart não tem a opção) | Compliance #3 e #4 da 4.6 |
+| `customLabels` app/team/env | require-labels |
+
+### As 3 ClusterPolicies
+
+Todas em **CEL** (`validate.cel`), regras só em `CREATE`/`UPDATE`, `failureAction: Enforce` com override `Audit` para kube-system, `background: true`. O Kyverno gera sozinho as regras `autogen-*` para Deployment, StatefulSet, DaemonSet, Job e CronJob: um Deployment ruim é recusado na hora do `apply`, e não só quando o ReplicaSet tenta criar o pod.
+
+| Policy | Regra | O que recusa |
+|---|---|---|
+| [`disallow-root-user`](../infra/kyverno/policies/disallow-root-user.yaml) | `proibir-runasuser-0` | `runAsUser: 0` no pod, container, initContainer ou ephemeral container |
+| | `exigir-nao-root` | container **sem garantia** de não-root: nem UID efetivo > 0 (do container ou herdado do pod), nem `runAsNonRoot: true`. Sem esta regra, um `image: nginx` sem securityContext passaria (o USER da imagem é root) |
+| [`disallow-latest-tag`](../infra/kyverno/policies/disallow-latest-tag.yaml) | `exigir-tag-sem-latest` | imagem sem tag (= latest implícito), `:latest` (mesmo com digest) e `localhost:5000/app` (o `:5000` é porta, não tag). Aceita `repo:tag`, `repo:tag@sha256:…` e `repo@sha256:…` |
+| [`require-labels`](../infra/kyverno/policies/require-labels.yaml) | `exigir-app-team-env` | Deployment/StatefulSet/DaemonSet sem `app`, `team` ou `env`, ou com `env` fora de `producao`/`homologacao`/`desenvolvimento` |
+
+### Audit primeiro, Enforce depois
+
+As policies entraram em `Audit`, e o primeiro background scan mostrou o que o Enforce teria quebrado:
+
+| Achado no PolicyReport | Correção |
+|---|---|
+| **Todos os 25 workloads** sem `app/team/env` | Labels `app=<nome>`, `team=<contas\|transacoes\|auditoria\|web\|plataforma>`, `env=producao`. Nos nossos manifests, **só no metadata** do workload: nenhum pod reiniciou, nem o Postgres. Nos charts, via values (ingress-nginx `controller.labels`, cert-manager `global.commonLabels`, kps `commonLabels` + `extraLabels`/`customLabels` dos subcharts, metrics-server `commonLabels`); o operator copia as labels do CR para os StatefulSets do Prometheus e do Alertmanager |
+| `local-path-provisioner` rodando como root | Patch [`local-path-provisioner-patch.yaml`](../infra/kubeadm/local-path-provisioner-patch.yaml): `runAsUser 65532`, root read-only, `drop: [ALL]`. Ele só conversa com a API |
+| **Armadilha**: o template do helper pod do local-path usa `docker.io/library/busybox` **sem tag** e root | Em Enforce, **nenhum PVC seria mais provisionado** (o `helm install` num cluster limpo travaria o Postgres em Pending). Novo template [`local-path-helper-pod.yaml`](../infra/kubeadm/local-path-helper-pod.yaml): busybox com digest, `allowPrivilegeEscalation: false`, root read-only, sem token, limits. Continua root → PolicyException |
+| kube-system: coredns, calico, kube-proxy, static pods | Labels e `runAsUser 65532` declarado no CoreDNS (a imagem já é `nonroot`) via [`system-compliance.sh`](../infra/kubeadm/system-compliance.sh). O resto é root de verdade: fica no nível Audit |
+
+A exceção formal ([`exceptions/helper-pod-local-path.yaml`](../infra/kyverno/exceptions/helper-pod-local-path.yaml)) vale só para Pods `helper-pod-*` no ns `local-path-storage` e só para as 2 regras de root. A `disallow-latest-tag` continua valendo para eles.
+
+### Critério 1 — `kubectl get cpol` com 3 policies Ready
+
+```console
+$ kubectl get cpol
+NAME                  ADMISSION   BACKGROUND   READY   AGE   MESSAGE
+disallow-latest-tag   true        true         True    20m   Ready
+disallow-root-user    true        true         True    20m   Ready
+require-labels        true        true         True    20m   Ready
+
+$ kubectl get cpol -o json | jq -c '.items[] | {name: .metadata.name, ready: .status.ready, acoes: [.spec.rules[].validate.failureAction]}'
+{"name":"disallow-latest-tag","ready":null,"acoes":["Enforce"]}
+{"name":"disallow-root-user","ready":null,"acoes":["Enforce","Enforce"]}
+{"name":"require-labels","ready":null,"acoes":["Enforce"]}
+
+$ kubectl get cpol require-labels -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+True
+```
+
+> **Nota para a 4.6 (comando #5)**: no Kyverno 1.19 o campo `status.ready` continua no schema, mas **não é mais preenchido**; o estado fica em `status.conditions[type=Ready]`. O comando #5 do manual vai imprimir `"ready": null` com as policies prontas. Não foi feito downgrade do Kyverno (versões antigas não suportam o Kubernetes 1.36 e carregam CVEs) para satisfazer um campo depreciado. A leitura equivalente é a do `jsonpath` acima. Pelo mesmo motivo, `ClusterPolicy`/`PolicyException` `kyverno.io` mostram *warning* de depreciação (o projeto migra para `ValidatingPolicy`). O manual pede `cpol`, então ficou `ClusterPolicy`, já escrita em CEL, que é a linguagem da API nova.
+
+### Critério 2 — 3 tentativas de pods "ruins" rejeitadas
+
+```console
+$ kubectl run ruim --image=nginx:latest
+Error from server: admission webhook "validate.kyverno.svc-fail" denied the request:
+
+resource Pod/default/ruim was blocked due to the following policies
+
+disallow-latest-tag:
+  exigir-tag-sem-latest: 'Imagem sem tag ou com :latest e proibida (TipsBank compliance): ruim=nginx:latest'
+disallow-root-user:
+  exigir-nao-root: 'Container sem garantia de nao-root: defina securityContext.runAsUser > 0 ou runAsNonRoot: true (TipsBank compliance). Containers: ruim'
+```
+
+```console
+$ kubectl apply -f ruim-root.yaml        # Pod em tipsbank-contas, imagem do banco com tag, securityContext.runAsUser: 0
+Error from server: error when creating "ruim-root.yaml": admission webhook "validate.kyverno.svc-fail" denied the request:
+
+resource Pod/tipsbank-contas/ruim-root was blocked due to the following policies
+
+disallow-root-user:
+  exigir-nao-root: 'Container sem garantia de nao-root: defina securityContext.runAsUser > 0 ou runAsNonRoot: true (TipsBank compliance). Containers: app'
+  proibir-runasuser-0: 'runAsUser: 0 proibido (TipsBank compliance). Containers: app'
+```
+
+```console
+$ kubectl apply -f ruim-labels.yaml      # Deployment nao-root, imagem com tag, so com a label app
+Error from server: error when creating "ruim-labels.yaml": admission webhook "validate.kyverno.svc-fail" denied the request:
+
+resource Deployment/tipsbank-contas/ruim-sem-dono was blocked due to the following policies
+
+require-labels:
+  exigir-app-team-env: 'Labels obrigatorias ausentes (TipsBank compliance): team, env'
+```
+
+Casos de borda (`kubectl run ... --dry-run=server`, que passa pelo webhook sem criar nada):
+
+```console
+bom: tag + nao-root (tipsbank-contas)                   ACEITO
+bom: so digest                                          ACEITO
+ruim: sem tag (busybox)                                 NEGADO: 'Imagem sem tag ou com :latest e proibida ...: r1=busybox'
+ruim: porta de registry sem tag (localhost:5000/app)    NEGADO: 'Imagem sem tag ou com :latest e proibida ...: r2=localhost:5000/app'
+ruim: latest com digest                                 NEGADO: 'Imagem sem tag ou com :latest e proibida ...: r3=busybox:latest@sha256:...
+ruim: runAsNonRoot pod mas container uid 0              NEGADO: 'runAsUser: 0 proibido (TipsBank compliance). Containers: r4'
+ruim: initContainer root                                NEGADO: 'Container sem garantia de nao-root: ...
+ruim: namespace novo (teste) tambem e enforce           NEGADO: 'Container sem garantia de nao-root: ...
+audit: root no kube-system NAO e bloqueado              ACEITO
+excecao: helper-pod-x root em local-path-storage        ACEITO
+excecao nao vale p/ outro nome no mesmo ns              NEGADO: 'Container sem garantia de nao-root: ...
+excecao nao libera latest                               NEGADO: 'Imagem sem tag ou com :latest e proibida ...: helper-pod-y=busybox:latest
+ruim: env=teste                                         env deve ser producao, homologacao ou desenvolvimento
+```
+
+### Critério 3 — todos os pods existentes do TipsBank passam
+
+```console
+$ kubectl get polr -A -o json | jq -r '... pass/fail por namespace'
+cert-manager         pass=39  fail=0
+ingress-nginx        pass=16  fail=0
+kube-system          pass=63  fail=20     # nivel Audit: static pods, kube-proxy, calico-node (root de verdade)
+local-path-storage   pass=10  fail=0
+tipsbank-auditoria   pass=37  fail=0
+tipsbank-contas      pass=57  fail=0
+tipsbank-loadtest    pass=19  fail=0
+tipsbank-monitoring  pass=82  fail=0
+tipsbank-transacoes  pass=65  fail=0
+tipsbank-web         pass=31  fail=0
+
+$ kubectl get deploy,sts,ds -A -o json | jq -c '[.items[] | select(.metadata.labels.app==null or .metadata.labels.team==null or .metadata.labels.env==null) | .metadata.name]'
+[]
+
+$ kubectl get polex -n kyverno
+NAME                    AGE
+helper-pod-local-path   7m38s
+```
+
+### O banco continua operando com Enforce ligado
+
+Uma policy que só é testada com pods ruins pode estar bloqueando os bons. Por isso também foi testado o caminho que mantém o banco no ar:
+
+| Teste | Resultado |
+|---|---|
+| PVC novo + Pod usando + apagar o namespace | helper `create` e `delete` rodaram sob a exceção; o PV e o diretório no w2 foram apagados (`Volume pvc-26a854ad… has been deleted on tipsbank-w2`) |
+| `kubectl rollout restart deploy/api-contas` com sonda HTTPS a cada 0,2 s | **110/110 respostas 200**, 0 falha |
+| `kubectl rollout restart` do CoreDNS (patch de `runAsUser`) | DNS ok, app 200 durante a troca |
+
+**Bug encontrado nesse teste**: na primeira versão, as regras não tinham `operations`. No `DELETE`, o Kyverno avalia a policy com `object` vazio, a expressão CEL dá erro (`no such key: spec`) e, com Enforce, **o pedido é negado**:
+
+```console
+level=error msg="unable to delete the helper pod: admission webhook \"validate.kyverno.svc-fail\" denied the request: ...
+  disallow-latest-tag: exigir-tag-sem-latest: 'expression ''size(variables.ruins) == 0'' resulted in error:
+  composited variable \"ruins\" fails to evaluate: composited variable \"containers\" fails to evaluate: no such key: spec'"
+```
+
+Isso teria travado o scale-down do HPA, todo rollout e a limpeza de PVCs. A correção foi `operations: [CREATE, UPDATE]` nas 4 regras; o webhook passou a registrar só essas operações, e o namespace de teste terminou de apagar logo em seguida. A janela durou ~6 min, sem impacto nos pods do banco.
+
+### Observações para as próximas etapas
+
+| Achado | Impacto | Quando |
+|---|---|---|
+| Rolling restart do ingress-nginx (labels no template do pod, via chart) deu **~16 s** sem resposta em `app.tipsbank.local` (14 s de conexão recusada + 2 s de 503). O `/etc/hosts` aponta só para o w1, e com hostPort + `maxSurge: 0` o pod do w1 sai antes do novo ficar pronto | Ponto único de falha de rede do lab; o w2 estava saudável. No EKS o NLB faz health check nos 2 nodes. A reavaliar antes do `helm upgrade` sem queda (4.5) | 4.5 |
+| Comando #5 da 4.6 devolve `ready: null` (ver Critério 1) | Documentar a leitura equivalente | 4.6 |
+| Comando #1: Kyverno (`reg.kyverno.io`), calico, kps, grafana, postgres, busybox e local-path fora do allowlist | Espelhar no `ghcr.io/jlui70` (o push é do usuário). Também é pré-requisito da policy de registry da 4.3 | 4.3 |
+| Comando #2 olha `runAsUser` **só no container**: kps, locust e node-agent têm o UID no pod e reprovam no `jq` (passam no Kyverno, que considera a herança) | Declarar `runAsUser` também no container | 4.2/4.6 |
+| Comando #3: cert-manager-cainjector, kube-proxy, config-reloader do Prometheus/Alertmanager, sidecars do Grafana sem liveness | Corrigir pelos values/patch | 4.6 |
+| `hostPath` do node-agent e do node-exporter (temido na 3.8) | Nenhuma policy da 4.1 restringe hostPath; nada a fazer agora | — |
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| `kubectl get cpol` mostra 3 policies Ready | ✅ READY `True` nas 3, em Enforce (`status.ready` depreciado: ver nota) |
+| 3 tentativas de pods "ruins" com a mensagem do Kyverno | ✅ `nginx:latest`, `runAsUser: 0`, Deployment sem `team`/`env` (+ 13 casos de borda) |
+| Todos os pods existentes do TipsBank passam | ✅ `fail=0` em todos os namespaces enforce; 0 workloads sem labels |

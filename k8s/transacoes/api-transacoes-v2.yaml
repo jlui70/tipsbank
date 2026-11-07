@@ -21,7 +21,8 @@ kind: Deployment
 metadata:
   name: api-transacoes-v2
   namespace: tipsbank-transacoes
-  labels: {app.kubernetes.io/name: api-transacoes, app.kubernetes.io/part-of: tipsbank, role: app, version: v2}
+  labels: {app.kubernetes.io/name: api-transacoes, app.kubernetes.io/part-of: tipsbank, role: app, version: v2,
+           app: api-transacoes, team: transacoes, env: producao}
 spec:
   replicas: 1                    # o canary recebe 10% do tráfego: uma réplica basta
   selector:

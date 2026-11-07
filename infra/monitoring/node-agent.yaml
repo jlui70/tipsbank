@@ -15,7 +15,8 @@ kind: DaemonSet
 metadata:
   name: node-agent
   namespace: tipsbank-monitoring
-  labels: {app.kubernetes.io/name: node-agent, app.kubernetes.io/part-of: tipsbank}
+  labels: {app.kubernetes.io/name: node-agent, app.kubernetes.io/part-of: tipsbank,
+           app: node-agent, team: plataforma, env: producao}
 spec:
   revisionHistoryLimit: 3
   selector:

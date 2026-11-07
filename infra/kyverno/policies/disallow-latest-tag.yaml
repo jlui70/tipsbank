@@ -1,0 +1,57 @@
+# Etapa 4.1 — Validate: imagem sempre com tag explicita (ou digest) e nunca :latest.
+# Sem tag o runtime assume :latest -> o mesmo manifest sobe codigo diferente a
+# cada pull, o que quebra rastreabilidade (qual versao estava em producao?) e
+# invalida a assinatura Cosign verificada para uma versao especifica.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+  annotations:
+    policies.kyverno.io/title: Proibir tag latest
+    policies.kyverno.io/category: TipsBank Compliance
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Toda imagem precisa de tag imutavel de versao ou digest sha256; ':latest'
+      e imagem sem tag sao recusados.
+spec:
+  background: true
+  rules:
+    - name: exigir-tag-sem-latest
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              # So CREATE/UPDATE: no DELETE o `object` vem vazio e a expressao CEL
+              # falharia -> com Enforce, NENHUM pod poderia ser apagado (HPA, rollout).
+              operations: [CREATE, UPDATE]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kyverno]
+      validate:
+        failureAction: Enforce
+        failureActionOverrides:
+          - action: Audit
+            namespaces: [kube-system]
+        cel:
+          variables:
+            - name: containers
+              expression: >-
+                object.spec.containers
+                + object.spec.?initContainers.orValue([])
+                + object.spec.?ephemeralContainers.orValue([])
+            # Aceita: repo@sha256:<64 hex>  ou  repo:tag[@sha256:...] com tag != latest.
+            # "localhost:5000/app" (porta de registry, sem tag) e recusado.
+            - name: ruins
+              expression: >-
+                variables.containers.filter(c,
+                  !(c.image.matches('^[^@]+@sha256:[a-f0-9]{64}$')
+                    || c.image.matches('^[^@]*:[^/@:]+(@sha256:[a-f0-9]{64})?$'))
+                  || c.image.matches(':latest(@sha256:[a-f0-9]{64})?$'))
+                .map(c, c.name + '=' + c.image)
+          expressions:
+            - expression: size(variables.ruins) == 0
+              messageExpression: >-
+                'Imagem sem tag ou com :latest e proibida (TipsBank compliance): '
+                + variables.ruins.join(', ')

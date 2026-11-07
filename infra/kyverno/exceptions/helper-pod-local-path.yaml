@@ -1,0 +1,28 @@
+# Excecao formal (etapa 4.1): helper pod do local-path-provisioner roda como root.
+#
+# Justificativa: ele cria e apaga o diretorio de cada PVC em /opt/local-path-provisioner
+# no no (dono root) e precisa apagar dados de outros UIDs (PGDATA do postgres, uid 70).
+# Controles compensatorios:
+#   - so Pods cujo nome comeca com helper-pod- E no namespace local-path-storage;
+#   - so as 2 regras de root; disallow-latest-tag continua valendo (imagem com digest);
+#   - template do helper versionado em infra/kubeadm/local-path-helper-pod.yaml:
+#     allowPrivilegeEscalation false, readOnlyRootFilesystem, sem token de SA, limits;
+#   - PolicyException so e aceita no namespace kyverno (features.policyExceptions);
+#   - no EKS nao existe: o volume e EBS (CSI), sem helper.
+# Dono: plataforma. Revisao: a cada upgrade do local-path-provisioner.
+apiVersion: kyverno.io/v2
+kind: PolicyException
+metadata:
+  name: helper-pod-local-path
+  namespace: kyverno
+  labels: {app: local-path-provisioner, team: plataforma, env: producao}
+spec:
+  exceptions:
+    - policyName: disallow-root-user
+      ruleNames: [proibir-runasuser-0, exigir-nao-root]
+  match:
+    any:
+      - resources:
+          kinds: [Pod]
+          namespaces: [local-path-storage]
+          names: ["helper-pod-*"]
