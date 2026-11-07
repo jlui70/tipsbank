@@ -4581,8 +4581,8 @@ selfsubjectreviews / selfsubjectaccessreviews / selfsubjectrulesreviews  [create
 
 | Achado | Impacto | Quando |
 |---|---|---|
-| `api-transacoes` (e `api-contas`) conectam no Postgres como `tipsbank`, o **dono do banco** | Uma senha vazada (por `exec`, log ou RCE) dá controle total do banco. O correto seria um role por API só com `SELECT/INSERT/UPDATE` nas suas tabelas. Mexe nos Secrets e no init SQL, não no código | decisão do usuário (fora do manual) |
-| `exec` sem trilha de auditoria | O API server não tem audit log configurado; num banco, todo `exec` seria registrado (audit policy do kube-apiserver) | decisão do usuário |
+| ~~APIs conectam no Postgres como o superusuário~~ | **Resolvido** no complemento abaixo (usuário de banco por API) | ✅ |
+| ~~`exec` sem trilha de auditoria~~ | **Resolvido** no complemento abaixo (audit log do API server) | ✅ |
 | Certificados vencem em **07/12/2026** | Gravar o vídeo (4.7) antes, ou renovar com `gerar-usuario.sh` | 4.7 |
 | SAs dos componentes de infra (kps, cert-manager, Kyverno) montam token | Eles **usam** a API: é necessário e cada chart dá um RBAC próprio | registrado |
 | O Helm umbrella (4.5) precisa levar `templates/rbac/` (Roles, bindings, SAs) | O manual lista `templates/rbac/` | 4.5 |
@@ -4597,3 +4597,123 @@ selfsubjectreviews / selfsubjectaccessreviews / selfsubjectrulesreviews  [create
 | `auditor.kubeconfig delete pod X` → Forbidden | ✅ |
 | 4 usuários com chave + CSR + certificado aprovado pela CA do cluster; kubeconfigs em `evidencias/kubeconfigs/`, chaves fora do Git | ✅ |
 | 2 ServiceAccounts com token | ✅ `api-contas` e `api-transacoes` via TokenRequest (10 min, sem permissões); + SA própria sem token em todos os workloads |
+
+### Complemento de segurança (além do manual): menor privilégio no banco + audit log do API server
+
+**Data**: 2026-11-07 · **Motivação**: as duas pendências acima, levantadas durante a 4.4. Nenhuma das duas viola as regras do desafio: são configuração nativa do Postgres e do kube-apiserver, sem ferramenta da lista proibida e **sem mudar o código da aplicação**. · **Arquivos**: [`sql/roles-app.sh`](../sql/roles-app.sh), [`sql/init.sql`](../sql/init.sql), [`k8s/contas/migrar-roles-app.sh`](../k8s/contas/migrar-roles-app.sh), [`k8s/gerar-secrets.sh`](../k8s/gerar-secrets.sh) + templates `secret-db.yaml.example`, [`infra/kubeadm/audit-policy.yaml`](../infra/kubeadm/audit-policy.yaml), [`infra/kubeadm/audit-log.sh`](../infra/kubeadm/audit-log.sh)
+
+#### 1. Um usuário de banco por API (sem superusuário)
+
+**Antes:**
+
+```console
+$ kubectl -n tipsbank-contas exec postgres-primary-0 -- psql -U tipsbank -d tipsbank -c '\du'
+ replicator | Replication
+ tipsbank   | Superuser, Create role, Create DB, Replication, Bypass RLS     # usado pelas DUAS APIs, pela rede
+```
+
+O `POSTGRES_USER` da imagem oficial é **superusuário**. Com a senha dele (vista por `exec`, um log ou uma falha de execução remota na app), dá para fazer tudo: apagar tabelas, ler `pg_authid`, criar usuários e alterar saldos à vontade.
+
+**Desenho**: os grants vieram do código das apps (SQLAlchemy). Nenhuma API faz `DELETE` nem DDL; o `create_all()` do startup só cria tabela inexistente, então a tabela `movimentos` (3.7), que só a app criava, passou para o [`init.sql`](../sql/init.sql).
+
+| Usuário | Tabela | Permissões | Limite de conexões |
+|---|---|---|---|
+| `app_contas` | `contas` | SELECT, INSERT, UPDATE | 60 (HPA máx. 10 pods × pool 5) |
+| `app_contas` | `movimentos` | SELECT, INSERT | |
+| `app_transacoes` | `transacoes` | SELECT, INSERT, UPDATE | 85 ((15+1) pods × 5) |
+| `tipsbank` (superusuário) | — | só DBA, **só pelo socket local** (`kubectl exec`, que o RBAC dá apenas ao `sre`) | conexão de **rede rejeitada** no `pg_hba` |
+
+Também: `REVOKE ALL` de `PUBLIC` no banco e no schema, e `log_connections`/`log_disconnections` ligados (quem conectou, com qual usuário, de onde).
+
+**Teste num Postgres descartável** (namespace `teste-pg`, mesmo template do StatefulSet, initdb do zero com `00-replicacao.sh` → `init.sql` → `roles-app.sh`), conectando **pela rede com senha**, como a app conecta:
+
+```console
+app_contas: SELECT contas                          OK 2
+app_contas: UPDATE contas                          OK UPDATE 0
+app_contas: INSERT movimentos                      OK INSERT 0 1
+app_contas: DELETE contas                          NEGADO: ERROR:  permission denied for table contas
+app_contas: UPDATE movimentos                      NEGADO: ERROR:  permission denied for table movimentos
+app_contas: SELECT transacoes                      NEGADO: ERROR:  permission denied for table transacoes
+app_contas: CREATE TABLE                           NEGADO: ERROR:  permission denied for schema public
+app_contas: DROP TABLE contas                      NEGADO: ERROR:  must be owner of table contas
+app_contas: ler pg_authid (senhas)                 NEGADO: ERROR:  permission denied for table pg_authid
+app_transacoes: INSERT transacoes                  OK INSERT 0 1
+app_transacoes: UPDATE transacoes                  OK UPDATE 1
+app_transacoes: SELECT contas                      NEGADO: ERROR:  permission denied for table contas
+app_transacoes: UPDATE contas                      NEGADO: ERROR:  permission denied for table contas
+app_contas: senha errada                           NEGADO: FATAL:  password authentication failed for user "app_contas"
+tipsbank (superuser) pela REDE                     NEGADO: FATAL:  pg_hba.conf rejects connection for host "10.244.63.184", user "tipsbank" ...
+tipsbank pelo socket local (exec)                  tipsbank
+```
+
+**Migração do banco de produção sem parar** ([`migrar-roles-app.sh`](../k8s/contas/migrar-roles-app.sh); as senhas vão pelo STDIN do `kubectl exec`, sem aparecer na linha de comando):
+
+| Fase | O quê | Resultado |
+|---|---|---|
+| 1 `usuarios` | `roles-app.sh` com `SEM_PG_HBA=1`: cria os usuários sem bloquear ainda o superusuário (as APIs antigas usam ele) | `app_contas` / `app_transacoes` criados |
+| 2 | `kubectl apply` dos Secrets novos (`DB_URL` com `app_*`) + rollout das 3 APIs, com sonda | **1056/1056 200**; conexões de rede: só `app_contas` e `app_transacoes` |
+| 3 `bloquear` | aborta se ainda houver conexão de rede com o superusuário; senão põe `host all tipsbank all reject` antes da regra genérica, no primary **e** na réplica, + `pg_reload_conf()` (sem restart) | **164/164 200** |
+| 4 | env `CONTAS_DB_PASSWORD`/`TRANSACOES_DB_PASSWORD` no StatefulSet (para o initdb de um cluster limpo, 4.5) | restart do primary: ~3 s de 503 (previsto) |
+
+```console
+$ psql -c "select usename, client_addr is not null as rede, count(*) from pg_stat_activity ..."
+ANTES   tipsbank|t|7
+DEPOIS  app_contas(rede) app_transacoes(rede) ... tipsbank(local)
+
+$ # superusuario COM a senha certa, a partir do pod da api-contas
+NEGADO: ... FATAL:  pg_hba.conf rejects connection for host "10.244.63.163", user "tipsbank", database "tipsbank", no encryption
+$ kubectl -n tipsbank-contas logs postgres-primary-0 | grep rejects
+... FATAL:  pg_hba.conf rejects connection for host "10.244.63.163", user "tipsbank", database "tipsbank", no encryption
+```
+
+Teste funcional com os usuários novos, passando por todos os caminhos de escrita: criar conta (201), transferência (`concluida`, saldo 10,00 → 11,00, linha em `transacoes` e em `movimentos`) e o mesmo `tx_id` repetido em `/transferencias-internas` (`"repetida": true`, saldo inalterado, 1 movimento). Réplica em `streaming` depois de cada passo.
+
+#### 2. Audit log do kube-apiserver
+
+[`audit-log.sh`](../infra/kubeadm/audit-log.sh): copia a [policy](../infra/kubeadm/audit-policy.yaml) para o control-plane, faz backup do manifest estático, adiciona `--audit-policy-file`, `--audit-log-path=/var/log/kubernetes/audit/audit.log` e rotação (100 MB × 10 arquivos, 30 dias), espera o `/readyz` (**restaura o backup sozinho** se o API server não voltar em 3 min) e grava o mesmo no `kubeadm-config` (`ClusterConfiguration.apiServer.extraArgs/extraVolumes`), para que um `kubeadm upgrade` não desfaça a configuração.
+
+| Nível na policy | O quê |
+|---|---|
+| None | leituras dos próprios componentes (kubelet, scheduler...), health checks, leases, events, PolicyReports |
+| **Metadata** (sem corpo) | **Secrets, ConfigMaps e tokens, inclusive leituras**: quem leu qual Secret, nunca o conteúdo; `exec`/`attach`/`port-forward`/`proxy` (o comando vai na URI) |
+| RequestResponse | RBAC, CSR/aprovação, Kyverno (policies e exceções), NetworkPolicy, webhooks, namespaces/SAs, `kubectl debug` |
+| Request | demais escritas |
+| Metadata | demais leituras |
+
+```console
+$ ./infra/kubeadm/audit-log.sh                  # sonda HTTPS rodando ao mesmo tempo
+manifest atualizado
+API server pronto
+kubeadm-config atualizado
+--- trafego da app durante o restart do API server:
+    748 200                                     # o trafego nao depende do API server
+```
+
+Ações reais com os kubeconfigs da 4.4 e o que ficou no log (`/var/log/kubernetes/audit/audit.log` no cp):
+
+```console
+13:39:02 operador-transacoes  get     tipsbank-transacoes/pods/exec/api-transacoes-7df96c59c-5t8n7 101 Metadata  ip=192.168.122.1 cmd=command=cat&command=%2Fetc%2Fhostname&container=log-forwarder&...
+13:39:03 auditor-global       list    tipsbank-contas/secrets                                    403 Metadata        ip=192.168.122.1
+13:39:03 operador-contas      list    tipsbank-transacoes/pods                                   403 Metadata        ip=192.168.122.1
+13:39:04 sre                  get     tipsbank-contas/secrets/postgres-credentials               200 Metadata        ip=192.168.122.1
+13:39:04 sre                  create  tipsbank-web/rolebindings/teste-audit                      201 RequestResponse ip=192.168.122.1 subjects=[{"kind": "User", ..., "name": "operador-contas"}]
+13:39:04 sre                  delete  tipsbank-web/rolebindings/teste-audit                      200 RequestResponse ip=192.168.122.1
+
+$ sudo grep -c 'POSTGRES_PASSWORD\|DB_URL' /var/log/kubernetes/audit/audit.log
+0                                               # o conteudo dos Secrets nunca entra no log
+```
+
+| Limitação | Por quê |
+|---|---|
+| O log fica no disco do control-plane (root, `0600`, rotacionado) | Envio para um repositório externo imutável seria o passo seguinte num banco; o Loki é proibido no desafio |
+| Só kubeadm | No EKS o equivalente é ligar os "control plane logs" (audit) do cluster para o CloudWatch |
+
+#### Resultado do complemento
+
+| Controle | Antes | Depois |
+|---|---|---|
+| Usuário das APIs no banco | superusuário `tipsbank`, pela rede | `app_contas` / `app_transacoes`, só as tabelas e os verbos que o código usa |
+| Superusuário pela rede | aceito | **rejeitado** (`pg_hba`), só `kubectl exec` (RBAC: `sre`) |
+| Trilha de acesso ao banco | não | `log_connections` / `log_disconnections` |
+| Trilha de ações no cluster | não | audit log do API server (exec, leitura de Secret, RBAC, CSR, Kyverno...) |
+| Impacto no tráfego | — | só os ~3 s de 503 do restart do primary; o resto, 100% 200 |

@@ -26,6 +26,18 @@ CREATE TABLE IF NOT EXISTS transacoes (
 CREATE INDEX IF NOT EXISTS idx_transacoes_origem ON transacoes(origem_id);
 CREATE INDEX IF NOT EXISTS idx_transacoes_destino ON transacoes(destino_id);
 
+-- Movimentos (idempotencia das transferencias internas, api-contas v1.2.0 / etapa 3.7).
+-- Antes era criada pela propria api-contas no startup (SQLAlchemy create_all). Desde a
+-- etapa 4.4 a app conecta com um usuario SEM permissao de DDL (sql/roles-app.sh), entao
+-- toda tabela precisa nascer aqui. Mesma definicao do modelo Movimento.
+CREATE TABLE IF NOT EXISTS movimentos (
+    tx_id VARCHAR(64) PRIMARY KEY,
+    origem_id VARCHAR(64) NOT NULL,
+    destino_id VARCHAR(64) NOT NULL,
+    valor NUMERIC(15, 2) NOT NULL,
+    criada_em TIMESTAMP DEFAULT NOW()
+);
+
 -- Dados seed (2 contas de exemplo, senha padrao: "giropops")
 -- O hash bcrypt abaixo foi gerado com bcrypt.hashpw("giropops", gensalt(10))
 INSERT INTO contas (id, titular, documento, senha_hash, saldo) VALUES

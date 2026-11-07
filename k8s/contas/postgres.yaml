@@ -63,6 +63,11 @@ spec:
               valueFrom: {secretKeyRef: {name: postgres-credentials, key: POSTGRES_DB}}
             - name: REPLICATION_PASSWORD         # usado só pelo 00-replicacao.sh no primeiro boot
               valueFrom: {secretKeyRef: {name: postgres-credentials, key: REPLICATION_PASSWORD}}
+            # 4.4: usuarios de aplicacao, usados so pelo roles-app.sh no primeiro boot (initdb)
+            - name: CONTAS_DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: postgres-credentials, key: CONTAS_DB_PASSWORD}}
+            - name: TRANSACOES_DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: postgres-credentials, key: TRANSACOES_DB_PASSWORD}}
             - name: PGDATA                       # subdiretório: o initdb exige diretório vazio
               value: /var/lib/postgresql/data/pgdata
           volumeMounts:

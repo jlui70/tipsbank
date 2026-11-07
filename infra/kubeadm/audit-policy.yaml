@@ -1,0 +1,69 @@
+# Politica de auditoria do kube-apiserver (complemento da etapa 4.4).
+# Responde "quem fez o que, quando e de onde" no cluster: exec em pod, leitura de
+# Secret, mudanca de RBAC, aprovacao de certificado, excecao do Kyverno...
+# Instalada por infra/kubeadm/audit-log.sh em /etc/kubernetes/audit/policy.yaml (cp).
+#
+# A PRIMEIRA regra que casa decide o nivel:
+#   None            nao registra
+#   Metadata        quem, quando, verbo, recurso, IP, resultado (sem corpo)
+#   Request         + o corpo do pedido
+#   RequestResponse + o corpo da resposta
+# Regra de ouro: Secret, ConfigMap e token NUNCA com corpo (o log viraria um vazamento).
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: [RequestReceived]          # registra so a conclusao de cada requisicao
+rules:
+  # --- 1. ruido: leituras dos proprios componentes do cluster e health checks ---
+  - level: None
+    users: [system:kube-proxy, system:kube-scheduler, system:kube-controller-manager, system:apiserver]
+    verbs: [get, list, watch]
+  - level: None
+    userGroups: [system:nodes]
+    verbs: [get, list, watch]
+  - level: None
+    userGroups: [system:nodes]
+    resources:
+      - {group: "", resources: [nodes/status, pods/status]}
+  - level: None
+    nonResourceURLs: ["/healthz*", "/readyz*", "/livez*", "/version", "/metrics", "/openapi/*"]
+  - level: None
+    resources:
+      - {group: coordination.k8s.io, resources: [leases]}       # eleicao de lider (a cada 2 s)
+      - {group: "", resources: [events]}
+      - {group: events.k8s.io, resources: [events]}
+      - {group: wgpolicyk8s.io}                                 # PolicyReports do Kyverno
+      - {group: reports.kyverno.io}
+      - {group: kyverno.io, resources: [updaterequests]}
+
+  # --- 2. segredos: so metadados, inclusive LEITURAS (quem leu qual Secret) ---
+  - level: Metadata
+    resources:
+      - {group: "", resources: [secrets, configmaps, serviceaccounts/token]}
+      - {group: authentication.k8s.io, resources: [tokenreviews]}
+
+  # --- 3. acesso interativo a containers (o comando do exec vai na URI) ---
+  - level: RequestResponse
+    resources:
+      - {group: "", resources: [pods/ephemeralcontainers]}      # kubectl debug: registra a spec
+  - level: Metadata
+    resources:
+      - {group: "", resources: [pods/exec, pods/attach, pods/portforward, pods/proxy, services/proxy, nodes/proxy]}
+
+  # --- 4. mudancas de controle de acesso e de seguranca: pedido + resposta ---
+  - level: RequestResponse
+    verbs: [create, update, patch, delete, deletecollection]
+    resources:
+      - {group: rbac.authorization.k8s.io}
+      - {group: certificates.k8s.io}                          # CSR e aprovacao
+      - {group: kyverno.io}                                   # ClusterPolicy, PolicyException
+      - {group: policies.kyverno.io}
+      - {group: networking.k8s.io, resources: [networkpolicies]}
+      - {group: admissionregistration.k8s.io}                 # webhooks
+      - {group: "", resources: [namespaces, serviceaccounts]}
+
+  # --- 5. demais escritas: o pedido (o que foi alterado) ---
+  - level: Request
+    verbs: [create, update, patch, delete, deletecollection]
+
+  # --- 6. demais leituras: so quem leu o que ---
+  - level: Metadata
