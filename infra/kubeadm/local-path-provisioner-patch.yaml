@@ -1,5 +1,6 @@
 # Patch (strategic merge) no Deployment upstream do local-path-provisioner — etapa 4.1.
 # O provisioner so conversa com a API (cria PV e helper pods): nao precisa de root.
+# Etapa 4.3: imagem do espelho ghcr.io/jlui70/mirror (infra/mirror/imagens.txt).
 metadata:
   labels: {app: local-path-provisioner, team: plataforma, env: producao}
 spec:
@@ -12,6 +13,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: local-path-provisioner
+          image: ghcr.io/jlui70/mirror/rancher/local-path-provisioner:v0.0.37@sha256:c3f2c60ee2490eb83ac00101d7e239fd8c20a5b8b4038e2dfc36a7e66fe99c08        # espelho (4.3)
           securityContext:
             runAsUser: 65532
             allowPrivilegeEscalation: false

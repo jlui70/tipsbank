@@ -13,6 +13,7 @@ helm repo add prometheus-community https://prometheus-community.github.io/helm-c
 helm repo update prometheus-community >/dev/null
 helm upgrade --install kps prometheus-community/kube-prometheus-stack \
   --version "$CHART_VERSION" -n tipsbank-monitoring \
-  -f "$DIR/values-kubeadm.yaml" --wait --timeout 10m
+  -f "$DIR/values-kubeadm.yaml" -f "$DIR/values-mirror.yaml" --wait --timeout 10m
 
 kubectl apply -f "$DIR/dashboards/"
+kubectl apply -f "$DIR/networkpolicy.yaml"      # etapa 4.3 (label de opt-out no 00-namespaces.yaml)

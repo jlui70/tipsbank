@@ -1,0 +1,58 @@
+# Etapa 4.3 — NetworkPolicy zero-trust do namespace ingress-nginx.
+#   clientes (qualquer origem) -> controller 80/443 (hostPort; o Calico aplica a NetPol
+#                                 depois do DNAT do hostPort, no IP do pod)
+#   controller -> API server 6443 (le Ingress, Services, EndpointSlices, Secrets TLS)
+#   controller -> backends (direto no IP do pod, porta do container):
+#       tipsbank-web, -contas, -transacoes, -auditoria :8080 ; tipsbank-loadtest :8089 (Locust)
+#       tipsbank-monitoring: prometheus 9090, alertmanager 9093, grafana 3000
+#   Os namespaces de destino tem a regra de ingress correspondente (2.5, 3.5, 3.7, 4.3).
+# Admission webhook do controller esta desligado (2.1) e o /metrics (10254) nao e coletado.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny, namespace: ingress-nginx, labels: {team: plataforma}}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-dns-egress, namespace: ingress-nginx, labels: {team: plataforma}}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: controller-ingress-clientes, namespace: ingress-nginx, labels: {team: plataforma}}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: ingress-nginx, app.kubernetes.io/component: controller}}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{protocol: TCP, port: 80}, {protocol: TCP, port: 443}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: controller-egress, namespace: ingress-nginx, labels: {team: plataforma}}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: ingress-nginx, app.kubernetes.io/component: controller}}
+  policyTypes: [Egress]
+  egress:
+    - to: [{ipBlock: {cidr: 192.168.122.10/32}}]
+      ports: [{protocol: TCP, port: 6443}]
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-web}}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-contas}}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-transacoes}}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-auditoria}}
+      ports: [{protocol: TCP, port: 8080}]
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-loadtest}}
+      ports: [{protocol: TCP, port: 8089}]
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: tipsbank-monitoring}}
+      ports: [{protocol: TCP, port: 9090}, {protocol: TCP, port: 9093}, {protocol: TCP, port: 3000}]

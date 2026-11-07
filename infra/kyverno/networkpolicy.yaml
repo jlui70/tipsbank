@@ -1,0 +1,51 @@
+# Etapa 4.3 — NetworkPolicy zero-trust do namespace kyverno.
+#   API server -> admission-controller :9443 e cleanup-controller :9443 (webhooks;
+#                 failurePolicy Fail: se este caminho cair, NENHUM Pod e criado fora
+#                 do kube-system). Origem: IP do cp (192.168.122.10) ou tunel IPIP (10.244.194.64).
+#   os 4 controllers -> API server 6443
+# Sem egress para a internet: nenhuma policy usa verifyImages nem contexto externo.
+# /metrics (8000) nao e coletado pelo Prometheus.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny, namespace: kyverno, labels: {team: plataforma}}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-dns-egress, namespace: kyverno, labels: {team: plataforma}}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-apiserver-egress, namespace: kyverno, labels: {team: plataforma}}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to: [{ipBlock: {cidr: 192.168.122.10/32}}]
+      ports: [{protocol: TCP, port: 6443}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: webhooks-ingress-apiserver, namespace: kyverno, labels: {team: plataforma}}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: [admission-controller, cleanup-controller]
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock: {cidr: 192.168.122.10/32}
+        - ipBlock: {cidr: 10.244.194.64/32}
+      ports: [{protocol: TCP, port: 9443}]

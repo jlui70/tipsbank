@@ -11,6 +11,11 @@ helm upgrade --install cert-manager cert-manager \
   -f "$DIR/values.yaml" \
   --wait --timeout 5m
 
+# Etapa 4.3: NetworkPolicy zero-trust do namespace + opt-out do Generate do Kyverno
+# (as NetPols deste namespace estao no Git).
+kubectl label ns cert-manager tipsbank.io/netpol=gerenciada-no-git --overwrite
+kubectl apply -f "$DIR/networkpolicy.yaml"
+
 # Sem o Job startupapicheck: espera o webhook responder antes de criar os emissores
 # (o API server consulta o webhook do cert-manager para validar Certificate/ClusterIssuer).
 kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=120s

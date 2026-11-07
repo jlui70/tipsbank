@@ -108,7 +108,7 @@ spec:
         # Sidecar: lê o log que a app grava no volume compartilhado e publica no stdout dele
         # (kubectl logs -c log-forwarder). Mesmo padrão de um agente de logs (Fluent Bit etc.).
         - name: log-forwarder
-          image: busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+          image: ghcr.io/jlui70/mirror/busybox:1.37@sha256:66a6306db78bf2dbf3487f293aa8d6990d8e506fdffab9cc43fe422becf886e4
           command: [sh, -c, 'exec tail -n +1 -F /var/log/app/app.log']
           securityContext:
             runAsUser: 65532

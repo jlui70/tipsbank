@@ -1,0 +1,16 @@
+# Imagens de terceiros vindas do espelho ghcr.io/jlui70/mirror (etapa 4.3).
+# Gerado a partir de infra/mirror/imagens.txt: copia EXATA do manifest linux/amd64 do
+# fornecedor, pinada por digest. Motivo: policy restrict-image-registries (Kyverno) e
+# comando #1 da auditoria (4.6). Uso: -f values.yaml -f values-mirror.yaml
+# O chart do Kyverno nao tem campo de digest: vai junto da tag (tag@sha256:...).
+admissionController:
+  initContainer:
+    image: {registry: ghcr.io, repository: jlui70/mirror/kyverno/kyvernopre, tag: "v1.19.2@sha256:380c58effb6f065d4e856c084564482930eef789f47fab9dafa68a1964139a81"}
+  container:
+    image: {registry: ghcr.io, repository: jlui70/mirror/kyverno/kyverno, tag: "v1.19.2@sha256:6f0c520054d863a4a3df53ac7bb67d571d20421b77b99809013a62ec5f1d5947"}
+backgroundController:
+  image: {registry: ghcr.io, repository: jlui70/mirror/kyverno/background-controller, tag: "v1.19.2@sha256:7643ae5d759ae45f5c6035c62d9db4de6b325e513e36d43cfe47f3bc95dadac7"}
+cleanupController:
+  image: {registry: ghcr.io, repository: jlui70/mirror/kyverno/cleanup-controller, tag: "v1.19.2@sha256:518233195e34e772a73277fafeaa7ff6a4920d5822c34be998e0f3b6b82494ce"}
+reportsController:
+  image: {registry: ghcr.io, repository: jlui70/mirror/kyverno/reports-controller, tag: "v1.19.2@sha256:9fbfa8cce7008bc45be75b2f6c4bf40e5ff582466fe571c1a38733a16a2bb510"}

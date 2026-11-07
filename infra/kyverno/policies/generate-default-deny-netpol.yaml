@@ -1,0 +1,91 @@
+# Etapa 4.3 — Generate: todo namespace NOVO nasce zero-trust.
+#   generated-default-deny : nega todo ingress e egress dos pods do namespace
+#   generated-allow-dns    : libera so o DNS (kube-dns 53 UDP/TCP), mesma
+#                            convencao da 2.5; sem isso nenhum pod resolve nome
+# Os times liberam fluxos com NetworkPolicies proprias (allow-*), versionadas.
+#
+# Decisoes:
+# - synchronize: true -> se alguem apagar ou editar a NetPol gerada, o Kyverno
+#   recria/restaura. O default-deny nao pode ser removido por quem tem acesso so
+#   ao namespace (so retirando a policy, que e da plataforma).
+# - Nomes generated-* (e nao default-deny): os namespaces criados pelo Helm
+#   umbrella (4.5) trazem o proprio default-deny; nomes iguais = conflito de dono
+#   entre Helm e Kyverno. Duas NetPols de deny juntas continuam sendo deny.
+# - Opt-out SO por label tipsbank.io/netpol=gerenciada-no-git: namespaces cujas
+#   NetPols (default-deny + allows) estao versionadas no Git (tipsbank-* da 2.5,
+#   infra da 4.3, os do Helm umbrella da 4.5). Label de Namespace e recurso de
+#   cluster: so a plataforma altera (RBAC 4.4), o time de produto nao.
+# - SEM `operations: [CREATE]`: o synchronize reavalia a regra em background
+#   (operacao != CREATE); com o filtro, a NetPol apagada NAO era recriada
+#   (achado no teste). generateExisting: false + a label acima evitam gerar em
+#   namespace antigo.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: generate-default-deny-netpol
+  annotations:
+    policies.kyverno.io/title: NetworkPolicy default-deny em namespace novo
+    policies.kyverno.io/category: TipsBank Compliance
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Namespace, NetworkPolicy
+    policies.kyverno.io/description: >-
+      Gera default-deny (ingress+egress) e liberacao de DNS em todo namespace
+      criado, exceto os do sistema.
+spec:
+  generateExisting: false
+  rules:
+    - name: default-deny
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+      exclude:
+        any:
+          - resources:
+              names: [kube-system, kube-public, kube-node-lease, default, kyverno]
+          - resources:
+              selector:
+                matchLabels: {tipsbank.io/netpol: gerenciada-no-git}
+      generate:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        name: generated-default-deny
+        namespace: "{{ request.object.metadata.name }}"
+        synchronize: true
+        data:
+          metadata:
+            labels: {app.kubernetes.io/managed-by: kyverno, team: plataforma}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress, Egress]
+    - name: allow-dns
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+      exclude:
+        any:
+          - resources:
+              names: [kube-system, kube-public, kube-node-lease, default, kyverno]
+          - resources:
+              selector:
+                matchLabels: {tipsbank.io/netpol: gerenciada-no-git}
+      generate:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        name: generated-allow-dns
+        namespace: "{{ request.object.metadata.name }}"
+        synchronize: true
+        data:
+          metadata:
+            labels: {app.kubernetes.io/managed-by: kyverno, team: plataforma}
+          spec:
+            podSelector: {}
+            policyTypes: [Egress]
+            egress:
+              - to:
+                  - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+                    podSelector: {matchLabels: {k8s-app: kube-dns}}
+                ports:
+                  - {protocol: UDP, port: 53}
+                  - {protocol: TCP, port: 53}

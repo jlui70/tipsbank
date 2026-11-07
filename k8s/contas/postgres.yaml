@@ -46,7 +46,7 @@ spec:
                   - {key: compliance, operator: In, values: [strict]}
       containers:
         - name: postgres
-          image: postgres:16-alpine
+          image: ghcr.io/jlui70/mirror/postgres:16-alpine@sha256:ac838714b7d794185a866e5a6b479b954e7d8a070568aa0acac6fe07c3070bf5
           # 3.7: 150 conexões (padrão: 100). O HPA multiplica os pools das APIs; a conta está nos
           # configmap-app.yaml. Na réplica (hot standby) o valor precisa ser >= ao do primary.
           args: ["-c", "max_connections=150"]

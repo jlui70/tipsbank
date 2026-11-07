@@ -1,0 +1,28 @@
+# Imagens de terceiros espelhadas em ghcr.io/jlui70/mirror/<caminho> (etapa 4.3).
+# Formato: <origem:tag>  <digest do indice multi-arch em uso no cluster>  <digest do manifest linux/amd64>
+#
+# So o manifest linux/amd64 e copiado (todos os nodes sao amd64): copia EXATA
+# (--prefer-index=false), entao o digest no ghcr e o mesmo publicado pelo
+# fornecedor para amd64 -> da para provar a procedencia com
+#   docker buildx imagetools inspect <origem>@<indice>   (lista o amd64 com este digest)
+# Copiar o indice inteiro (10+ plataformas) estourou o limite do ghcr (429).
+# Fora daqui (allowlist do auditor, comando #1 da 4.6): quay.io/jetstack,
+# registry.k8s.io, gcr.io/distroless e as nossas ghcr.io/jlui70/tipsbank-*.
+docker.io/library/busybox:1.37                                  sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec sha256:66a6306db78bf2dbf3487f293aa8d6990d8e506fdffab9cc43fe422becf886e4
+docker.io/library/postgres:16-alpine                            sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139 sha256:ac838714b7d794185a866e5a6b479b954e7d8a070568aa0acac6fe07c3070bf5
+docker.io/grafana/grafana:13.3.0-distroless                     sha256:540b8afb775bf34aefce417e4329039daa5d44b6f2fbda6881397b1b247ca7df sha256:ffa50e781972f7862410639eed96e0a9ad96c94ebeccd43e634141f3d9605a99
+docker.io/rancher/local-path-provisioner:v0.0.37                sha256:e757967a5ec338f6a9b371c5a9688bedaa8c3578ea3dd4db329ea0084be0a86f sha256:c3f2c60ee2490eb83ac00101d7e239fd8c20a5b8b4038e2dfc36a7e66fe99c08
+quay.io/calico/calico:v3.33.0                                   sha256:4ebc20730127bc9e8bf1db5f5a2d8b58cf37fe0e891b3c7b5471992221d213e5 sha256:3eba6eb95b51b337bf255ecaf5c669b4b2ba04f9f813aa89785aa6853ecf9817
+quay.io/calico/node:v3.33.0                                     sha256:565d8db3200e443955557f8f28ff44ab8a4a456754bc74a19c4f2f3444af9b1c sha256:224903e17a8d0588a6b9781331bd64935b0ef741a4208043f7dd9fcc834fc7cd
+quay.io/calico/third-party-cni-plugins:v3.33.0                  sha256:0f32f48279484c0d6f0e0d0e767b2d0e1a6c6ca34cb3421a61b989d992f3df41 sha256:ae6464c7d8ffae03f2f26ed411a5b69e91baf31d8d538923645459f4f301a917
+quay.io/kiwigrid/k8s-sidecar:2.14.3                             sha256:52d311dcedd587421a236c4d6c621f05614c40a51386e955e0699dca97ec0880 sha256:84df4f4f53bedc59e72f594f58047a1f98f8aebc4326533f0c7170b2748e6840
+quay.io/prometheus/alertmanager:v0.34.2                         sha256:39d8bb3966c694a124428a3a88fbcffd40bd069129ecd47c059f8a3f17c55f3b sha256:7619e9399e623c9f99a40cb199c2bceb972cbf725598a51dcbde69d51dcaaedf
+quay.io/prometheus/node-exporter:v1.12.1-distroless             sha256:8c9bac11973b94b59be88d6e11fee4429aa743c8846cdc75d65b18db33f6a106 sha256:bbfbd533202cfef891c70383ddf6f0c32acece66400ad8091a18bed7aad5db6f
+quay.io/prometheus/prometheus:v3.16.0-distroless                sha256:9764044e09eb2c9e1abdb12d0f0188d4efb7384b0262d3c080f0fc59045c89ba sha256:b3e1df0b7003c8222c9f79e679b2ec9c8f993803d36839d7f139eef5cc64119b
+quay.io/prometheus-operator/prometheus-config-reloader:v0.94.2  sha256:a1897c67478bc23434534e91ad3855280771196b1daf17144db9dbcb655bef71 sha256:e825978c71333cc8e140400506da8fa4972c7087f62805b378a1b93259924fdb
+quay.io/prometheus-operator/prometheus-operator:v0.94.2         sha256:c7edf0379b7271ef1705dce258d2bb73820e299cc95559369e9f6fc3321639ec sha256:051606fe50e8c4bf6a433f0972bc3dcf3b90a62bc712f55692a9c4be83fe6f46
+reg.kyverno.io/kyverno/kyverno:v1.19.2                          sha256:c8c4dd09e720d2cd7fd24ca73ac28e46651001372f988e0cba3f2f612f04b955 sha256:6f0c520054d863a4a3df53ac7bb67d571d20421b77b99809013a62ec5f1d5947
+reg.kyverno.io/kyverno/kyvernopre:v1.19.2                       sha256:27f3cc52e628559b56d08363b85316819802086c9808606914f7805a244148f4 sha256:380c58effb6f065d4e856c084564482930eef789f47fab9dafa68a1964139a81
+reg.kyverno.io/kyverno/background-controller:v1.19.2            sha256:c46e124f21ef8a6bb4b48de57106808b1007edcd5ddd4ff7df5d23b9efa60ce2 sha256:7643ae5d759ae45f5c6035c62d9db4de6b325e513e36d43cfe47f3bc95dadac7
+reg.kyverno.io/kyverno/cleanup-controller:v1.19.2               sha256:d7340aa7c9315080c3dafa7b765d090ced37353e89e5cd7a3f9ac69e8fb532b2 sha256:518233195e34e772a73277fafeaa7ff6a4920d5822c34be998e0f3b6b82494ce
+reg.kyverno.io/kyverno/reports-controller:v1.19.2               sha256:5fb6d3e738050dbce84f60ecabaede7665fbe0578d07c1e8c912443b035e79c3 sha256:9fbfa8cce7008bc45be75b2f6c4bf40e5ff582466fe571c1a38733a16a2bb510

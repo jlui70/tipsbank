@@ -8,6 +8,11 @@ kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisione
 # Etapa 4.1: provisioner nao-root + labels de dono, helper pod com imagem fixa
 # (sem :latest). Reaplicar este script reaplica os patches.
 DIR=$(cd "$(dirname "$0")" && pwd)
+
+# Etapa 4.3: NetworkPolicy zero-trust do namespace + opt-out do Generate do Kyverno
+# (as NetPols deste namespace estao no Git).
+kubectl label ns local-path-storage tipsbank.io/netpol=gerenciada-no-git --overwrite
+kubectl apply -f "$DIR/local-path-networkpolicy.yaml"
 kubectl -n local-path-storage patch deploy local-path-provisioner --type=strategic \
   --patch-file "$DIR/local-path-provisioner-patch.yaml"
 kubectl -n local-path-storage patch configmap local-path-config --type=merge \

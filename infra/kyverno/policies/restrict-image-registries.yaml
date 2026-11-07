@@ -1,0 +1,56 @@
+# Etapa 4.3 — Validate: so imagens de registries confiaveis.
+# Allowlist = a do auditor (comando #1 da 4.6):
+#   ghcr.io/jlui70/   nossas imagens (assinadas, Trivy) + espelho de terceiros (infra/mirror/)
+#   quay.io/jetstack/ cert-manager          registry.k8s.io/   projeto Kubernetes
+#   gcr.io/distroless/ bases Distroless
+# Imagem sem registry no nome (ex.: busybox) = docker.io implicito -> recusada.
+# O prefixo inclui a barra final: ghcr.io/jlui70evil/... NAO passa.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-image-registries
+  annotations:
+    policies.kyverno.io/title: Restringir registries de imagem
+    policies.kyverno.io/category: TipsBank Compliance
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Containers, initContainers e ephemeral containers so podem usar imagens de
+      ghcr.io/jlui70, quay.io/jetstack, registry.k8s.io ou gcr.io/distroless.
+spec:
+  background: true
+  rules:
+    - name: registries-confiaveis
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              operations: [CREATE, UPDATE]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kyverno]
+      validate:
+        failureAction: Enforce
+        failureActionOverrides:
+          - action: Audit
+            namespaces: [kube-system]
+        cel:
+          variables:
+            - name: confiaveis
+              expression: "['ghcr.io/jlui70/', 'quay.io/jetstack/', 'registry.k8s.io/', 'gcr.io/distroless/']"
+            - name: containers
+              expression: >-
+                object.spec.containers
+                + object.spec.?initContainers.orValue([])
+                + object.spec.?ephemeralContainers.orValue([])
+            - name: fora
+              expression: >-
+                variables.containers.filter(c,
+                  !variables.confiaveis.exists(r, c.image.startsWith(r)))
+                .map(c, c.name + '=' + c.image)
+          expressions:
+            - expression: size(variables.fora) == 0
+              messageExpression: >-
+                'Registry nao confiavel (TipsBank compliance; permitidos: ghcr.io/jlui70,
+                quay.io/jetstack, registry.k8s.io, gcr.io/distroless): ' + variables.fora.join(', ')

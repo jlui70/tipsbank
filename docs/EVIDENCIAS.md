@@ -4150,3 +4150,258 @@ tipsbank-web         pass=45   fail=0   skip=0
 |---|---|
 | Pod criado sem securityContext recebe o contexto mutado | ✅ `nginx:1.27` com os 3 campos injetados (e barrado pelo kubelet por rodar como root) |
 | As 3 APIs continuam funcionando com root filesystem read-only | ✅ rollout das 3 APIs + web com 1188/1188 200; transferência 201 com evento gravado na auditoria; escrita na raiz recusada |
+
+---
+
+## Etapa 4.3 — Kyverno: Generate (NetworkPolicy automática) + registry confiável
+
+**Data**: 2026-11-07 · **Arquivos**: [`infra/kyverno/policies/generate-default-deny-netpol.yaml`](../infra/kyverno/policies/generate-default-deny-netpol.yaml), [`infra/kyverno/policies/restrict-image-registries.yaml`](../infra/kyverno/policies/restrict-image-registries.yaml), [`infra/mirror/`](../infra/mirror/) (`imagens.txt`, `espelhar-imagens.sh`), `values-mirror.yaml` (monitoring, kyverno), NetworkPolicies novas em `infra/{monitoring,ingress-nginx,cert-manager,kyverno}/networkpolicy.yaml` e `infra/kubeadm/local-path-networkpolicy.yaml`
+
+### Decisões (com o usuário, em 2026-11-07)
+
+| Decisão | Por quê |
+|---|---|
+| Registries aceitos = **allowlist do auditor** (comando #1 da 4.6): `ghcr.io/jlui70/`, `quay.io/jetstack/`, `registry.k8s.io/`, `gcr.io/distroless/` | O critério de "confiável" é o da auditoria. Todo o resto (18 imagens) foi **espelhado** em `ghcr.io/jlui70/mirror/` |
+| NetworkPolicy também nos namespaces que **já existiam sem nenhuma** (`tipsbank-monitoring`, `ingress-nginx`, `cert-manager`, `kyverno`, `local-path-storage`) | O Generate só cobre namespaces novos; o checkpoint pede zero-trust em todos |
+
+### Parte 1 — Generate: namespace novo nasce zero-trust
+
+A policy gera 2 NetworkPolicies em todo namespace criado: `generated-default-deny` (nega ingress e egress) e `generated-allow-dns` (libera só o kube-dns na porta 53, a mesma convenção da 2.5; sem isso nenhum pod resolve nome).
+
+| Decisão | Por quê |
+|---|---|
+| `synchronize: true` | Se alguém apagar ou editar a NetPol gerada, o Kyverno restaura. O default-deny não pode ser removido por quem só tem acesso ao namespace |
+| Nomes `generated-*` | Os namespaces do Helm umbrella (4.5) trazem o próprio `default-deny`: nomes iguais = conflito de dono entre Helm e Kyverno |
+| Opt-out **só** pela label `tipsbank.io/netpol=gerenciada-no-git` (+ os namespaces do sistema e o `kyverno`, por nome) | Os namespaces cujas NetPols estão versionadas no Git (2.5 e esta etapa). Label de Namespace é recurso de cluster: só a plataforma altera (RBAC da 4.4). Agora está no [`00-namespaces.yaml`](../k8s/00-namespaces.yaml) e nos `install.sh` |
+
+**Critério — `kubectl create ns novo-teste` gera a NetPol sozinho:**
+
+```console
+$ kubectl create namespace novo-teste
+namespace/novo-teste created
+$ kubectl get netpol -n novo-teste
+NAME                     POD-SELECTOR   AGE
+generated-allow-dns      <none>         5s
+generated-default-deny   <none>         5s
+
+$ kubectl get netpol -n novo-teste generated-default-deny -o yaml
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kyverno
+    generate.kyverno.io/policy-name: generate-default-deny-netpol
+    generate.kyverno.io/rule-name: default-deny
+    generate.kyverno.io/trigger-kind: Namespace
+    team: plataforma
+  name: generated-default-deny
+  namespace: novo-teste
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+```
+
+O efeito é real (pods `busybox` dentro do `novo-teste`):
+
+```console
+DNS: api-contas.tipsbank-contas.svc.cluster.local -> Address: 10.100.19.37    # liberado
+egress p/ api-contas:8000 -> wget: download timed out  BLOQUEADO
+egress internet (1.1.1.1:443) -> BLOQUEADO
+pod->pod no mesmo namespace :8080 -> BLOQUEADO
+```
+
+**Achado — o `synchronize` não funcionava na 1ª versão.** Com `operations: [CREATE]` na regra (o padrão das outras policies), a NetPol apagada **não voltava**. Para recriar, o Kyverno reavalia a regra em background, e aí a operação não é `CREATE`, então a regra deixava de casar. Retirar o filtro faria qualquer `UPDATE` de namespace antigo (até uma label) gerar NetPols nele, por isso o opt-out passou a ser a label. A regra de generate é imutável: a policy foi apagada e recriada. Depois da correção:
+
+```console
+$ kubectl -n novo-teste delete netpol generated-default-deny
+$ sleep 15; kubectl get netpol -n novo-teste
+generated-allow-dns      <none>   21s
+generated-default-deny   <none>   15s          # recriada
+
+$ kubectl -n novo-teste patch netpol generated-allow-dns --type=json -p '[{"op":"replace","path":"/spec/egress/0/ports/0/port","value":5353}]'
+$ sleep 15; kubectl -n novo-teste get netpol generated-allow-dns -o jsonpath='{.spec.egress[0].ports}'
+[{"port":53,"protocol":"UDP"},{"port":53,"protocol":"TCP"}]                  # edicao desfeita
+
+$ kubectl label ns tipsbank-web teste-update=1      # namespace com a label de opt-out
+$ kubectl get netpol -n tipsbank-web
+allow-dns-egress default-deny web-ingress           # nada gerado
+```
+
+### Parte 1b — NetworkPolicy nos 5 namespaces que estavam sem nenhuma
+
+Os fluxos vieram dos alvos ativos do Prometheus, dos webhooks registrados e dos backends dos Ingress. Pontos comuns:
+
+- **API server como destino** = `192.168.122.10:6443`: o Calico avalia a NetPol **depois** do DNAT do kube-proxy, então o destino é o IP real e não o ClusterIP `10.96.0.1`.
+- **API server como origem** (webhooks de cert-manager, Kyverno e kps-operator; `kubectl get --raw .../proxy`): vem do control-plane, pelo IP do node `192.168.122.10` ou pelo túnel IPIP do Calico `10.244.194.64`. As portas de webhook aceitam **só** essas duas origens.
+- Os arquivos usam IPs do lab kubeadm. No EKS o control plane fala com os nodes por ENIs da VPC, então o `install.sh` do ingress só aplica a NetPol com `values-kubeadm.yaml`. Isso vira parâmetro no Helm (4.5).
+
+| Namespace | O que foi liberado (o resto é negado) | Teste |
+|---|---|---|
+| `local-path-storage` | provisioner → API | PVC criado, gravado e apagado |
+| `cert-manager` | controller/cainjector/webhook → API; API → webhook `:10250` | `Certificate` validado pelo webhook (dry-run) e **emitido** (Ready) |
+| `tipsbank-monitoring` (10 NetPols) | ingress-nginx → UIs; grafana → prometheus/alertmanager; prometheus → todos os alvos de scrape (APIs `:8080`, coredns `:9153`, rede dos nodes `6443/10250/9100`) e alertmanager; API → operator `:10250` e prometheus `:9090` (proxy do `kubectl get --raw`); operator/ksm/grafana → API | 34/34 alvos `up`; alertmanager descoberto; Grafana → Prometheus "Successfully queried" e → Alertmanager 200; webhook do operator **recusou** regra inválida (`unclosed left parenthesis`) |
+| `ingress-nginx` | qualquer origem → `80/443`; controller → API e → backends (APIs/web `:8080`, locust `:8089`, prometheus `:9090`, alertmanager `:9093`, grafana `:3000`) | 7 hosts ok (200/302/401), HTTP→308, sonda 296/296 200, lease de líder renovando |
+| `kyverno` | 4 controllers → API; API → admission/cleanup `:9443` | 6/6 webhooks respondendo logo após o apply (rollback pronto, porque `failurePolicy: Fail` travaria o cluster); mutate e generate ok; 0 erro nos 4 controllers |
+
+```console
+$ kubectl get netpol -A --no-headers | awk '{print $1}' | sort | uniq -c
+      4 cert-manager
+      4 ingress-nginx
+      4 kyverno
+      3 local-path-storage
+      3 tipsbank-auditoria
+      6 tipsbank-contas
+      4 tipsbank-loadtest
+     10 tipsbank-monitoring
+      5 tipsbank-transacoes
+      3 tipsbank-web
+```
+
+`kube-system` continua sem NetPol (CNI, DNS, kube-proxy, static pods do control-plane), coerente com o nível "Audit" da 4.1. Os pods com `hostNetwork` (node-exporter, kube-proxy, calico-node) não são alcançados por NetworkPolicy.
+
+### Parte 2 — Espelho das imagens de terceiros
+
+```console
+$ cat infra/mirror/imagens.txt          # 18 imagens: origem:tag, digest do indice em uso, digest linux/amd64
+docker.io/library/busybox:1.37        sha256:a7dbc319...  sha256:66a6306d...
+docker.io/library/postgres:16-alpine  sha256:aa6cb33c...  sha256:ac838714...
+...
+reg.kyverno.io/kyverno/reports-controller:v1.19.2  sha256:5fb6d3e7...  sha256:9fbfa8cc...
+
+$ ./infra/mirror/espelhar-imagens.sh            # rodado pelo usuario (push no ghcr)
+falhas: 0
+$ ./infra/mirror/espelhar-imagens.sh --conferir # leitura ANONIMA, como o kubelet
+OK      ghcr.io/jlui70/mirror/busybox:1.37@sha256:66a6306db78bf2dbf3487f293aa8d6990d8e506fdffab9cc43fe422becf886e4
+OK      ghcr.io/jlui70/mirror/postgres:16-alpine@sha256:ac838714b7d794185a866e5a6b479b954e7d8a070568aa0acac6fe07c3070bf5
+...                                              (18 x OK)
+falhas: 0
+```
+
+| Decisão | Por quê |
+|---|---|
+| Digest de origem = o que estava **rodando** (`imageID` dos pods) | Espelhar exatamente o que estava em produção, e não o que a tag aponta hoje |
+| Cópia **exata** do manifest `linux/amd64` (`imagetools create --prefer-index=false`) | O digest no ghcr é o mesmo publicado pelo fornecedor para amd64, então a procedência é verificável com `imagetools inspect <origem>@<indice>`. A 1ª tentativa, com o índice multi-arquitetura inteiro, estourou o limite do ghcr (`429 Too Many Requests ... allowed: 2000/minute`); todos os nodes são amd64. O script ganhou retry com espera crescente |
+| Pacotes **públicos** (o usuário trocou a visibilidade dos 18) | São cópias de imagens já públicas no fornecedor; um `imagePullSecret` seria mais um segredo em cada namespace e chart |
+
+**Achado — Postgres primary e réplica rodavam bytes diferentes com a mesma tag:**
+
+```console
+postgres-primary-0 tipsbank-w3 docker.io/library/postgres@sha256:aa6cb33c...   # build de 2026-11-05, PG 16.15
+postgres-replica-0 tipsbank-w1 docker.io/library/postgres@sha256:0cefaabd...   # build de 2026-10-21, PG 16.15
+```
+
+Cada node baixou `postgres:16-alpine` num dia diferente e o Docker Hub tinha reconstruído a tag. É o problema de tag mutável que a `disallow-latest-tag` não pega, porque `16-alpine` não é `latest`. Os dois agora estão pinados no mesmo digest (o build de 05/11, sem mudança de versão).
+
+### Troca para o espelho (com sonda HTTPS a cada 0,2 s nas 3 APIs + web)
+
+| Ordem | O quê | Como | Resultado |
+|---|---|---|---|
+| 1 | busybox (log-forwarder v1/v2, node-agent, helper do local-path) e local-path-provisioner | manifests + `install-local-path.sh` | 1048/1048 200 |
+| 2 | Kyverno (5 imagens; o chart não tem campo de digest → `tag: "v1.19.2@sha256:..."`) | `install.sh` + [`values-mirror.yaml`](../infra/kyverno/values-mirror.yaml) | webhook respondendo, liveness preservada |
+| 3 | kube-prometheus-stack (7 imagens) | `install.sh` + [`values-mirror.yaml`](../infra/monitoring/values-mirror.yaml) | 34/34 alvos `up`, UIs ok |
+| 4 | Calico (3 imagens) | `kubectl set image` (reaplicar o manifest desfaria os resources da 3.4); `install-calico.sh` atualizado para reinstalações | rede trocada node a node: **1148/1148 200** |
+| 5 | Postgres: réplica, depois primary | manifests | réplica voltou em streaming; primary **3 s de 503** (09:59:42→09:59:45, previsto na 3.4) |
+
+Dados conferidos antes e depois do Postgres:
+
+```console
+ANTES   primary: 1003|10000730.35 | transacoes=45778 | versao=16.15   replica: t|1003|10000730.35   replicacao: streaming
+DEPOIS  primary: 1003|10000730.35 | transacoes=45778                  replica: 1003|10000730.35     replicacao: streaming
+```
+
+O `imageID` do primary continuou mostrando `docker.io/...@aa6cb…`, embora o node tenha baixado a imagem do ghcr (`ghcr.io/jlui70/mirror/postgres@sha256:ac838714…` aparece no `ctr images ls` do w3). O containerd reconhece que os bytes são os mesmos da imagem em cache e reporta a primeira referência que conhece. É mais uma confirmação de que a cópia é idêntica.
+
+### Parte 3 — Policy `restrict-image-registries` (Enforce)
+
+Validate em CEL: toda imagem (containers, initContainers, ephemeral) precisa começar com um dos 4 prefixos, **com a barra final**. Imagem sem registry (`nginx`) é docker.io implícito e é recusada. Ficou em Audit até as trocas acima; depois passou para Enforce (Audit no kube-system, como as demais).
+
+**Critério — registry externo rejeitado, `ghcr.io/jlui70/*` passa:**
+
+```console
+$ kubectl -n tipsbank-web run ruim-registry --image=docker.io/nginx:1.27
+Error from server: admission webhook "validate.kyverno.svc-fail" denied the request:
+
+resource Pod/tipsbank-web/ruim-registry was blocked due to the following policies
+
+restrict-image-registries:
+  registries-confiaveis: 'Registry nao confiavel (TipsBank compliance; permitidos: ghcr.io/jlui70, quay.io/jetstack, registry.k8s.io, gcr.io/distroless): ruim-registry=docker.io/nginx:1.27'
+
+$ kubectl -n tipsbank-web run bom-registry --image=ghcr.io/jlui70/tipsbank-web:v1.0.0 ...
+pod/bom-registry created
+pod/bom-registry condition met
+```
+
+```console
+docker.io/nginx (criterio)                              NEGADO: 'Registry nao confiavel ...
+nginx sem registry (docker.io implicito)                NEGADO: 'Registry nao confiavel ...
+quay.io fora do jetstack                                NEGADO: 'Registry nao confiavel ...
+ghcr.io de outro usuario                                NEGADO: 'Registry nao confiavel ...
+prefixo enganoso ghcr.io/jlui70evil                     NEGADO: 'Registry nao confiavel ...
+ghcr.io/jlui70 (criterio)                               ACEITO
+ghcr.io/jlui70/mirror                                   ACEITO
+registry.k8s.io (allowlist auditor)                     ACEITO
+kube-system: Audit, nao bloqueia                        ACEITO
+```
+
+**Comando #1 da auditoria (4.6), no cluster inteiro:**
+
+```console
+$ kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\t"}{range .spec.containers[*]}{.image}{"\n"}{end}{end}' | grep -v 'ghcr.io/jlui70\|quay.io/jetstack\|registry.k8s.io\|gcr.io/distroless'
+$                                        # vazio: nenhum container fora do registry confiavel, kube-system incluido
+```
+
+**Consequência para rollback (intencional):** as revisões anteriores à 4.3 continuam no histórico (ReplicaSets com 0 réplicas, por isso aparecem como `fail` no PolicyReport), mas **não podem mais ser restauradas**:
+
+```console
+$ kubectl -n tipsbank-transacoes rollout undo deploy/api-transacoes --to-revision=19 --dry-run=server
+restrict-image-registries:
+  autogen-registries-confiaveis: 'Registry nao confiavel (...): log-forwarder=busybox:1.37@sha256:a7dbc319...'
+```
+
+Um rollback não consegue reintroduzir imagem de fora do registry confiável. O rollback para revisões a partir da 20 (já no espelho) funciona normalmente, inclusive o da 4.7.
+
+Com tudo em Enforce, o provisionamento de volumes continua funcionando: o PVC foi criado pelo helper **vindo do espelho** (`Pulled image "ghcr.io/jlui70/mirror/busybox:1.37@sha256:66a6306d…"`) e apagado.
+
+### Estado final
+
+```console
+$ kubectl get cpol
+NAME                               ADMISSION   BACKGROUND   READY   AGE    MESSAGE
+disallow-latest-tag                true        true         True    100m   Ready
+disallow-root-user                 true        true         True    100m   Ready
+disallow-security-context-optout   true        true         True    72m    Ready
+generate-default-deny-netpol       true        true         True    43m    Ready
+mutate-security-context            true        true         True    72m    Ready
+require-labels                     true        true         True    100m   Ready
+restrict-image-registries          true        true         True    34m    Ready
+
+$ PolicyReports por namespace (os fail fora do kube-system sao so ReplicaSets de historico, 0 replicas)
+cert-manager         pass=63   fail=0   skip=0
+ingress-nginx        pass=21   fail=0   skip=5
+kube-system          pass=108  fail=32  skip=0
+local-path-storage   pass=20   fail=1   skip=0
+tipsbank-auditoria   pass=66   fail=0   skip=0
+tipsbank-contas      pass=96   fail=0   skip=1
+tipsbank-loadtest    pass=31   fail=0   skip=0
+tipsbank-monitoring  pass=142  fail=4   skip=0
+tipsbank-transacoes  pass=102  fail=15  skip=0
+tipsbank-web         pass=56   fail=0   skip=0
+```
+
+### Observações para as próximas etapas
+
+| Achado | Impacto | Quando |
+|---|---|---|
+| NetPols de infra usam IPs do lab (`192.168.122.10`, túnel `10.244.194.64`, rede `192.168.122.0/24`) | Viram parâmetros no Helm umbrella; no EKS, ipBlock da VPC | 4.5 |
+| Imagens espelhadas não passaram pelo Trivy | São as do fornecedor, só mudaram de lugar. Um banco escanearia antes de admitir; `infra/mirror/imagens.txt` é a lista | 4.6 |
+| Pods de `helm test` do Kyverno usam `ghcr.io/kyverno/readiness-checker:latest` | Só existem se alguém rodar `helm test kyverno`, e as policies os barram | registrado |
+| Espelho só amd64 | Um node arm64 não puxaria as imagens | registrado |
+| Cache dos nodes ainda tem as imagens antigas do docker.io/quay.io | Não são usadas (o kubelet puxa pelo nome do spec); o GC de imagens do kubelet remove | registrado |
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| `kubectl create ns novo-teste` gera automaticamente uma NetPol lá dentro | ✅ `generated-default-deny` + `generated-allow-dns`; bloqueio comprovado; recria se apagada, restaura se editada |
+| Imagem de registry externo (ex.: `docker.io/nginx`) rejeitada, `ghcr.io/seu-user/*` passa | ✅ `docker.io/nginx:1.27` negado; `ghcr.io/jlui70/tipsbank-web:v1.0.0` Ready; comando #1 da 4.6 vazio no cluster inteiro |
+| Extra: NetworkPolicy em todos os namespaces fora do kube-system | ✅ 10 namespaces, cada fluxo testado |

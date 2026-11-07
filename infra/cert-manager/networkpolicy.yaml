@@ -1,0 +1,47 @@
+# Etapa 4.3 — NetworkPolicy zero-trust do namespace cert-manager.
+#   controller, cainjector, webhook -> API server (192.168.122.10:6443)
+#   API server -> webhook :10250 (validacao/conversao de Certificate, Issuer...).
+#     A chamada sai do control-plane: origem = IP do node (192.168.122.10) ou o
+#     IP do tunel IPIP do Calico no cp (10.244.194.64). Nenhuma outra origem.
+# Sem egress para a internet: no kubeadm os emissores sao a CA do lab (2.2).
+# No EKS (Let's Encrypt, 2.3) o controller precisaria de egress 443 para a ACME.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny, namespace: cert-manager, labels: {team: plataforma}}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-dns-egress, namespace: cert-manager, labels: {team: plataforma}}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-apiserver-egress, namespace: cert-manager, labels: {team: plataforma}}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to: [{ipBlock: {cidr: 192.168.122.10/32}}]
+      ports: [{protocol: TCP, port: 6443}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: webhook-ingress-apiserver, namespace: cert-manager, labels: {team: plataforma}}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/component: webhook}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock: {cidr: 192.168.122.10/32}
+        - ipBlock: {cidr: 10.244.194.64/32}
+      ports: [{protocol: TCP, port: 10250}]

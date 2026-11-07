@@ -13,4 +13,12 @@ helm upgrade --install ingress-nginx ingress-nginx \
   -f "$VALUES" \
   --wait --timeout 5m
 
+# Etapa 4.3: NetworkPolicy zero-trust + opt-out do Generate do Kyverno. So no kubeadm:
+# o arquivo usa o IP do API server do lab (192.168.122.10); no EKS o control plane
+# fala com os nodes por ENIs da VPC (seria ipBlock da VPC).
+if [[ "$VALUES" == *values-kubeadm.yaml ]]; then
+  kubectl label ns ingress-nginx tipsbank.io/netpol=gerenciada-no-git --overwrite
+  kubectl apply -f "$DIR/networkpolicy.yaml"
+fi
+
 kubectl -n ingress-nginx get pods -o wide

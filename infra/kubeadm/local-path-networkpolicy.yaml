@@ -1,0 +1,34 @@
+# Etapa 4.3 — NetworkPolicy zero-trust do namespace local-path-storage.
+# O provisioner so conversa com a API do Kubernetes; os helper pods (mkdir/rm no
+# node via hostPath) nao precisam de rede nenhuma. Ninguem chama o provisioner
+# (a porta 8080 e so health check do kubelet, que nao passa por NetworkPolicy).
+# API server do lab: 192.168.122.10:6443 (o Calico avalia a NetPol DEPOIS do
+# DNAT do kube-proxy, entao o destino e o IP real, nao o ClusterIP 10.96.0.1).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny, namespace: local-path-storage, labels: {team: plataforma}}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-dns-egress, namespace: local-path-storage, labels: {team: plataforma}}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: provisioner-egress-apiserver, namespace: local-path-storage, labels: {team: plataforma}}
+spec:
+  podSelector: {matchLabels: {app: local-path-provisioner}}
+  policyTypes: [Egress]
+  egress:
+    - to: [{ipBlock: {cidr: 192.168.122.10/32}}]
+      ports: [{protocol: TCP, port: 6443}]
