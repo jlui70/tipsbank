@@ -32,6 +32,8 @@ spec:
     metadata:
       labels: {app.kubernetes.io/name: postgres-replica, app.kubernetes.io/part-of: tipsbank, role: db}
     spec:
+      serviceAccountName: postgres                # etapa 4.4: SA propria, sem token (a app nao usa a API do Kubernetes)
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 70          # usuário postgres da imagem alpine

@@ -38,6 +38,8 @@ spec:
       annotations:
         tipsbank.io/log-config-sha: "7ec289c99786"   # muda com o configmap-log.yaml -> força rollout
     spec:
+      serviceAccountName: api-transacoes                # etapa 4.4: SA propria, sem token (a app nao usa a API do Kubernetes)
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532         # nonroot do Distroless

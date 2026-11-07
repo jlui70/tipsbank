@@ -29,6 +29,8 @@ spec:
         # muda quando o nginx.conf muda -> força rollout (o nginx só lê a config no start)
         tipsbank.io/nginx-conf-sha: "414f1bbf64dd"
     spec:
+      serviceAccountName: web                # etapa 4.4: SA propria, sem token (a app nao usa a API do Kubernetes)
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 101

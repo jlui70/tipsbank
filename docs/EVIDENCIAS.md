@@ -4405,3 +4405,195 @@ tipsbank-web         pass=56   fail=0   skip=0
 | `kubectl create ns novo-teste` gera automaticamente uma NetPol lá dentro | ✅ `generated-default-deny` + `generated-allow-dns`; bloqueio comprovado; recria se apagada, restaura se editada |
 | Imagem de registry externo (ex.: `docker.io/nginx`) rejeitada, `ghcr.io/seu-user/*` passa | ✅ `docker.io/nginx:1.27` negado; `ghcr.io/jlui70/tipsbank-web:v1.0.0` Ready; comando #1 da 4.6 vazio no cluster inteiro |
 | Extra: NetworkPolicy em todos os namespaces fora do kube-system | ✅ 10 namespaces, cada fluxo testado |
+
+---
+
+## Etapa 4.4 — RBAC: 4 perfis com certificados X.509 + ServiceAccounts
+
+**Data**: 2026-11-07 · **Arquivos**: [`k8s/rbac/usuarios.yaml`](../k8s/rbac/usuarios.yaml), [`k8s/rbac/serviceaccounts.yaml`](../k8s/rbac/serviceaccounts.yaml), [`infra/rbac/gerar-usuario.sh`](../infra/rbac/gerar-usuario.sh), `serviceAccountName` nos manifests de `k8s/`
+
+### Os 4 perfis
+
+| Usuário (CN) | Kubeconfig | Escopo | Permissões |
+|---|---|---|---|
+| `operador-contas` | `op-contas.kubeconfig` | Role em `tipsbank-contas` | get/list/watch em `pods` e `pods/log` |
+| `operador-transacoes` | `op-transacoes.kubeconfig` | Role em `tipsbank-transacoes` | get/list/watch em `pods` e `pods/log` + `pods/exec` (create, get) |
+| `auditor-global` | `auditor.kubeconfig` | ClusterRole | get/list/watch em `pods` e `pods/log`, todos os namespaces |
+| `sre` | `sre.kubeconfig` | ClusterRoleBinding | `cluster-admin` |
+
+Fluxo de cada usuário ([`gerar-usuario.sh`](../infra/rbac/gerar-usuario.sh), Day-18): chave ECDSA P-256 e CSR com `openssl` (`CN=<usuario>`) → objeto `CertificateSigningRequest` com `signerName: kubernetes.io/kube-apiserver-client` e `expirationSeconds` de 30 dias → `kubectl certificate approve` → o kube-controller-manager assina com a CA do cluster → kubeconfig com CA, certificado e chave embutidos.
+
+```console
+$ ./infra/rbac/gerar-usuario.sh operador-contas op-contas 30
+subject=CN = operador-contas
+issuer=CN = kubernetes
+notAfter=Dec  7 13:09:23 2026 GMT
+kubeconfig: .../evidencias/kubeconfigs/op-contas.kubeconfig
+(idem operador-transacoes -> op-transacoes, auditor-global -> auditor, sre -> sre)
+
+$ kubectl get csr
+NAME                  SIGNERNAME                            REQUESTOR          REQUESTEDDURATION   CONDITION
+auditor-global        kubernetes.io/kube-apiserver-client   kubernetes-admin   30d                 Approved,Issued
+operador-contas       kubernetes.io/kube-apiserver-client   kubernetes-admin   30d                 Approved,Issued
+operador-transacoes   kubernetes.io/kube-apiserver-client   kubernetes-admin   30d                 Approved,Issued
+sre                   kubernetes.io/kube-apiserver-client   kubernetes-admin   30d                 Approved,Issued
+
+$ kubectl --kubeconfig=op-contas.kubeconfig auth whoami
+Username   operador-contas
+Groups     [system:authenticated]
+Extra: authentication.kubernetes.io/credential-id   [X509SHA256=a7873d536dc9961478f62feef7b44fa31418f8864fe4d75d9063071b0f99f417]
+```
+
+Os kubeconfigs ficam em `evidencias/kubeconfigs/` (`-rw-------`), que está no `.gitignore`. A chave privada vai **dentro** do kubeconfig, então nem o kubeconfig nem o `.key` entram no Git. O repositório tem só o script que os gera.
+
+| Decisão | Por quê |
+|---|---|
+| Nenhum certificado com `O=system:masters` | Esse grupo **ignora o RBAC** e só deixa de valer trocando a CA do cluster. Até o `sre` recebe `cluster-admin` por um binding, que pode ser apagado |
+| Certificado de **30 dias** | O Kubernetes não consulta lista de revogação (CRL) para certificado de cliente. Revogar = apagar o binding (imediato) + vida curta. Renovar = rodar o script de novo |
+| Bindings para `User` (não para grupo `O=`) | O vínculo pessoa → permissão fica explícito na auditoria |
+| Nenhum perfil, exceto o `sre`, lê Secrets | Ver testes abaixo |
+
+### Critérios
+
+```console
+$ kubectl --kubeconfig=op-contas.kubeconfig get pods -n tipsbank-contas
+NAME                         READY   STATUS    RESTARTS   AGE
+api-contas-8db7fb897-dqvs5   1/1     Running   0          81m
+api-contas-8db7fb897-gvhlz   1/1     Running   0          81m
+postgres-primary-0           1/1     Running   0          15m
+postgres-replica-0           1/1     Running   0          15m
+
+$ kubectl --kubeconfig=op-contas.kubeconfig get pods -n tipsbank-transacoes
+Error from server (Forbidden): pods is forbidden: User "operador-contas" cannot list resource "pods" in API group "" in the namespace "tipsbank-transacoes"
+
+$ kubectl --kubeconfig=auditor.kubeconfig get pods -A
+NAMESPACE             NAME                                             READY   STATUS    RESTARTS       AGE
+cert-manager          cert-manager-5c8557dcf6-v4lk9                    1/1     Running   0              103m
+cert-manager          cert-manager-cainjector-699cd649bf-z4677         1/1     Running   0              103m
+ingress-nginx         ingress-nginx-controller-694b746c6f-ncv5d        1/1     Running   0              81m
+kube-system           calico-kube-controllers-6b875bb6b-ckhkn          1/1     Running   0              17m
+...                                                                      (todos os namespaces)
+
+$ kubectl --kubeconfig=auditor.kubeconfig delete pod/web-8ff57ff65-ltcm7 -n tipsbank-web
+Error from server (Forbidden): pods "web-8ff57ff65-ltcm7" is forbidden: User "auditor-global" cannot delete resource "pods" in API group "" in the namespace "tipsbank-web"
+```
+
+### Testes de borda (o que um auditor perguntaria)
+
+```console
+op-contas: logs api-contas                           OK: INFO:     192.168.122.12:35578 - "GET /health/ready HTTP/1.1
+op-contas: exec                                      FORBIDDEN
+op-contas: ler Secret                                FORBIDDEN
+op-contas: apagar pod                                FORBIDDEN
+op-transacoes: exec no log-forwarder (id)            OK: uid=65532 gid=65532 groups=65532
+op-transacoes: exec em contas                        FORBIDDEN
+op-transacoes: apagar pod                            FORBIDDEN
+op-transacoes: escalar deployment                    FORBIDDEN
+op-transacoes: ler Secret                            FORBIDDEN
+auditor: logs de pod/coredns-5cfcb86f9c-7n5bj        OK: linux/amd64, go1.26.1, dd1df4f
+auditor: ler Secrets (todos os ns)                   FORBIDDEN
+auditor: exec                                        FORBIDDEN
+auditor: listar deployments                          FORBIDDEN
+auditor: aprovar CSR                                 FORBIDDEN
+sre: nodes                                           OK
+sre: ler Secret                                      OK: secret/postgres-credentials
+
+$ kubectl --kubeconfig=op-transacoes.kubeconfig auth can-i --list -n tipsbank-transacoes | grep pods
+pods/exec      []   []   [create get]
+pods/log       []   []   [get list watch]
+pods           []   []   [get list watch]
+$ kubectl --kubeconfig=sre.kubeconfig auth can-i '*' '*' --all-namespaces
+yes
+```
+
+O `pods/exec` tem `get` além de `create` porque o kubectl atual abre o exec por WebSocket, que chega ao API server como `GET`.
+
+Também foi registrado: o auditor **não** consegue `kubectl logs deploy/coredns`, porque resolver o Deployment exige `get deployments`. Ele precisa usar o nome do pod. É o comportamento correto para "só pods e logs".
+
+**Revogação** (o certificado continua válido; o acesso cai na hora):
+
+```console
+$ kubectl -n tipsbank-contas delete rolebinding operador-contas
+$ kubectl --kubeconfig=op-contas.kubeconfig get pods -n tipsbank-contas
+Error from server (Forbidden): pods is forbidden: User "operador-contas" cannot list resource "pods" ...
+$ kubectl apply -f k8s/rbac/usuarios.yaml        # devolve o acesso (4 pods listados)
+```
+
+**O risco do `exec` (o perfil pedido pelo manual):**
+
+```console
+$ kubectl --kubeconfig=op-transacoes.kubeconfig -n tipsbank-transacoes exec <pod> -c app -- python3 -c "...os.environ['DB_URL']... (mascarado)"
+postgresql+psycopg://tipsbank:****@postgres-primary.tipsbank-contas.svc.cluster.local:5432/tipsbank
+```
+
+Quem tem `exec` lê tudo o que o processo lê, inclusive a senha do banco no ambiente. E a `api-transacoes` conecta como **`tipsbank`, o dono do banco**. Por isso o perfil fica restrito a um namespace e o `exec` não foi dado a mais ninguém. Ver as pendências abaixo.
+
+### ServiceAccounts: uma por workload, sem token
+
+**Antes** (achado no levantamento): todos os pods do app usavam a SA `default` com o token da API montado em `/var/run/secrets/kubernetes.io/serviceaccount/`, inclusive o Postgres. Nenhuma app do TipsBank fala com a API do Kubernetes, então uma falha de execução remota na `api-contas` entregaria uma credencial da API sem necessidade nenhuma (CIS Kubernetes 5.1.5 e 5.1.6).
+
+```console
+api-contas-8db7fb897-dqvs5 1        # 1 = volume projetado com serviceAccountToken
+postgres-primary-0 1
+...                                  (12 pods)
+```
+
+**Depois** ([`k8s/rbac/serviceaccounts.yaml`](../k8s/rbac/serviceaccounts.yaml)): SAs `api-contas`, `postgres`, `api-transacoes` (v1 e v2), `auditoria`, `web` e `locust`. Todas com `automountServiceAccountToken: false` na SA **e** no pod, e sem nenhum RoleBinding: são identidades sem permissão. A SA `default` de cada namespace `tipsbank-*` também deixou de montar token, para que um pod futuro que esqueça o `serviceAccountName` não ganhe credencial.
+
+```console
+tipsbank-auditoria/auditoria           sa=auditoria       token_montado=false
+tipsbank-contas/api-contas             sa=api-contas      token_montado=false
+tipsbank-contas/postgres-primary-0     sa=postgres        token_montado=false
+tipsbank-contas/postgres-replica-0     sa=postgres        token_montado=false
+tipsbank-loadtest/locust               sa=locust          token_montado=false
+tipsbank-transacoes/api-transacoes     sa=api-transacoes  token_montado=false
+tipsbank-transacoes/api-transacoes-v2  sa=api-transacoes  token_montado=false
+tipsbank-web/web                       sa=web             token_montado=false
+
+$ kubectl -n tipsbank-contas exec <api-contas> -- python3 -c "import os; print(os.path.exists('/var/run/secrets/kubernetes.io/serviceaccount/token'))"
+False
+```
+
+Rollout com sonda HTTPS a cada 0,2 s: APIs, web e locust sem nenhuma falha. Réplica do Postgres antes do primary; o primary deu os **3 s de 503** previstos (10:16:45→10:16:48), e a replicação voltou `streaming`.
+
+**As 2 ServiceAccounts com token** (`api-contas` e `api-transacoes`): token por **TokenRequest** (`kubectl create token`), curto e assinado, nunca um Secret do tipo `kubernetes.io/service-account-token` (legado, sem expiração):
+
+```console
+$ T=$(kubectl -n tipsbank-contas create token api-contas --duration=10m)
+$ echo $T | cut -d. -f2 | base64 -d | jq '{sub, aud, exp, iat}'
+{"sub":"system:serviceaccount:tipsbank-contas:api-contas","aud":["https://kubernetes.default.svc.cluster.local"],"exp":"2026-11-07T13:27:27Z","iat":"2026-11-07T13:17:27Z"}
+
+$ kubectl --server=https://192.168.122.10:6443 --certificate-authority=ca.crt --token=$T auth whoami
+Username   system:serviceaccount:tipsbank-contas:api-contas
+Groups     [system:serviceaccounts system:serviceaccounts:tipsbank-contas system:authenticated]
+
+$ kubectl ... --token=$T -n tipsbank-contas get pods
+Error from server (Forbidden): pods is forbidden: User "system:serviceaccount:tipsbank-contas:api-contas" cannot list resource "pods" ...
+
+$ kubectl ... --token=$T auth can-i --list -n tipsbank-contas
+selfsubjectreviews / selfsubjectaccessreviews / selfsubjectrulesreviews  [create]
+/api, /api/*, /.well-known/openid-configuration ...                      [get]     # so descoberta
+```
+
+(idem `api-transacoes`.) O token expira em 10 min e não dá permissão nenhuma: privilégio mínimo de verdade.
+
+### Observações para as próximas etapas
+
+| Achado | Impacto | Quando |
+|---|---|---|
+| `api-transacoes` (e `api-contas`) conectam no Postgres como `tipsbank`, o **dono do banco** | Uma senha vazada (por `exec`, log ou RCE) dá controle total do banco. O correto seria um role por API só com `SELECT/INSERT/UPDATE` nas suas tabelas. Mexe nos Secrets e no init SQL, não no código | decisão do usuário (fora do manual) |
+| `exec` sem trilha de auditoria | O API server não tem audit log configurado; num banco, todo `exec` seria registrado (audit policy do kube-apiserver) | decisão do usuário |
+| Certificados vencem em **07/12/2026** | Gravar o vídeo (4.7) antes, ou renovar com `gerar-usuario.sh` | 4.7 |
+| SAs dos componentes de infra (kps, cert-manager, Kyverno) montam token | Eles **usam** a API: é necessário e cada chart dá um RBAC próprio | registrado |
+| O Helm umbrella (4.5) precisa levar `templates/rbac/` (Roles, bindings, SAs) | O manual lista `templates/rbac/` | 4.5 |
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| `op-contas.kubeconfig get pods -n tipsbank-contas` → 200 | ✅ lista os 4 pods |
+| `op-contas.kubeconfig get pods -n tipsbank-transacoes` → Forbidden | ✅ |
+| `auditor.kubeconfig get pods -A` → lista todos | ✅ |
+| `auditor.kubeconfig delete pod X` → Forbidden | ✅ |
+| 4 usuários com chave + CSR + certificado aprovado pela CA do cluster; kubeconfigs em `evidencias/kubeconfigs/`, chaves fora do Git | ✅ |
+| 2 ServiceAccounts com token | ✅ `api-contas` e `api-transacoes` via TokenRequest (10 min, sem permissões); + SA própria sem token em todos os workloads |

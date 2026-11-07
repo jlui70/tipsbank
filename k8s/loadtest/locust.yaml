@@ -19,6 +19,7 @@ spec:
     metadata:
       labels: {app.kubernetes.io/name: locust, app.kubernetes.io/part-of: tipsbank}
     spec:
+      serviceAccountName: locust                # etapa 4.4: SA propria, sem token (a app nao usa a API do Kubernetes)
       automountServiceAccountToken: false     # o Locust não fala com a API do Kubernetes
       securityContext:
         runAsNonRoot: true

@@ -1,0 +1,69 @@
+# Etapa 4.4 — RBAC dos 4 perfis humanos (autenticacao por certificado X.509 do cluster).
+# Usuario = CN do certificado (infra/rbac/gerar-usuario.sh). Os bindings apontam para o
+# usuario (e nao para o grupo O=) para o vinculo ficar explicito na auditoria.
+#
+# Regras de banco aplicadas:
+# - Nenhum certificado tem O=system:masters: esse grupo IGNORA o RBAC e nao pode ser
+#   revogado sem trocar a CA do cluster. Ate o sre recebe cluster-admin por binding,
+#   que pode ser apagado.
+# - O Kubernetes nao consulta lista de revogacao (CRL) de certificado de cliente.
+#   Revogar = apagar o binding (efeito imediato) + certificado de vida curta (30 dias).
+# - Nenhum perfil abaixo, exceto o sre, le Secrets.
+---
+# operador-contas: so observa os pods do namespace de contas
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: operador-contas, namespace: tipsbank-contas, labels: {team: plataforma}}
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: operador-contas, namespace: tipsbank-contas, labels: {team: plataforma}}
+subjects: [{kind: User, name: operador-contas, apiGroup: rbac.authorization.k8s.io}]
+roleRef: {kind: Role, name: operador-contas, apiGroup: rbac.authorization.k8s.io}
+---
+# operador-transacoes: observa e entra (exec) nos pods de transacoes.
+# exec e o privilegio mais sensivel daqui: dentro do container ele le as variaveis de
+# ambiente (DB_URL com a senha do banco). Ver EVIDENCIAS 4.4.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: operador-transacoes, namespace: tipsbank-transacoes, labels: {team: plataforma}}
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create, get]       # get: kubectl novo abre o exec por WebSocket (requisicao GET)
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: operador-transacoes, namespace: tipsbank-transacoes, labels: {team: plataforma}}
+subjects: [{kind: User, name: operador-transacoes, apiGroup: rbac.authorization.k8s.io}]
+roleRef: {kind: Role, name: operador-transacoes, apiGroup: rbac.authorization.k8s.io}
+---
+# auditor-global: leitura de pods e logs em TODOS os namespaces, nada mais
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: auditor-global, labels: {team: plataforma}}
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: auditor-global, labels: {team: plataforma}}
+subjects: [{kind: User, name: auditor-global, apiGroup: rbac.authorization.k8s.io}]
+roleRef: {kind: ClusterRole, name: auditor-global, apiGroup: rbac.authorization.k8s.io}
+---
+# sre: cluster-admin (ClusterRole padrao do Kubernetes). Perfil de break-glass:
+# poucos titulares, certificado curto e uso registrado.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: sre-cluster-admin, labels: {team: plataforma}}
+subjects: [{kind: User, name: sre, apiGroup: rbac.authorization.k8s.io}]
+roleRef: {kind: ClusterRole, name: cluster-admin, apiGroup: rbac.authorization.k8s.io}

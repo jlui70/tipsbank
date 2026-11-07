@@ -26,6 +26,8 @@ spec:
     metadata:
       labels: {app.kubernetes.io/name: api-contas, app.kubernetes.io/part-of: tipsbank, role: app}
     spec:
+      serviceAccountName: api-contas                # etapa 4.4: SA propria, sem token (a app nao usa a API do Kubernetes)
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532         # nonroot do Distroless
