@@ -14,6 +14,15 @@ crds:
 startupapicheck:
   enabled: false
 
+# 4.6: imagens pinadas por DIGEST (index multi-arch do quay.io, conferido com
+# `docker buildx imagetools inspect`). A tag sozinha e mutavel: o fornecedor (ou quem invadir o
+# registry) pode trocar o conteudo sem trocar o nome. Com digest, o node so roda aquele conteudo.
+image:
+  digest: sha256:9f4f96a33c7774cef24466fcd85031997531a03a8d117f151126baa8d1290dcc   # controller v1.21.3
+acmesolver:
+  image:
+    digest: sha256:c8c1225bb2fe8ab37a330b77f0d8c2ee6a41210fcb54fc07ca606ab9a022b8b7 # v1.21.3 (so ACME/EKS)
+
 # Compliance #2: o comando olha runAsUser em CADA container (ausente conta como root).
 # As 3 imagens já rodam como 65532; aqui só fica explícito. Os maps são mesclados com os
 # padrões do chart (drop ALL, readOnlyRootFilesystem, allowPrivilegeEscalation: false).
@@ -26,6 +35,8 @@ resources:
   limits: {cpu: 200m, memory: 256Mi}
 
 webhook:
+  image:
+    digest: sha256:055ac8e9de6a0ba6763794838fe38944acc650f68ebe1b01dd8be079e580f458 # v1.21.3
   containerSecurityContext:
     runAsUser: 65532
     runAsGroup: 65532
@@ -33,8 +44,10 @@ webhook:
     requests: {cpu: 10m, memory: 32Mi}
     limits: {cpu: 100m, memory: 128Mi}
 
-# Atenção (etapa 4.6): o template do cainjector não tem livenessProbe -> aparece no compliance #3.
+# O template do cainjector não tem livenessProbe (compliance #3): patch no install.sh (4.6).
 cainjector:
+  image:
+    digest: sha256:083d0e906f8eb44e255fe4ff817ae54e49f9ed82e22f1011bb4e9e4f4b8a641f # v1.21.3
   containerSecurityContext:
     runAsUser: 65532
     runAsGroup: 65532

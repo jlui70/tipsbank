@@ -1,0 +1,16 @@
+# 4.6 - manifest RUIM no 1: Pod rodando como root (uid 0).
+# Esperado: bloqueado pela ClusterPolicy disallow-root-user (Enforce).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ruim-root
+  namespace: tipsbank-contas
+  labels: {app: ruim-root, team: contas, env: producao}
+spec:
+  securityContext: {runAsUser: 0}
+  containers:
+    - name: app
+      image: ghcr.io/jlui70/tipsbank-api-contas:v1.2.0@sha256:f99c96cedcf83921d77b89419fee5936c6fca6a383897b4361cdc6ac9d01146c
+      securityContext: {runAsUser: 0}
+      resources:
+        limits: {cpu: 100m, memory: 64Mi}

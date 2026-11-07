@@ -2,7 +2,7 @@
 # Gerado a partir de infra/mirror/imagens.txt: copia EXATA do manifest linux/amd64 do
 # fornecedor, pinada por digest. Motivo: policy restrict-image-registries (Kyverno) e
 # comando #1 da auditoria (4.6). Uso: -f values-kubeadm.yaml -f values-mirror.yaml
-# kube-state-metrics continua em registry.k8s.io (allowlist do auditor).
+# kube-state-metrics continua em registry.k8s.io (allowlist do auditor), pinado por digest (4.6).
 prometheusOperator:
   image: {registry: ghcr.io, repository: jlui70/mirror/prometheus-operator/prometheus-operator, tag: v0.94.2, sha: "051606fe50e8c4bf6a433f0972bc3dcf3b90a62bc712f55692a9c4be83fe6f46"}
   prometheusConfigReloader:
@@ -20,3 +20,7 @@ grafana:
 # node-exporter: o chart acrescenta "-distroless" a tag (distroless: true no kps).
 prometheus-node-exporter:
   image: {registry: ghcr.io, repository: jlui70/mirror/prometheus/node-exporter, tag: v1.12.1, digest: "sha256:bbfbd533202cfef891c70383ddf6f0c32acece66400ad8091a18bed7aad5db6f"}
+# o chart do KSM monta "tag@sha" literal: o valor precisa do prefixo sha256: (sem ele a referencia
+# fica malformada e o Kyverno recusa o Deployment - aconteceu na 4.6).
+kube-state-metrics:
+  image: {registry: registry.k8s.io, repository: kube-state-metrics/kube-state-metrics, tag: v2.20.0, sha: "sha256:42cfe3723a5f058171c627537fb57a3ea0f26e4380fa18555a95cb1a1b4cfc5b"}

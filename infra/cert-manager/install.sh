@@ -16,6 +16,15 @@ helm upgrade --install cert-manager cert-manager \
 kubectl label ns cert-manager tipsbank.io/netpol=gerenciada-no-git --overwrite
 kubectl apply -f "$DIR/networkpolicy.yaml"
 
+# 4.6 (compliance #3): o chart nao tem livenessProbe para o cainjector, e ele nao expoe
+# /healthz (so /metrics na 9402). Liveness = o servidor HTTP do processo responde. Patch com field
+# manager proprio: o helm upgrade (server-side apply) nao remove campos que nao sao dele.
+kubectl -n cert-manager patch deploy cert-manager-cainjector --type=strategic -p '{
+  "spec":{"template":{"spec":{"containers":[{"name":"cert-manager-cainjector",
+    "livenessProbe":{"httpGet":{"path":"/metrics","port":9402},"initialDelaySeconds":15,
+                     "periodSeconds":30,"timeoutSeconds":5,"failureThreshold":3}}]}}}}'
+kubectl -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=120s
+
 # Sem o Job startupapicheck: espera o webhook responder antes de criar os emissores
 # (o API server consulta o webhook do cert-manager para validar Certificate/ClusterIssuer).
 kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=120s

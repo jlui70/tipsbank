@@ -4968,3 +4968,358 @@ $ sha256sum tipsbank-1.0.0.tgz dist/tipsbank-1.0.0.tgz
 | `helm upgrade` sem derrubar tráfego | ✅ 572/572 respostas 200 |
 | `helm rollback` também | ✅ 552/552 respostas 200 |
 | Chart publicado num repositório remoto acessível | ✅ `oci://ghcr.io/jlui70/charts/tipsbank:1.0.0`, pull anônimo idêntico |
+
+
+## Etapa 4.6 — Teste de compliance final (auditoria BACEN)
+
+**Data**: 2026-11-07 14:25 -03 · **Cluster**: kubeadm v1.36.6 (cp + 3 workers) · **App**: release Helm `tipsbank` 1.0.0 (OCI) · **Script**: [`tests/compliance/auditoria.sh`](../tests/compliance/auditoria.sh) (7 comandos do manual + checagens extras) · **Manifests ruins**: [`tests/compliance/`](../tests/compliance/)
+
+Postura adotada (pedido do instrutor): tratar como auditoria do BACEN num banco real. Cada item que aparece na saída tem **dono, justificativa e controle compensatório**; o que dava para corrigir foi corrigido **antes** da coleta final, e o que é limite técnico ficou registrado como risco aceito.
+
+### Correções feitas antes da coleta final
+
+A primeira execução (início da 4.6) acusava, além do esperado, componentes de **plataforma**. Todos corrigidos na fonte (values ou script de instalação), não com exceção:
+
+| Comando | Achado | Correção | Onde |
+|---|---|---|---|
+| #2 | Pods do kube-prometheus-stack (Prometheus, Alertmanager, Grafana + sidecars, operator, kube-state-metrics, node-exporter): uid só no **pod**, não no container. O jq do manual trata "sem `runAsUser` no container" como root | `runAsUser`/`runAsGroup`/`runAsNonRoot` declarados em **todos** os containers (inclusive os gerados pelo operator: strategic merge via `prometheusSpec.containers`/`initContainers`) | [`infra/monitoring/values-kubeadm.yaml`](../infra/monitoring/values-kubeadm.yaml) |
+| #2 | `calico-kube-controllers` sem uid declarado (a imagem roda como 10001) | patch declarando 10001 | [`infra/kubeadm/system-compliance.sh`](../infra/kubeadm/system-compliance.sh) |
+| #3 | `config-reloader` do Prometheus e do Alertmanager sem liveness | `httpGet /healthz` na porta `reloader-web` | `values-kubeadm.yaml` |
+| #3 | Sidecars do Grafana sem liveness — **e um bug latente**: os 2 sidecars (dashboards e datasources) abriam o health server na **mesma porta 8080** dentro do pod; o de datasources morria com *address already in use* e ficava sem `/healthz` | `HEALTH_PORT` 8080/8081 (um por sidecar) + liveness `httpGet` por container | `values-kubeadm.yaml` + [`infra/monitoring/install.sh`](../infra/monitoring/install.sh) |
+| #3 | `cert-manager-cainjector` sem liveness (o chart não oferece; o processo só expõe `/metrics`) | `httpGet /metrics :9402` (o servidor HTTP do processo responde) | [`infra/cert-manager/install.sh`](../infra/cert-manager/install.sh) |
+| #3 | `kube-proxy` sem liveness (o kubeadm não põe) | `httpGet 127.0.0.1:10256/livez` (liveness pura; o `/healthz` também fica 503 com o node em remoção) | `system-compliance.sh` |
+| extra | cert-manager (3 imagens), kube-state-metrics e metrics-server rodando **só por tag** | pinados por **digest** | `infra/cert-manager/values.yaml`, `infra/monitoring/values-mirror.yaml`, `infra/metrics-server/values-kubeadm.yaml` |
+
+Os patches por `kubectl patch` (cainjector, kube-proxy, sidecars do Grafana) seguem o padrão já usado nos controllers do Kyverno (4.1): field manager próprio, e o `helm upgrade` (server-side apply) não remove campos que não são dele. `kube-proxy` e `calico-kube-controllers` são recriados por `kubeadm upgrade`/reinstalação do Calico → rodar de novo o `system-compliance.sh` (já documentado no script).
+
+Duas tentativas que **não** ficaram (registradas porque um auditor pergunta "como vocês validaram?"):
+
+- Probe `exec` em Python para os sidecars do Grafana: com limit de 100m de CPU o interpretador leva mais de 5 s para subir, a probe estoura o timeout e o kubelet **matou** os sidecars (CrashLoop, Grafana 503 por ~10 min). Trocada por `httpGet` por container.
+- Pin do kube-state-metrics: o chart monta `tag@sha` literal e o valor sem o prefixo `sha256:` gerou uma referência malformada → o próprio Kyverno (`disallow-latest-tag`) **recusou** o Deployment e o `helm upgrade` falhou sem tocar no que estava rodando. Corrigido o valor.
+
+### Os 7 comandos do manual
+
+`seuuser` → `jlui70`. Saída integral de `tests/compliance/auditoria.sh`.
+
+#### 1. Nenhuma imagem fora do registry confiável
+
+```console
+$ kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\t"}{range .spec.containers[*]}{.image}{"\n"}{end}{end}' | grep -v 'ghcr.io/jlui70\|quay.io/jetstack\|registry.k8s.io\|gcr.io/distroless'
+$ echo $?
+1
+```
+
+Limpo: nenhuma linha. Os initContainers (que o comando do manual não olha) também foram conferidos (B2 abaixo).
+
+#### 2. Nenhum pod rodando como root
+
+```console
+$ kubectl get pods -A -o json | jq '[.items[] | select(.spec.securityContext.runAsUser == 0 or (.spec.containers[].securityContext.runAsUser // 0) == 0) | .metadata.name]'
+[
+  "calico-node-47czt",
+  "calico-node-cbnkj",
+  "calico-node-hwnkl",
+  "calico-node-vf58f",
+  "etcd-tipsbank-cp",
+  "kube-apiserver-tipsbank-cp",
+  "kube-controller-manager-tipsbank-cp",
+  "kube-proxy-2prgf",
+  "kube-proxy-4w99d",
+  "kube-proxy-6mr2w",
+  "kube-proxy-skw6l",
+  "kube-scheduler-tipsbank-cp",
+  "nfs-server-0"
+]
+```
+
+Os 13 pods restantes rodam como root **de verdade** (não é falta de declaração). Todos são exceções conhecidas:
+
+| Pod | Por que precisa de root | Controle compensatório |
+|---|---|---|
+| `etcd`, `kube-apiserver`, `kube-controller-manager`, `kube-scheduler` (static pods do kubeadm) | O kubeadm grava certificados e kubeconfigs como `root:root 0600` em `/etc/kubernetes`. O modo rootless (`RootlessControlPlane`) nunca saiu de alpha | só no control plane (taint `NoSchedule`), imagens **assinadas pelo projeto Kubernetes** (B4), audit log do API server (4.4), kube-system em **Audit** no Kyverno (PolicyReport) |
+| `kube-proxy` (DaemonSet) | programa iptables/IPVS no namespace de rede do **host** (`privileged`) | idem; agora com liveness (#3) |
+| `calico-node` (DaemonSet) | CNI: rotas, túnel IPIP e regras de NetworkPolicy no host | imagem do **espelho** pinada por digest (4.3) |
+| `nfs-server-0` (`tipsbank-nfs`) | o `nfsd` é do kernel: montar `/proc/fs/nfsd` exige root + privileged | **PolicyException nominal** (só `nfs-server*` em `tipsbank-nfs`), imagem própria (0 HIGH/CRITICAL, assinada), só NFSv4/TCP, `all_squash` → uid 65532, NetworkPolicy só dos nodes, node dedicado (4.5) |
+
+Nenhum pod de **aplicação** roda como root (B1). Num cluster gerenciado (EKS, 2.3) os 4 static pods nem aparecem: o control plane é da AWS.
+
+#### 3. Cobertura de probes
+
+```console
+$ kubectl get deploy,sts,ds -A -o json | jq '[.items[] | select(.spec.template.spec.containers[].livenessProbe == null) | .metadata.name]'
+[]
+```
+
+#### 4. Cobertura de resources
+
+```console
+$ kubectl get deploy,sts,ds -A -o json | jq '[.items[] | select(.spec.template.spec.containers[].resources.limits == null) | .metadata.name]'
+[]
+```
+
+#### 5. Policies Kyverno ativas
+
+```console
+$ kubectl get cpol -o json | jq -c '.items[] | {name: .metadata.name, ready: .status.ready, Ready: ((.status.conditions // [])[] | select(.type=="Ready") | .status)}'
+{"name":"disallow-latest-tag","ready":null,"Ready":"True"}
+{"name":"disallow-root-user","ready":null,"Ready":"True"}
+{"name":"disallow-security-context-optout","ready":null,"Ready":"True"}
+{"name":"generate-default-deny-netpol","ready":null,"Ready":"True"}
+{"name":"mutate-security-context","ready":null,"Ready":"True"}
+{"name":"require-labels","ready":null,"Ready":"True"}
+{"name":"restrict-image-registries","ready":null,"Ready":"True"}
+```
+
+`.status.ready` (o campo do manual) vem `null` em **todas**: o Kyverno 1.19 removeu esse campo e passou a publicar a condição `Ready` em `.status.conditions`. Por isso o comando foi estendido com a coluna `Ready`: as 7 estão `True` (3 Validate da 4.1, `mutate-security-context` e `disallow-security-context-optout` da 4.2, `generate-default-deny-netpol` e `restrict-image-registries` da 4.3). Todas em **Enforce** (kube-system em Audit; `kyverno` excluído).
+
+#### 6. NetworkPolicies aplicadas nos namespaces tipsbank-*
+
+```console
+$ kubectl get netpol -n tipsbank-contas
+NAME                              POD-SELECTOR                              AGE
+allow-dns-egress                  <none>                                    35m
+api-contas-egress-postgres        app.kubernetes.io/name=api-contas         35m
+api-contas-ingress                app.kubernetes.io/name=api-contas         35m
+default-deny                      <none>                                    35m
+postgres-ingress                  app.kubernetes.io/name=postgres-primary   35m
+postgres-replica-egress-primary   app.kubernetes.io/name=postgres-replica   35m
+$ kubectl get netpol -n tipsbank-transacoes
+NAME                            POD-SELECTOR                            AGE
+allow-dns-egress                <none>                                  35m
+api-transacoes-egress-externo   app.kubernetes.io/name=api-transacoes   35m
+api-transacoes-egress-interno   app.kubernetes.io/name=api-transacoes   35m
+api-transacoes-ingress          app.kubernetes.io/name=api-transacoes   35m
+default-deny                    <none>                                  35m
+$ kubectl get netpol -n tipsbank-auditoria
+NAME                POD-SELECTOR                                AGE
+allow-dns-egress    <none>                                      35m
+auditoria-ingress   app.kubernetes.io/name=auditoria            35m
+default-deny        <none>                                      35m
+porteiro-ingress    app.kubernetes.io/name=auditoria-porteiro   35m
+```
+
+Todos com `default-deny` (Ingress + Egress) e liberações por pod/porta. Os demais namespaces (`tipsbank-web`, `-loadtest`, `-nfs`, `-monitoring`, `ingress-nginx`, `cert-manager`, `kyverno`, `local-path-storage`) também têm NetPol (4.3); namespace novo nasce com `default-deny` pelo Generate do Kyverno.
+
+#### 7. Imagens assinadas (Cosign)
+
+```console
+$ for img in ghcr.io/jlui70/tipsbank-api-contas:v1.0.0 ghcr.io/jlui70/tipsbank-api-transacoes:v1.0.0 ghcr.io/jlui70/tipsbank-auditoria:v1.0.0; do
+    cosign verify $img --certificate-identity-regexp '.*' --certificate-oidc-issuer-regexp '.*' && echo "OK: $img"
+  done      # (JSON das assinaturas omitido)
+OK: ghcr.io/jlui70/tipsbank-api-contas:v1.0.0
+OK: ghcr.io/jlui70/tipsbank-api-transacoes:v1.0.0
+OK: ghcr.io/jlui70/tipsbank-auditoria:v1.0.0
+```
+
+O comando do manual usa `--certificate-identity-regexp '.*'`: aceita **qualquer** assinatura keyless válida, de qualquer pessoa. Num banco isso não prova a origem. Por isso o B3 abaixo repete com a identidade **exata** e em todas as imagens próprias que estão **rodando** (pelo digest em execução, não pela tag).
+
+### Registro de 3 manifests "ruins" bloqueados pelo Kyverno
+
+Aplicados como `cluster-admin` (nem o administrador passa: o bloqueio é na admissão, não no RBAC). Arquivos em [`tests/compliance/`](../tests/compliance/).
+
+| Arquivo | Violações | Policies que bloquearam |
+|---|---|---|
+| `ruim-1-root.yaml` | Pod com `runAsUser: 0` | `disallow-root-user` |
+| `ruim-2-latest-registry.yaml` | Deployment com `docker.io/library/nginx:latest`, sem uid | `disallow-latest-tag` + `restrict-image-registries` + `disallow-root-user` (regras **autogen**: o Deployment nem é criado) |
+| `ruim-3-privilegiado-sem-dono.yaml` | Deployment sem `app`/`team`/`env`, `privileged: true`, `allowPrivilegeEscalation: true` | `require-labels` + `disallow-security-context-optout` |
+
+```console
+$ kubectl apply -f tests/compliance/ruim-1-root.yaml
+Error from server: error when creating "tests/compliance/ruim-1-root.yaml": admission webhook "validate.kyverno.svc-fail" denied the request: 
+
+resource Pod/tipsbank-contas/ruim-root was blocked due to the following policies 
+
+disallow-root-user:
+  proibir-runasuser-0: 'runAsUser: 0 proibido (TipsBank compliance). Containers: app'
+=> RECUSADO
+$ kubectl apply -f tests/compliance/ruim-2-latest-registry.yaml
+Error from server: error when creating "tests/compliance/ruim-2-latest-registry.yaml": admission webhook "validate.kyverno.svc-fail" denied the request: 
+
+resource Deployment/tipsbank-transacoes/ruim-latest was blocked due to the following policies 
+
+disallow-latest-tag:
+  autogen-exigir-tag-sem-latest: 'Imagem sem tag ou com :latest e proibida (TipsBank compliance): app=docker.io/library/nginx:latest'
+disallow-root-user:
+  autogen-exigir-nao-root: 'Container sem garantia de nao-root: defina securityContext.runAsUser > 0 ou runAsNonRoot: true (TipsBank compliance). Containers: app'
+restrict-image-registries:
+  autogen-registries-confiaveis: 'Registry nao confiavel (TipsBank compliance; permitidos: ghcr.io/jlui70/, quay.io/jetstack/, registry.k8s.io/, gcr.io/distroless/): app=docker.io/library/nginx:latest'
+=> RECUSADO
+$ kubectl apply -f tests/compliance/ruim-3-privilegiado-sem-dono.yaml
+Error from server: error when creating "tests/compliance/ruim-3-privilegiado-sem-dono.yaml": admission webhook "validate.kyverno.svc-fail" denied the request: 
+
+resource Deployment/tipsbank-auditoria/ruim-privilegiado was blocked due to the following policies 
+
+disallow-security-context-optout:
+  autogen-proibir-optout: 'Opt-out do securityContext seguro exige PolicyException (TipsBank compliance): readOnlyRootFilesystem false, allowPrivilegeEscalation true, runAsNonRoot false ou privileged true em: app'
+require-labels:
+  exigir-app-team-env: 'Labels obrigatorias ausentes (TipsBank compliance): app, team, env'
+=> RECUSADO
+```
+
+Depois: `kubectl get pod,deploy -A | grep ruim` → nada criado.
+
+### Nuance do `web`: nonroot/minimal, não Distroless
+
+```console
+$ kubectl get pod -n tipsbank-web -l app.kubernetes.io/name=web -o json | jq -c '.items[0] | ...'
+{"podSC":{"runAsGroup":101,"runAsNonRoot":true,"runAsUser":101,"seccompProfile":{"type":"RuntimeDefault"}},"c":{"image":"ghcr.io/jlui70/tipsbank-web:v1.0.0@sha256:852f4882…","sc":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true,"runAsNonRoot":true,"runAsUser":101},"live":true,"ready":true,"limits":{"cpu":"200m","memory":"64Mi"}}}
+$ kubectl exec -n tipsbank-web <pod-web> -- sh -c 'id; head -2 /etc/os-release; ls /bin/sh /sbin/apk'
+uid=101(nginx) gid=101(nginx) groups=101(nginx)
+NAME="Alpine Linux"
+ID=alpine
+/bin/sh
+/sbin/apk
+$ kubectl exec -n tipsbank-contas deploy/api-contas -c app -- sh -c true
+... exec: "sh": executable file not found in $PATH        # API Distroless: sem shell
+```
+
+O `web` (`nginx-unprivileged` sobre Alpine) é **não-root (uid 101), minimal e com root filesystem read-only**, mas **não é Distroless** no sentido estrito: tem `/bin/sh` e `apk`. O critério "100% Distroless" vale para as **3 APIs Python** (`gcr.io/distroless/python3-debian13:nonroot`, sem shell, como mostra o último comando); o `web` é a alternativa didática nonroot/minimal (nota já registrada na 1.2). Os demais critérios valem **integralmente** para ele e foram atendidos: não roda como root (#2), sem `:latest` (pinado por tag + digest), `resources` com limits (#4), liveness e readiness (#3), assinado (B3) e **0 HIGH/CRITICAL** no Trivy (tabela abaixo).
+
+### Além do manual: o que um auditor também pediria
+
+#### B1. Comando #2 só nos namespaces de aplicação
+
+```console
+$ kubectl get pods -A -o json | jq -c '[.items[] | select(.metadata.namespace != "kube-system") | select(...mesmo filtro do #2...) | .metadata.namespace + "/" + .metadata.name]'
+["tipsbank-nfs/nfs-server-0"]
+```
+
+Fora do kube-system, o único root é o servidor NFS, coberto pela PolicyException (B5).
+
+#### B2. initContainers e pin por digest
+
+```console
+$ IMGS=$(kubectl get pods -A -o json | jq -r '[.items[].spec | (.containers + (.initContainers // []))[] | .image] | unique[]')
+total de imagens distintas: 37
+fora do registry confiavel:
+  (nenhuma)
+sem digest (so tag):
+registry.k8s.io/coredns/coredns:v1.14.2
+registry.k8s.io/etcd:3.6.8-0
+registry.k8s.io/kube-apiserver:v1.36.6
+registry.k8s.io/kube-controller-manager:v1.36.6
+registry.k8s.io/kube-proxy:v1.36.6
+registry.k8s.io/kube-scheduler:v1.36.6
+```
+
+As 6 imagens só por tag são as do **kubeadm** (static pods, kube-proxy e CoreDNS: quem escreve o manifest é o `kubeadm`, e o `kubeadm upgrade` reescreve). Compensação: a assinatura oficial delas é verificada no B4. As outras 31 rodam por digest.
+
+#### B3. Cosign com identidade estrita, em tudo que é nosso e está rodando
+
+```console
+$ cosign verify <imagem@digest-em-execucao> --certificate-identity 188764035+jlui70@users.noreply.github.com --certificate-oidc-issuer https://github.com/login/oauth
+OK: ghcr.io/jlui70/tipsbank-api-contas:v1.2.0@sha256:f99c96cedcf83921d77b89419fee5936c6fca6a383897b4361cdc6ac9d01146c
+OK: ghcr.io/jlui70/tipsbank-api-transacoes:v1.2.0@sha256:4e9c9d06fe2db5784ebb22754ad8114f9ef747abb58a861e5d40d4fcf87f1341
+OK: ghcr.io/jlui70/tipsbank-api-transacoes:v2.2.0@sha256:b0d43d2056718a35488c544f7dd96c988a991e4ce8d040ac13f4d1247a36d5ed
+OK: ghcr.io/jlui70/tipsbank-auditoria:v1.0.0@sha256:64768d4d27788fe6e390ffb27e1cca5ae068a79a1779e98eb6702ba1ab2af3b2
+OK: ghcr.io/jlui70/tipsbank-locust:v1.0.0@sha256:c8d86e15ea84482902844a6c247aa11ae5ee93de5755fe84da486f06781d330c
+OK: ghcr.io/jlui70/tipsbank-nfs:v1.0.1@sha256:6db1c58940e4227083c8f6c63fb2d29bdad5fd248eda368ecde76fc5a9cf5aa9
+OK: ghcr.io/jlui70/tipsbank-web:v1.0.0@sha256:852f48826838c0de6a5dd73880ef13c151464f6f26bdc2ae90f5d9423b966ded
+```
+
+#### B4. Imagens do kubeadm: assinatura do projeto Kubernetes
+
+```console
+$ cosign verify registry.k8s.io/<img> --certificate-identity krel-trust@k8s-releng-prod.iam.gserviceaccount.com --certificate-oidc-issuer https://accounts.google.com
+OK: registry.k8s.io/coredns/coredns:v1.14.2
+OK: registry.k8s.io/etcd:3.6.8-0
+OK: registry.k8s.io/kube-apiserver:v1.36.6
+OK: registry.k8s.io/kube-controller-manager:v1.36.6
+OK: registry.k8s.io/kube-proxy:v1.36.6
+OK: registry.k8s.io/kube-scheduler:v1.36.6
+```
+
+#### B5. PolicyExceptions vigentes (toda exceção é nominal e está no Git)
+
+```console
+$ kubectl get policyexception -A
+kyverno/helper-pod-local-path: disallow-root-user[proibir-runasuser-0,exigir-nao-root] mutate-security-context[containers,init-containers]
+kyverno/ingress-nginx-controller: disallow-security-context-optout[proibir-optout,autogen-proibir-optout]
+kyverno/nfs-server: disallow-root-user[proibir-runasuser-0,exigir-nao-root,autogen-proibir-runasuser-0,autogen-exigir-nao-root] disallow-security-context-optout[proibir-optout,autogen-proibir-optout] mutate-security-context[containers,init-containers]
+```
+
+| Exceção | Escopo | Por quê | Onde |
+|---|---|---|---|
+| `helper-pod-local-path` | pods `helper-pod-*` em `local-path-storage` | o helper do provisioner cria/apaga diretórios do PV no host como root | `infra/kyverno/exceptions/` (4.1) |
+| `ingress-nginx-controller` | só o controller em `ingress-nginx`, só a regra de opt-out | o controller reescreve `/etc/nginx/nginx.conf` em runtime a cada mudança de Ingress → root filesystem gravável. Continua uid 101, `allowPrivilegeEscalation: false`, drop ALL + só `NET_BIND_SERVICE` | `infra/kyverno/exceptions/` (4.2) |
+| `nfs-server` | só `nfs-server*` em `tipsbank-nfs` | nfsd de kernel (root + privileged) | chart `templates/nfs/policyexception.yaml` (4.5) |
+
+PolicyException só é aceita no namespace `kyverno` (`features.policyExceptions.namespace`): um time de produto não consegue se autoconceder exceção.
+
+#### Trivy em todas as imagens em execução (HIGH/CRITICAL com correção disponível)
+
+`trivy image -q --severity HIGH,CRITICAL --ignore-unfixed` (Trivy 0.69.3, base de 2026-11-07), nas 37 imagens distintas:
+
+| Imagens próprias | HIGH/CRIT |
+|---|---|
+| `tipsbank-api-contas:v1.2.0` | 2 |
+| `tipsbank-api-transacoes:v1.2.0` | 2 |
+| `tipsbank-api-transacoes:v2.2.0` | 2 |
+| `tipsbank-auditoria:v1.0.0` | 2 |
+| `tipsbank-locust:v1.0.0` | 105 |
+| `tipsbank-nfs:v1.0.1` | 0 |
+| `tipsbank-web:v1.0.0` | 0 |
+
+| Espelho de terceiros (`ghcr.io/jlui70/mirror/…`) | HIGH/CRIT |
+|---|---|
+| `mirror/busybox:1.37` | 0 |
+| `mirror/calico/calico:v3.33.0` | 12 |
+| `mirror/calico/node:v3.33.0` | 19 |
+| `mirror/calico/third-party-cni-plugins:v3.33.0` | 24 |
+| `mirror/grafana/grafana:13.3.0-distroless` | 54 |
+| `mirror/kiwigrid/k8s-sidecar:2.14.3` | 5 |
+| `mirror/kyverno/background-controller:v1.19.2` | 3 |
+| `mirror/kyverno/cleanup-controller:v1.19.2` | 3 |
+| `mirror/kyverno/kyverno:v1.19.2` | 3 |
+| `mirror/kyverno/kyvernopre:v1.19.2` | 3 |
+| `mirror/kyverno/reports-controller:v1.19.2` | 3 |
+| `mirror/postgres:16-alpine` | 26 |
+| `mirror/prometheus-operator/prometheus-config-reloader:v0.94.2` | 1 |
+| `mirror/prometheus-operator/prometheus-operator:v0.94.2` | 1 |
+| `mirror/prometheus/alertmanager:v0.34.2` | 2 |
+| `mirror/prometheus/node-exporter:v1.12.1-distroless` | 16 |
+| `mirror/prometheus/prometheus:v3.16.0-distroless` | 2 |
+| `mirror/rancher/local-path-provisioner:v0.0.37` | 16 |
+
+| Upstream (registry.k8s.io, quay.io/jetstack) | HIGH/CRIT |
+|---|---|
+| `quay.io/jetstack/cert-manager-cainjector:v1.21.3` | 1 |
+| `quay.io/jetstack/cert-manager-controller:v1.21.3` | 2 |
+| `quay.io/jetstack/cert-manager-webhook:v1.21.3` | 1 |
+| `registry.k8s.io/coredns/coredns:v1.14.2` | 64 |
+| `registry.k8s.io/etcd:3.6.8-0` | 131 |
+| `registry.k8s.io/ingress-nginx/controller:v1.15.1` | 133 |
+| `registry.k8s.io/kube-apiserver:v1.36.6` | 8 |
+| `registry.k8s.io/kube-controller-manager:v1.36.6` | 8 |
+| `registry.k8s.io/kube-proxy:v1.36.6` | 9 |
+| `registry.k8s.io/kube-scheduler:v1.36.6` | 8 |
+| `registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.20.0` | 11 |
+| `registry.k8s.io/metrics-server/metrics-server:v0.9.0` | 21 |
+
+Leitura:
+
+- **APIs (2 cada)**: as duas são do `zlib1g` da **base Distroless** (`CVE-2026-76844`, `CVE-2026-85091`; corrigido no Debian em `deb13u1`). A base `gcr.io/distroless/python3-debian13:nonroot` **mais recente ainda traz a versão vulnerável** (conferido hoje): rebuild agora não resolve, e Distroless não tem `apt` para corrigir na nossa camada. Exposição baixa (as APIs não descompactam dados vindos do cliente). Ação: rebuild + assinatura assim que a base for atualizada.
+- **`web` e `nfs`: 0.** Imagens Alpine nossas, atualizadas na 1.2 e na 4.5.
+- **`locust` (105)**: base `locustio/locust` (Debian 12 + ferramentas de build Python). A versão mais nova do Locust também tem 90. É **ferramenta de teste de carga**, sem dado de cliente, isolada por NetPol, UI atrás de Basic Auth. Num banco real ela **não roda em produção**: no `values-dev.yaml` já vem desligada, e em produção o certo é ligar só durante o teste (`--set loadtest.enabled=true`).
+- **Plataforma/upstream** (etcd, ingress-nginx, CoreDNS, Calico, Grafana…): quase tudo é biblioteca padrão do Go compilada nos binários do fornecedor. Não se corrige com rebuild nosso, só com a **versão nova do fornecedor**. Ação: upgrade de patch planejado (kubeadm, ingress-nginx, kps), com nova rodada do espelho (4.3).
+
+### Riscos residuais (aceite formal)
+
+| Risco | Por que fica | Mitigação / próximo passo |
+|---|---|---|
+| 13 pods root (control plane, kube-proxy, calico-node, NFS) | limite técnico (acima) | Audit no kube-system, imagens assinadas/pinadas, exceção nominal no NFS |
+| Imagens do kubeadm só por tag | o kubeadm gera os manifests | assinatura verificada (B4); em EKS some |
+| HIGH/CRIT em imagens de fornecedor e na base Distroless | correção depende do fornecedor | upgrade planejado + Trivy na esteira |
+| `GET /contas` e `GET /eventos` públicos (SPA de demo) | app sem autenticação de usuário (fora do escopo do desafio) | rate limit (2.2), POST bloqueado no Ingress (4.4) |
+| Sem autenticação serviço-a-serviço (só NetworkPolicy) | service mesh é proibido no desafio | NetPol por pod/porta, SA sem token, usuários do banco com menor privilégio (4.4) |
+| Ingress num só node no `/etc/hosts` do lab | lab sem load balancer | em EKS: NLB na frente das réplicas do controller (2.3) |
+| Alerta info `CPUThrottlingHigh` (log-forwarder, node-agent, sidecars do Grafana) | limits pequenos de propósito; uso de CPU baixo, alerta mede **fração de períodos** com throttling | sem impacto nos SLOs (3.6); revisar limits se virar latência |
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| Os 7 comandos colados com a saída esperada | ✅ #1, #3, #4 e #6 limpos; #5 com as 7 policies `Ready=True`; #7 OK nas 3 (e no modo estrito em todas as 7 imagens próprias); #2 só com root **real** de plataforma + NFS, cada um justificado e com controle compensatório |
+| Registro de 3 manifests ruins bloqueados pelo Kyverno | ✅ 3/3 recusados (5 policies diferentes acionadas), nada criado |
+| Nuance do `web` documentada | ✅ nonroot uid 101, minimal, read-only; não Distroless (tem `sh`/`apk`); demais critérios atendidos |
+| Extras | correções de plataforma na fonte, bug dos sidecars do Grafana, pin por digest, Cosign estrito, assinatura do kubeadm, inventário de exceções, Trivy de 37 imagens, riscos residuais |

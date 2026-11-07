@@ -1,0 +1,24 @@
+# 4.6 - manifest RUIM no 3: Deployment SEM labels de dono (app/team/env) e com container
+# privilegiado + escalacao de privilegio.
+# Esperado: bloqueado por require-labels e disallow-security-context-optout (autogen).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ruim-privilegiado
+  namespace: tipsbank-auditoria
+spec:
+  replicas: 1
+  selector: {matchLabels: {x: ruim-privilegiado}}
+  template:
+    metadata:
+      labels: {x: ruim-privilegiado}
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/jlui70/tipsbank-auditoria:v1.0.0@sha256:64768d4d27788fe6e390ffb27e1cca5ae068a79a1779e98eb6702ba1ab2af3b2
+          securityContext:
+            runAsUser: 65532
+            privileged: true
+            allowPrivilegeEscalation: true
+          resources:
+            limits: {cpu: 100m, memory: 64Mi}

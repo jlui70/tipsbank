@@ -49,6 +49,9 @@ prometheusOperator:
   resources:
     requests: {cpu: 50m, memory: 64Mi}
     limits: {cpu: 300m, memory: 256Mi}
+  # 4.6 (compliance #2): o uid ja vem do pod (65534); aqui ele fica DECLARADO no container, que e
+  # o que o auditor confere (container sem runAsUser = "pode ser root", depende da imagem).
+  containerSecurityContext: {runAsUser: 65534, runAsGroup: 65534, runAsNonRoot: true}
   prometheusConfigReloader:
     resources:
       requests: {cpu: 10m, memory: 32Mi}
@@ -77,6 +80,23 @@ prometheus:
     scrapeInterval: 15s
     retention: 3d
     retentionSize: 3GB
+    # 4.6: o operator faz strategic merge destes containers com os que ele gera (casa pelo nome).
+    #  - runAsUser declarado em todos (compliance #2; o pod ja roda como 1000).
+    #  - livenessProbe no config-reloader (compliance #3): /healthz da porta reloader-web.
+    containers:
+      - name: prometheus
+        securityContext: {runAsUser: 1000, runAsGroup: 2000, runAsNonRoot: true}
+      - name: config-reloader
+        securityContext: {runAsUser: 1000, runAsGroup: 2000, runAsNonRoot: true}
+        livenessProbe:
+          httpGet: {path: /healthz, port: reloader-web}
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+    initContainers:
+      - name: init-config-reloader
+        securityContext: {runAsUser: 1000, runAsGroup: 2000, runAsNonRoot: true}
     resources:
       requests: {cpu: 200m, memory: 512Mi}
       limits: {cpu: "1", memory: 1536Mi}
@@ -103,6 +123,23 @@ alertmanager:
     tls:
       - {secretName: alertmanager-tipsbank-tls, hosts: [alertmanager.tipsbank.local]}
   alertmanagerSpec:
+    # 4.6: o operator faz strategic merge destes containers com os que ele gera (casa pelo nome).
+    #  - runAsUser declarado em todos (compliance #2; o pod ja roda como 1000).
+    #  - livenessProbe no config-reloader (compliance #3): /healthz da porta reloader-web.
+    containers:
+      - name: alertmanager
+        securityContext: {runAsUser: 1000, runAsGroup: 2000, runAsNonRoot: true}
+      - name: config-reloader
+        securityContext: {runAsUser: 1000, runAsGroup: 2000, runAsNonRoot: true}
+        livenessProbe:
+          httpGet: {path: /healthz, port: reloader-web}
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+    initContainers:
+      - name: init-config-reloader
+        securityContext: {runAsUser: 1000, runAsGroup: 2000, runAsNonRoot: true}
     resources:
       requests: {cpu: 10m, memory: 32Mi}
       limits: {cpu: 100m, memory: 128Mi}
@@ -128,21 +165,35 @@ grafana:
   resources:
     requests: {cpu: 50m, memory: 128Mi}
     limits: {cpu: 500m, memory: 384Mi}
+  containerSecurityContext: {runAsUser: 472, runAsGroup: 472, runAsNonRoot: true}   # 4.6 (#2)
   sidecar:
     resources:
       requests: {cpu: 10m, memory: 64Mi}
       limits: {cpu: 100m, memory: 128Mi}
+    securityContext: {runAsUser: 472, runAsGroup: 472, runAsNonRoot: true}          # 4.6 (#2)
+    # 4.6 (#3) e BUG corrigido: os 2 sidecars (dashboards e datasources) sobem um health server na
+    # MESMA porta (8080, padrao do k8s-sidecar) dentro do mesmo pod; o 2o falhava com "address
+    # already in use" e ficava sem /healthz. Agora cada um tem a sua porta (HEALTH_PORT abaixo).
+    # A livenessProbe do chart e UMA so para os 2 sidecars (nao da para apontar portas diferentes):
+    # ela e aplicada por container no install.sh (kubectl patch, httpGet /healthz em cada porta).
+    # Tentativa descartada: probe exec com python lendo HEALTH_PORT -> o interpretador leva > 5 s
+    # para subir com limit de 100m de CPU, a probe estoura o timeout e o kubelet mata o sidecar.
     dashboards:
       searchNamespace: ALL      # ConfigMaps com label grafana_dashboard=1 em qualquer namespace
+      env: {HEALTH_PORT: "8080"}
+    datasources:
+      env: {HEALTH_PORT: "8081"}
 
 kube-state-metrics:
   customLabels: {app: kube-state-metrics, team: plataforma, env: producao}
+  containerSecurityContext: {runAsUser: 65534, runAsGroup: 65534, runAsNonRoot: true}   # 4.6 (#2)
   resources:
     requests: {cpu: 10m, memory: 32Mi}
     limits: {cpu: 100m, memory: 128Mi}
 
 prometheus-node-exporter:
   commonLabels: {app: node-exporter, team: plataforma, env: producao}
+  containerSecurityContext: {runAsUser: 65534, runAsGroup: 65534, runAsNonRoot: true}   # 4.6 (#2)
   resources:
     requests: {cpu: 10m, memory: 24Mi}
     limits: {cpu: 200m, memory: 64Mi}

@@ -14,6 +14,10 @@
 # Dono do workload (require-labels, etapa 4.1; kube-system = nivel Audit).
 commonLabels: {app: metrics-server, team: plataforma, env: producao}
 
+# 4.6: imagem pinada por digest (index multi-arch; o chart so tem "tag", que aceita tag@digest).
+image:
+  tag: v0.9.0@sha256:d9862115e7c7881280d3d75ca26bda8ffc0fc213315979575bf23ce9826205c0
+
 apiService:
   create: true
   insecureSkipTLSVerify: false

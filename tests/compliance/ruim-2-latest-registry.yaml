@@ -1,0 +1,21 @@
+# 4.6 - manifest RUIM no 2: Deployment com imagem :latest do Docker Hub (fora do registry confiavel).
+# Esperado: bloqueado por disallow-latest-tag E restrict-image-registries (regras autogen
+# para Deployment: o Deployment nem chega a ser criado).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ruim-latest
+  namespace: tipsbank-transacoes
+  labels: {app: ruim-latest, team: transacoes, env: producao}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: ruim-latest}}
+  template:
+    metadata:
+      labels: {app: ruim-latest, team: transacoes, env: producao}
+    spec:
+      containers:
+        - name: app
+          image: docker.io/library/nginx:latest
+          resources:
+            limits: {cpu: 100m, memory: 64Mi}
