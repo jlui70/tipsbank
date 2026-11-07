@@ -1,0 +1,66 @@
+{{- /* 2.4: canary da v2 (peso + header X-Canary: true) */ -}}
+{{- if .Values.transacoes.canary.enabled }}
+{{- $ns := .Values.namespaces.transacoes -}}
+{{- $t := .Values.transacoes -}}
+{{- $d := .Values.global.dominio -}}
+{{ include "tipsbank.api.service" (dict "root" $ "ns" $ns "nome" "api-transacoes-v2" "componente" "api-transacoes" "job" "api-transacoes"
+     "seletor" (dict "app.kubernetes.io/name" "api-transacoes" "app.kubernetes.io/instance" .Release.Name "version" "v2")
+     "labelsExtras" (dict "version" "v2")) }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-transacoes-v2
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "api-transacoes") | nindent 4 }}
+    {{- include "tipsbank.labelsDono" (dict "root" $ "app" "api-transacoes" "team" "transacoes") | nindent 4 }}
+    role: app
+    version: v2
+spec:
+  replicas: {{ $t.canary.replicas }}
+  revisionHistoryLimit: {{ $t.revisionHistoryLimit }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      {{- toYaml $t.estrategia | nindent 6 }}
+  selector:
+    matchLabels:
+      {{- include "tipsbank.selector" (dict "root" $ "componente" "api-transacoes") | nindent 6 }}
+      version: v2
+  template:
+    {{- include "tipsbank.transacoes.pod" (dict "root" $ "versao" "v2" "img" $t.canary.image) | nindent 4 }}
+{{- range $h := list (dict "sufixo" "" "host" (printf "api.%s" $d) "path" "/transacoes(/|$)(.*)" "tls" "api-tipsbank-tls")
+                     (dict "sufixo" "-spa" "host" (printf "app.%s" $d) "path" "/api/transacoes(/|$)(.*)" "tls" "app-tipsbank-tls") }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-transacoes{{ $h.sufixo }}-canary
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "api-transacoes") | nindent 4 }}
+    version: v2
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: {{ $t.canary.peso | quote }}
+    nginx.ingress.kubernetes.io/canary-by-header: X-Canary
+    nginx.ingress.kubernetes.io/canary-by-header-value: "true"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: {{ $.Values.global.ingressClassName }}
+  tls:
+    - hosts: [{{ $h.host }}]
+      {{- if $.Values.global.tlsSecretPorHost }}
+      secretName: {{ $h.tls }}
+      {{- end }}
+  rules:
+    - host: {{ $h.host }}
+      http:
+        paths:
+          - path: {{ $h.path }}
+            pathType: ImplementationSpecific
+            backend: {service: {name: api-transacoes-v2, port: {number: 8080}}}
+{{- end }}
+{{- end }}

@@ -1,0 +1,27 @@
+{{- /* PV da auditoria: aponta para o NFS interno (Service com IP fixo) ou externo (VM/EFS) */ -}}
+{{- $f := .Values.nfs -}}
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ include "tipsbank.nfs.pvNome" . }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "auditoria") | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  capacity: {storage: {{ .Values.auditoria.armazenamento }}}
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain     # apagar o PVC nao apaga a trilha de auditoria
+  storageClassName: ""
+  mountOptions: [nfsvers=4.2, hard]
+  nfs:
+    {{- if eq $f.modo "interno" }}
+    server: {{ $f.clusterIP }}               # IP, nao DNS: quem monta e o kubelet do node
+    path: /                                  # raiz NFSv4 (fsid=0) = /exports do servidor
+    {{- else }}
+    server: {{ $f.externo.servidor }}
+    path: {{ $f.externo.caminho }}
+    {{- end }}
+  claimRef:
+    namespace: {{ .Values.namespaces.auditoria }}
+    name: auditoria-data

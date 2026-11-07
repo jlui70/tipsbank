@@ -1,0 +1,104 @@
+{{- $ns := .Values.namespaces.monitoring -}}
+{{- $m := .Values.monitoring -}}
+{{- if $m.regrasSlo }}
+# 3.6: 4 alertas de SLO (regras em files/regras-slo.yaml, lidas sem passar pelo template engine:
+# elas usam {{ "{{" }} $labels }} do Prometheus)
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: tipsbank-slo
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "tipsbank-slo") | nindent 4 }}
+spec:
+  {{- .Files.Get "files/regras-slo.yaml" | nindent 2 }}
+{{- end }}
+{{- if $m.dashboard }}
+---
+# 3.5: dashboard das APIs (o sidecar do Grafana carrega ConfigMaps com grafana_dashboard=1)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dashboard-tipsbank-apis
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "dashboard") | nindent 4 }}
+    grafana_dashboard: "1"
+data:
+  {{- range $arquivo, $_ := .Files.Glob "files/dashboards/*.json" }}
+  {{ base $arquivo }}: |-
+    {{- $.Files.Get $arquivo | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- if $m.nodeAgent.enabled }}
+---
+# 3.8: agente de coleta em cada worker (inclusive o de dados, com taint compliance=strict)
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-agent
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "node-agent") | nindent 4 }}
+    {{- include "tipsbank.labelsDono" (dict "root" $ "app" "node-agent" "team" "plataforma") | nindent 4 }}
+spec:
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "tipsbank.selector" (dict "root" $ "componente" "node-agent") | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 1}
+  template:
+    metadata:
+      labels:
+        {{- include "tipsbank.labels" (dict "root" $ "componente" "node-agent") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 5
+      securityContext:
+        {{- include "tipsbank.podSecurityContext" (dict "uid" 65534) | nindent 8 }}
+      {{- if .Values.postgres.nodeDedicado.enabled }}
+      tolerations:
+        - {key: {{ .Values.postgres.nodeDedicado.chave }}, operator: Equal, value: {{ .Values.postgres.nodeDedicado.valor }}, effect: NoSchedule}
+      {{- end }}
+      containers:
+        - name: agent
+          image: {{ include "tipsbank.imagem" (dict "root" $ "img" $m.nodeAgent.image) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              while true; do
+                disco=$(df -P /host | awk 'NR==2 {print $5}')
+                livre=$(df -Ph /host | awk 'NR==2 {print $4}')
+                carga=$(cut -d' ' -f1-3 /proc/loadavg)
+                mem_total=$(awk '/^MemTotal/ {print $2}' /proc/meminfo)
+                mem_disp=$(awk '/^MemAvailable/ {print $2}' /proc/meminfo)
+                mem_uso=$(( (mem_total - mem_disp) * 100 / mem_total ))
+                echo "{\"ts\":\"$(date -u +%FT%TZ)\",\"node\":\"$NODE_NAME\",\"disco_uso\":\"$disco\",\"disco_livre\":\"$livre\",\"load\":\"$carga\",\"mem_uso\":\"${mem_uso}%\"}"
+                touch /tmp/heartbeat
+                sleep 30
+              done
+          env:
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          livenessProbe:
+            exec: {command: [sh, -c, 'test -n "$(find /tmp/heartbeat -mmin -2)"']}
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests: {cpu: 5m, memory: 8Mi}
+            limits: {cpu: 50m, memory: 32Mi}
+          securityContext:
+            {{- include "tipsbank.containerSecurityContext" (dict "uid" 65534) | nindent 12 }}
+          volumeMounts:
+            - {name: host-root, mountPath: /host, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: host-root
+          hostPath: {path: /, type: Directory}
+        - name: tmp
+          emptyDir: {sizeLimit: 1Mi}
+{{- end }}

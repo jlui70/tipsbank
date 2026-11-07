@@ -4793,3 +4793,178 @@ evento na auditoria: ['transferencia b3c196ad-...']    # transacoes -> auditoria
 |---|---|
 | As APIs internas confiam em qualquer chamada que chegue pelo Service (sem autenticação serviço-a-serviço) | Já restrito por NetworkPolicy: só a `api-transacoes` alcança contas e auditoria (2.5). O passo seguinte seria mTLS entre serviços (service mesh, proibido no desafio) ou token na aplicação (exigiria mudar a app) |
 | `GET /eventos` e `GET /contas` continuam públicos (leitura de dados de clientes) | É o comportamento do SPA de demonstração, que não tem sessão/autenticação real; fica registrado |
+
+---
+
+## Etapa 4.5 — Helm Chart umbrella
+
+**Data**: 2026-11-07 · **Chart**: [`helm/tipsbank/`](../helm/tipsbank/) 1.0.0 (app 1.2.0) · **Publicado**: `oci://ghcr.io/jlui70/charts/tipsbank` (digest `sha256:91312e62…`) · **Plataforma**: [`infra/plataforma/instalar.sh`](../infra/plataforma/instalar.sh) · **Imagem nova**: `ghcr.io/jlui70/tipsbank-nfs:v1.0.1` ([`apps/nfs/`](../apps/nfs/))
+
+### Decisões (com o usuário)
+
+| Decisão | Por quê |
+|---|---|
+| Chart = **app + objetos dos operadores** (ClusterPolicy, ServiceMonitor, PrometheusRule, dashboard, Ingress); os **operadores** (Kyverno, kube-prometheus-stack, cert-manager, ingress-nginx, metrics-server, StorageClass) são a plataforma, instalada antes por um script | O Helm não instala um CRD e um objeto dele na mesma release sem hooks (os CRDs do Kyverno vêm como templates: `no matches for kind ClusterPolicy`). E um `helm uninstall tipsbank` **não** desliga o Kyverno nem o monitoring do cluster. Bate com a lista de `templates/` do manual |
+| `templates/nfs/` com **servidor NFS em StatefulSet** dentro do cluster (`nfs.modo: interno`); `externo` (VM da 1.6, EFS) continua disponível | Pedido do manual. A imagem de teste do Kubernetes (`registry.k8s.io/e2e-test-images/volume/nfs:1.4`) **reprovou**: CentOS 7 sem suporte, **81 HIGH/CRITICAL** corrigíveis no Trivy, export `no_root_squash`. Construí a `tipsbank-nfs` (Alpine + nfs-utils, **0 HIGH/CRITICAL**, assinada): só NFSv4/TCP 2049, `all_squash` para o uid 65532, root read-only. O nfsd de kernel exige root + privileged → PolicyException nominal |
+| Teste de cluster limpo **no próprio kubeadm**: app removido e reinstalado via Helm (o banco volta ao seed) | A máquina não comporta um 2º cluster (2 GB livres). A partir daqui o app é gerenciado **só pelo Helm** |
+| Publicação em **OCI no ghcr.io** | Mesmo registry das imagens; `helm install` direto do OCI |
+
+### Estrutura
+
+```text
+helm/tipsbank/
+├── Chart.yaml            version 1.0.0, appVersion 1.2.0
+├── values.yaml           defaults seguros e comentados (nenhuma senha)
+├── values-prod.yaml      producao (HPA, replica do banco, canary 90/10)
+├── values-dev.yaml       1 replica, recursos menores, sem replica/canary/Locust, uninstall limpa tudo
+├── values-eks.yaml       dominio real, certificado padrao, rede da VPC, NFS externo (EFS)
+├── files/                sql/ (init), nginx.conf do web e do porteiro, log-config, dashboard, regras SLO
+└── templates/
+    ├── _helpers.tpl      tipsbank.fullname, .labels, .labelsDono, .imagem (tag+digest), .senha, netpol base
+    ├── _api.tpl          container/Service/HPA/ServiceMonitor/SA/Ingress das APIs (um molde, 3 APIs)
+    ├── namespaces.yaml   6 namespaces (keep em prod; label de opt-out do Generate)
+    ├── contas/ postgres/ transacoes/ auditoria/ web/ nfs/ loadtest/ monitoring/ rbac/ policies/
+    └── NOTES.txt         acesso, senhas, ordem segura de limpeza
+```
+
+Recursos do Day-19 usados: `define`/`include`, `if`, `range`, `toYaml`, `nindent`, `default`, `required`, `with`, `lookup`, `htpasswd`, `.Files.Get`/`.Files.Glob`, `sha256sum` (checksum de ConfigMap → rollout), hooks.
+
+| Ponto de qualidade | Como |
+|---|---|
+| Senhas | **Geradas** na 1ª instalação e **reaproveitadas** nos upgrades (`lookup` do Secret existente); um cache em `.Values.__senhas` garante o mesmo valor em todos os templates (`postgres-credentials` e as `DB_URL` de dois namespaces). `--set` para fixar. Nada no values nem no Git |
+| HPA × `replicas` | Com HPA ligado o Deployment não declara `replicas`: um `helm upgrade` não reseta a escala |
+| Imagens | Sempre `tag@digest`, montadas por um helper |
+| Dados e controles | `helm.sh/resource-policy: keep` em prod: namespaces (PVCs do banco), PVC/PV da auditoria, servidor NFS e ClusterPolicies sobrevivem a um `helm uninstall` |
+| Ordem de CRD | A PolicyException do NFS é hook `pre-install,pre-upgrade` (o Helm cria tipos desconhecidos por último; sem isso o Kyverno recusaria o StatefulSet). Não é Job |
+| Paridade com as etapas | As 7 ClusterPolicies renderizadas foram comparadas com as que estavam em produção: lógica idêntica |
+
+### Critério 1 — `helm lint` passa limpo
+
+```console
+$ helm lint --strict helm/tipsbank -f helm/tipsbank/values-prod.yaml
+==> Linting helm/tipsbank
+1 chart(s) linted, 0 chart(s) failed
+# idem com values-dev.yaml e com values-prod.yaml + values-eks.yaml
+```
+
+### Critério 2 — `helm template` renderiza todos os manifests
+
+```console
+$ helm template tipsbank helm/tipsbank -f helm/tipsbank/values-prod.yaml | ...
+114 objetos: Namespace 6, NetworkPolicy 24, ServiceAccount 8, Secret 5, ConfigMap 9, PV 1, PVC 1,
+  ClusterRole 1, ClusterRoleBinding 2, Role 2, RoleBinding 2, Service 10, DaemonSet 1, Deployment 7,
+  HorizontalPodAutoscaler 4, StatefulSet 3, Ingress 15, PodDisruptionBudget 1, ClusterPolicy 7,
+  PrometheusRule 1, ServiceMonitor 3, PolicyException 1
+# workloads conferidos: labels app/team/env, registry confiavel, tag+digest, runAsUser no container,
+#   liveness e limits em todos (o comando #2 da 4.6 so olha o container)
+$ kubectl apply --dry-run=server -f <render>      # API + webhooks do Kyverno, antes de instalar
+97 objetos ok (+ 2 imutaveis esperados, tratados na migracao: PV auditoria-nfs e selector do node-agent)
+```
+
+### Migração do app (kubectl → Helm)
+
+[`migrar-app-para-helm.sh`](../infra/plataforma/migrar-app-para-helm.sh): **adota** no Helm o que existe fora dos namespaces do app (7 ClusterPolicies, RBAC de cluster, PrometheusRule, dashboard), para as policies **nunca saírem do ar**; recria o node-agent (selector imutável); apaga os namespaces do app e o PV estático da auditoria. A trilha antiga da auditoria segue na VM NFS da 1.6.
+
+Achados da primeira instalação, já corrigidos:
+
+| Achado | Causa | Correção |
+|---|---|---|
+| `conflict with "kubectl-client-side-apply" ... .spec.rules` | o Helm 4 usa **server-side apply**; os objetos adotados tinham campos do kubectl | `--force-conflicts` só nesta migração (num cluster novo não existe o conflito; a instalação final não usou o flag) |
+| `nfs-server-0` em CrashLoop: `2: Unsupported version` | o kernel dos nodes (Ubuntu 24.04) não tem mais NFSv2, e `--no-nfs-version 2` falha | tirado do entrypoint → **v1.0.1** (testado antes com override do comando no StatefulSet) |
+| namespace `tipsbank-auditoria` preso em `Terminating` | o servidor NFS foi apagado antes dos pods clientes; o umount de NFS `hard` sem servidor espera para sempre | `umount -f -l` só do ponto de montagem do pod no w2; no chart, o servidor NFS fica com `keep` em prod e o NOTES traz a ordem segura (auditoria → demais → NFS) |
+| pods da `api-transacoes` levavam 30 s para terminar | no sidecar, `tail` rodava como PID 1 e ignorava o SIGTERM (vinha desde a 1.5) | `trap "exit 0" TERM; tail ... & wait $!` → **~7 s** (5 s de preStop + saída) |
+
+### Critério 3 — instalação num cluster limpo em menos de 10 min
+
+Instalação final **a partir do repositório remoto**, depois de `helm uninstall` e limpeza dos namespaces:
+
+```console
+$ helm install tipsbank oci://ghcr.io/jlui70/charts/tipsbank --version 1.0.0 \
+    -n tipsbank --create-namespace -f helm/tipsbank/values-prod.yaml --wait --timeout 10m
+Pulled: ghcr.io/jlui70/charts/tipsbank:1.0.0
+Digest: sha256:91312e62335a6c25ee985571ed8a810cbc263090aa081550741e80792c95642f
+NAME: tipsbank
+STATUS: deployed
+REVISION: 1
+DURACAO: 44s
+19/19 pods Ready
+```
+
+(A primeira instalação, do diretório local, levou 41 s. As imagens já estavam em cache nos nodes; num cluster sem cache o tempo é dominado pelo download, ~400 MB no total.)
+
+Distribuição: Postgres primary e servidor NFS no node de dados (w3, taint `compliance=strict`), réplica no w1 em `streaming`, APIs espalhadas entre w1/w2. Os usuários `app_contas`, `app_transacoes` e `replicator` foram criados pelo initdb do próprio chart.
+
+Funcionamento ponta a ponta na instalação via Helm:
+
+```console
+transferencia 25.00: {"status":"concluida"}   saldos 10000.00 -> 9975.00 / 500.00 -> 525.00
+evento na auditoria (GET /eventos): ['transferencia']
+$ kubectl -n tipsbank-nfs exec nfs-server-0 -- ls -ln /exports
+-rw-r--r-- 1 65532 65532 324 Nov  7 16:35 eventos-2026-11-07.jsonl      # all_squash funcionando
+canary, 100 req: 90 v1 / 10 v2   (header X-Canary: true -> v2)
+POST /contas/{id}/saldo 403 | POST /transferencias-internas 403 | POST /auditoria/eventos 403 | GET /auditoria/eventos 200
+/contas/admin 401 | locust 401 | 15 Certificates Ready
+4.6: #1 = 0 | #4 = [] | #5 7 cpol Ready | #6 NetPol em todos os ns | #7 OK x3
+     #2/#3: so plataforma (kps, cert-manager-cainjector, kube-proxy, kube-system) e a excecao do NFS
+RBAC: op-contas 4 pods / Forbidden em transacoes | auditor 55 pods / Forbidden no delete
+```
+
+### Critério 4 — `helm upgrade` sem derrubar tráfego
+
+Mudança que reinicia as 3 APIs (`LOG_LEVEL` no ConfigMap → checksum na anotação do pod → rolling update), com sonda HTTPS a cada 0,2 s nas 3 APIs + web:
+
+```console
+$ helm upgrade tipsbank ./helm/tipsbank -n tipsbank -f values-prod.yaml --set contas.config.LOG_LEVEL=WARNING ... --wait
+STATUS: deployed   REVISION: 2   (39 s)
+    143 api/auditoria/health/ready 200
+    143 api/contas/health/ready 200
+    143 api/transacoes/health/ready 200
+    143 web 200                              # 572/572
+```
+
+O Postgres não foi tocado: o StatefulSet não mudou.
+
+### Critério 5 — `helm rollback` também
+
+```console
+$ helm rollback tipsbank 1 -n tipsbank --wait
+Rollback was a success! Happy Helming!      (38 s)
+    138 x 4 = 552/552 respostas 200
+LOG_LEVEL=INFO                               # voltou
+REVISION  STATUS      DESCRIPTION
+1         superseded  Install complete
+2         superseded  Upgrade complete
+3         deployed    Rollback to 1
+```
+
+### Critério 6 — chart publicado num repositório remoto acessível
+
+```console
+$ helm package helm/tipsbank -d dist
+$ helm registry login ghcr.io -u jlui70 && helm push dist/tipsbank-1.0.0.tgz oci://ghcr.io/jlui70/charts   # usuario
+# pacote ghcr "charts/tipsbank" publico
+$ helm pull oci://ghcr.io/jlui70/charts/tipsbank --version 1.0.0      # SEM credencial
+Digest: sha256:91312e62335a6c25ee985571ed8a810cbc263090aa081550741e80792c95642f
+$ sha256sum tipsbank-1.0.0.tgz dist/tipsbank-1.0.0.tgz
+17baae13c7ce87fc4b27dfc84863ac33aae3723328a5fcb1b3c61c3e3fedf05a  (os dois)   # identico ao empacotado
+```
+
+### Observações para as próximas etapas
+
+| Achado | Impacto | Quando |
+|---|---|---|
+| #2/#3 da 4.6 ainda acusam componentes de **plataforma** (kps sem `runAsUser` no container; cainjector, kube-proxy, sidecars do Grafana e config-reloader sem liveness) | Ajustar nos values/patches da plataforma | 4.6 |
+| `k8s/` (manifests kubectl das etapas 1.4–4.4) e `infra/kyverno/policies/` ficam como registro das etapas; a fonte da verdade do app agora é o chart | Não aplicar os dois no mesmo cluster | registrado |
+| `values-eks.yaml` não foi testado nesta etapa | Validar ao recriar o EKS | 4.7, se usado |
+| PV antigo da 3.3 (`pvc-6cce5c49…`, `Released`, w1) | Apagar só com autorização do usuário | — |
+
+### Resultado
+
+| Critério | Status |
+|---|---|
+| `helm lint` passa limpo | ✅ `--strict`, 4 combinações de values |
+| `helm template` renderiza todos os manifests corretamente | ✅ 114 objetos; dry-run no servidor com os webhooks do Kyverno |
+| Instalação num cluster limpo sobe **tudo** em menos de 10 min | ✅ **44 s** a partir do ghcr (41 s do diretório), 19/19 pods Ready, fluxo de negócio ok |
+| `helm upgrade` sem derrubar tráfego | ✅ 572/572 respostas 200 |
+| `helm rollback` também | ✅ 552/552 respostas 200 |
+| Chart publicado num repositório remoto acessível | ✅ `oci://ghcr.io/jlui70/charts/tipsbank:1.0.0`, pull anônimo idêntico |

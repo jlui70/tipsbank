@@ -1,0 +1,69 @@
+{{- /* 4.4: perfis humanos. Autenticacao por certificado X.509 (infra/rbac/gerar-usuario.sh,
+       fora do chart); aqui so a autorizacao. Nunca O=system:masters; revogar = apagar o binding. */ -}}
+{{- if .Values.rbac.enabled }}
+{{- $u := .Values.rbac.usuarios -}}
+{{- $n := .Values.namespaces -}}
+{{- $perfis := list
+    (dict "nome" "operador-contas" "ns" $n.contas "usuario" $u.operadorContas "exec" false)
+    (dict "nome" "operador-transacoes" "ns" $n.transacoes "usuario" $u.operadorTransacoes "exec" true) }}
+{{- range $perfis }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .nome }}
+  namespace: {{ .ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "rbac") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log]
+    verbs: [get, list, watch]
+  {{- if .exec }}
+  # exec le o ambiente do processo: o privilegio mais sensivel do perfil (4.4)
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create, get]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .nome }}
+  namespace: {{ .ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "rbac") | nindent 4 }}
+subjects: [{kind: User, name: {{ .usuario }}, apiGroup: rbac.authorization.k8s.io}]
+roleRef: {kind: Role, name: {{ .nome }}, apiGroup: rbac.authorization.k8s.io}
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: auditor-global
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "rbac") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: auditor-global
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "rbac") | nindent 4 }}
+subjects: [{kind: User, name: {{ $u.auditor }}, apiGroup: rbac.authorization.k8s.io}]
+roleRef: {kind: ClusterRole, name: auditor-global, apiGroup: rbac.authorization.k8s.io}
+---
+# break-glass: cluster-admin por binding (revogavel), poucos titulares
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sre-cluster-admin
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "rbac") | nindent 4 }}
+subjects: [{kind: User, name: {{ $u.sre }}, apiGroup: rbac.authorization.k8s.io}]
+roleRef: {kind: ClusterRole, name: cluster-admin, apiGroup: rbac.authorization.k8s.io}
+{{- end }}

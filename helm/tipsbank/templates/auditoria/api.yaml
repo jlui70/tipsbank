@@ -1,0 +1,81 @@
+{{- $ns := .Values.namespaces.auditoria -}}
+{{- $a := .Values.auditoria -}}
+{{ include "tipsbank.serviceaccount" (dict "root" $ "ns" $ns "nome" "auditoria") }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auditoria-config
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "auditoria") | nindent 4 }}
+data:
+  {{- toYaml $a.config | nindent 2 }}
+---
+# 1.6: volume RWX no NFS (PV em templates/nfs/), varias replicas gravando ao mesmo tempo
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: auditoria-data
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "auditoria") | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep        # a trilha de auditoria nao some num helm uninstall
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: {{ include "tipsbank.nfs.pvNome" . }}
+  resources:
+    requests: {storage: {{ $a.armazenamento }}}
+---
+{{ include "tipsbank.api.service" (dict "root" $ "ns" $ns "nome" "auditoria" "componente" "auditoria" "job" "api-auditoria"
+     "seletor" (dict "app.kubernetes.io/name" "auditoria" "app.kubernetes.io/instance" .Release.Name)) }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auditoria
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "auditoria") | nindent 4 }}
+    {{- include "tipsbank.labelsDono" (dict "root" $ "app" "auditoria" "team" "auditoria") | nindent 4 }}
+    role: app
+spec:
+  {{- if not $a.hpa.enabled }}
+  replicas: {{ $a.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels:
+      {{- include "tipsbank.selector" (dict "root" $ "componente" "auditoria") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tipsbank.labels" (dict "root" $ "componente" "auditoria") | nindent 8 }}
+        role: app
+      annotations:
+        checksum/config: {{ toYaml $a.config | sha256sum | trunc 12 }}
+    spec:
+      serviceAccountName: auditoria
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "tipsbank.podSecurityContext" (dict "uid" .Values.apiPadrao.uid "fsGroup" true) | nindent 8 }}
+      affinity:
+        {{- include "tipsbank.antiAffinity" (dict "componente" "auditoria") | nindent 8 }}
+      containers:
+        {{- $env := list }}
+        {{- range $k, $_ := $a.config }}
+        {{- $env = append $env (dict "name" $k "valueFrom" (dict "configMapKeyRef" (dict "name" "auditoria-config" "key" $k))) }}
+        {{- end }}
+        {{- include "tipsbank.api.container" (dict "root" $ "cfg" $a "img" $a.image "env" $env
+              "volumeMounts" (list (dict "name" "data" "mountPath" "/data"))) | nindent 8 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: auditoria-data}
+---
+{{ include "tipsbank.api.hpa" (dict "root" $ "ns" $ns "nome" "auditoria" "cfg" $a) }}
+---
+{{ include "tipsbank.api.servicemonitor" (dict "root" $ "ns" $ns "nome" "auditoria" "job" "api-auditoria") }}

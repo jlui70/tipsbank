@@ -1,0 +1,33 @@
+{{- /* Excecao formal do servidor NFS (mesmo modelo das excecoes da 4.1/4.2).
+       Hook pre-install/pre-upgrade: o Helm cria tipos desconhecidos (PolicyException) por ultimo;
+       sem o hook, o StatefulSet seria recusado pelo Kyverno antes de a excecao existir.
+       Justificativa: nfsd de kernel exige root + privileged. Dono: auditoria. Revisao: a cada
+       versao da imagem tipsbank-nfs. Alternativa sem excecao: nfs.modo=externo (VM/EFS). */ -}}
+{{- if and (eq .Values.nfs.modo "interno") .Values.policies.enabled }}
+apiVersion: kyverno.io/v2
+kind: PolicyException
+metadata:
+  name: nfs-server
+  namespace: {{ .Values.namespaces.kyverno }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "nfs-server") | nindent 4 }}
+    team: auditoria
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  exceptions:
+    - policyName: disallow-root-user
+      ruleNames: [proibir-runasuser-0, exigir-nao-root, autogen-proibir-runasuser-0, autogen-exigir-nao-root]
+    - policyName: disallow-security-context-optout
+      ruleNames: [proibir-optout, autogen-proibir-optout]
+    - policyName: mutate-security-context
+      ruleNames: [containers, init-containers]
+  match:
+    any:
+      - resources:
+          kinds: [Pod, StatefulSet]
+          namespaces: [{{ .Values.namespaces.nfs }}]
+          names: ["nfs-server*"]
+{{- end }}

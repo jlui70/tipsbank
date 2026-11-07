@@ -1,0 +1,87 @@
+{{- $ns := .Values.namespaces.contas -}}
+{{- $d := .Values.global.dominio -}}
+{{- /* 2.1: rotas da api-contas nos hosts api.<dominio> e app.<dominio> */ -}}
+{{ include "tipsbank.api.ingress" (dict "root" $ "ns" $ns "nome" "api-contas" "servico" "api-contas" "prefixo" "contas") }}
+---
+# 2.2: /contas/admin com Basic Auth (Secret gerado abaixo)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-contas-admin
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "api-contas") | nindent 4 }}
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: contas-admin-basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "TipsBank - area administrativa"
+spec:
+  ingressClassName: {{ .Values.global.ingressClassName }}
+  tls:
+    - hosts: [api.{{ $d }}]
+      {{- if .Values.global.tlsSecretPorHost }}
+      secretName: api-tipsbank-tls
+      {{- end }}
+  rules:
+    - host: api.{{ $d }}
+      http:
+        paths:
+          - path: /contas/admin(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend: {service: {name: api-contas, port: {number: 8080}}}
+{{- /* Complemento 4.4: endpoints INTERNOS (so a api-transacoes chama, pelo Service) negados no
+       Ingress para qualquer origem: credito/debito direto e transferencia interna.
+       Path regex mais longo vence o /contas(/|$)(.*) acima. */}}
+{{- range $h := list (dict "sufixo" "" "host" (printf "api.%s" $d) "base" "/contas" "tls" "api-tipsbank-tls")
+                     (dict "sufixo" "-spa" "host" (printf "app.%s" $d) "base" "/api/contas" "tls" "app-tipsbank-tls") }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-contas{{ $h.sufixo }}-bloqueio-interno
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "api-contas") | nindent 4 }}
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/denylist-source-range: "0.0.0.0/0,::/0"
+spec:
+  ingressClassName: {{ $.Values.global.ingressClassName }}
+  tls:
+    - hosts: [{{ $h.host }}]
+      {{- if $.Values.global.tlsSecretPorHost }}
+      secretName: {{ $h.tls }}
+      {{- end }}
+  rules:
+    - host: {{ $h.host }}
+      http:
+        paths:
+          {{- range list "/contas/[^/]+/saldo" "/transferencias-internas" }}
+          - path: {{ $h.base }}{{ . }}
+            pathType: ImplementationSpecific
+            backend: {service: {name: api-contas, port: {number: 8080}}}
+          {{- end }}
+{{- end }}
+---
+{{- $usuario := .Values.contas.admin.usuario }}
+{{- $senha := include "tipsbank.senha" (dict "root" $ "ns" $ns "secret" "contas-admin-basic-auth" "chave" "senha") }}
+{{- $existente := lookup "v1" "Secret" $ns "contas-admin-basic-auth" }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: contas-admin-basic-auth
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "api-contas") | nindent 4 }}
+type: Opaque
+data:
+  usuario: {{ $usuario | b64enc }}
+  senha: {{ $senha | b64enc }}
+  {{- /* htpasswd gera salt novo a cada render: reaproveita o hash existente se a senha nao mudou */}}
+  {{- if and $existente $existente.data (hasKey $existente.data "auth") }}
+  auth: {{ index $existente.data "auth" }}
+  {{- else }}
+  auth: {{ htpasswd $usuario $senha | b64enc }}
+  {{- end }}

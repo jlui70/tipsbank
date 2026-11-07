@@ -1,0 +1,61 @@
+{{- $ns := .Values.namespaces.contas -}}
+{{- $c := .Values.contas -}}
+{{ include "tipsbank.serviceaccount" (dict "root" $ "ns" $ns "nome" "api-contas") }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: contas-config
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "api-contas") | nindent 4 }}
+data:
+  {{- toYaml $c.config | nindent 2 }}
+---
+{{ include "tipsbank.api.service" (dict "root" $ "ns" $ns "nome" "api-contas" "componente" "api-contas" "job" "api-contas"
+     "seletor" (dict "app.kubernetes.io/name" "api-contas" "app.kubernetes.io/instance" .Release.Name)) }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-contas
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "api-contas") | nindent 4 }}
+    {{- include "tipsbank.labelsDono" (dict "root" $ "app" "api-contas" "team" "contas") | nindent 4 }}
+    role: app
+spec:
+  {{- if not $c.hpa.enabled }}
+  replicas: {{ $c.replicas }}     {{- /* com HPA, o replicas fica com ele (helm upgrade nao reseta a escala) */}}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels:
+      {{- include "tipsbank.selector" (dict "root" $ "componente" "api-contas") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tipsbank.labels" (dict "root" $ "componente" "api-contas") | nindent 8 }}
+        role: app
+      annotations:
+        # ConfigMap mudou -> rollout (a app so le o ambiente no start)
+        checksum/config: {{ toYaml $c.config | sha256sum | trunc 12 }}
+    spec:
+      serviceAccountName: api-contas
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "tipsbank.podSecurityContext" (dict "uid" .Values.apiPadrao.uid "fsGroup" true) | nindent 8 }}
+      affinity:
+        {{- include "tipsbank.antiAffinity" (dict "componente" "api-contas") | nindent 8 }}
+      containers:
+        {{- $env := list (dict "name" "DB_URL" "valueFrom" (dict "secretKeyRef" (dict "name" "contas-db" "key" "DB_URL"))) }}
+        {{- range $k, $_ := $c.config }}
+        {{- $env = append $env (dict "name" $k "valueFrom" (dict "configMapKeyRef" (dict "name" "contas-config" "key" $k))) }}
+        {{- end }}
+        {{- include "tipsbank.api.container" (dict "root" $ "cfg" $c "img" $c.image "env" $env) | nindent 8 }}
+---
+{{ include "tipsbank.api.hpa" (dict "root" $ "ns" $ns "nome" "api-contas" "cfg" $c) }}
+---
+{{ include "tipsbank.api.servicemonitor" (dict "root" $ "ns" $ns "nome" "api-contas" "job" "api-contas") }}

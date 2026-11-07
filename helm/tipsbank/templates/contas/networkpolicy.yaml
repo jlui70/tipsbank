@@ -1,0 +1,77 @@
+{{- $ns := .Values.namespaces.contas -}}
+{{- $n := .Values.namespaces -}}
+{{ include "tipsbank.netpolBase" (dict "root" $ "ns" $ns) }}
+---
+# api-contas recebe: Ingress, api-transacoes (v1/v2), Prometheus (/metrics) e Locust (3.7)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-contas-ingress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "networkpolicy") | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: api-contas}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- include "tipsbank.de" (dict "ns" $n.ingress "app" "ingress-nginx") | nindent 8 }}
+        {{- include "tipsbank.de" (dict "ns" $n.transacoes "app" "api-transacoes") | nindent 8 }}
+        {{- include "tipsbank.de" (dict "ns" $n.monitoring "app" "prometheus") | nindent 8 }}
+        {{- if .Values.loadtest.enabled }}
+        {{- include "tipsbank.de" (dict "ns" $n.loadtest "app" "locust") | nindent 8 }}
+        {{- end }}
+      ports:
+        - {protocol: TCP, port: 8080}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-contas-egress-postgres
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "networkpolicy") | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: api-contas}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector: {matchLabels: {app.kubernetes.io/name: postgres-primary}}
+      ports:
+        - {protocol: TCP, port: 5432}
+---
+# Postgres primary recebe so das 2 APIs e da replica (5432)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-ingress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "networkpolicy") | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: postgres-primary}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app.kubernetes.io/name: api-contas, role: app}}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ $n.transacoes }}}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: api-transacoes, role: app}}
+        - podSelector: {matchLabels: {app.kubernetes.io/name: postgres-replica}}
+      ports:
+        - {protocol: TCP, port: 5432}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-replica-egress-primary
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "networkpolicy") | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: postgres-replica}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector: {matchLabels: {app.kubernetes.io/name: postgres-primary}}
+      ports:
+        - {protocol: TCP, port: 5432}

@@ -1,0 +1,203 @@
+# Valores padrao do chart tipsbank. Defaults SEGUROS: o que vem aqui ja passa nas policies
+# do proprio chart (nao-root, sem :latest, registry confiavel, labels de dono, limits, probes).
+# Ambientes: values-dev.yaml e values-prod.yaml sobrescrevem tags, replicas e recursos.
+#
+# NUNCA coloque senha aqui. As senhas sao GERADAS na 1a instalacao e reaproveitadas nos
+# upgrades (lookup do Secret existente). Para fixar uma, use --set na linha de comando.
+
+global:
+  # vira a label env de todos os workloads (policy require-labels: producao, homologacao ou desenvolvimento)
+  env: producao
+  # hosts publicos: app.<dominio>, api.<dominio>, locust.<dominio>
+  dominio: tipsbank.local
+  ingressClassName: nginx
+  # ClusterIssuer do cert-manager para os certificados dos Ingress ("" = sem anotacao, ex.: EKS
+  # com certificado padrao do controller)
+  clusterIssuer: tipsbank-ca
+  # true: cada host com o seu Secret TLS (cert-manager, 2.2). false: sem secretName, o controller
+  # usa o certificado padrao (--default-ssl-certificate, EKS 2.3)
+  tlsSecretPorHost: true
+  # prefixo das imagens proprias e do espelho de terceiros (4.3)
+  registry: ghcr.io/jlui70
+  imagePullPolicy: IfNotPresent
+
+# Namespaces criados pelo chart. "monitoring" e "kyverno" sao da plataforma: o chart so publica
+# objetos dentro deles (ServiceMonitor, PrometheusRule, dashboard, node-agent, PolicyException).
+namespaces:
+  contas: tipsbank-contas
+  transacoes: tipsbank-transacoes
+  auditoria: tipsbank-auditoria
+  web: tipsbank-web
+  loadtest: tipsbank-loadtest
+  nfs: tipsbank-nfs
+  monitoring: tipsbank-monitoring
+  kyverno: kyverno
+  ingress: ingress-nginx
+  # helm.sh/resource-policy: keep nos Namespaces: um `helm uninstall` NAO apaga os namespaces
+  # (e com eles os PVCs do banco e da auditoria). Em banco, dado nao some por engano.
+  manterNoUninstall: true
+
+# Rede do cluster, usada nas NetworkPolicies que envolvem o control plane e os nodes.
+# Valores do lab kubeadm (192.168.122.0/24, Calico IPIP). No EKS: ver values-eks.yaml.
+rede:
+  # de onde o API server chama webhooks e o proxy (IP do node + tunel IPIP do cp)
+  controlPlane: [192.168.122.10/32, 10.244.194.64/32]
+  # quem monta o NFS e o kubelet de cada node: IPs dos nodes + tuneis IPIP (Calico)
+  nodes: [192.168.122.0/24, 10.244.194.64/32, 10.244.41.64/32, 10.244.63.128/32, 10.244.64.192/32]
+  # destino liberado na saida da api-transacoes (gateway externo :443), menos redes internas e metadata
+  saidaExterna:
+    cidr: 0.0.0.0/0
+    exceto: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16]
+
+# Valores comuns aos containers das APIs (Distroless, uid 65532)
+apiPadrao:
+  uid: 65532
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 256Mi}
+  # 3.1/3.7: probes calibradas no stress test
+  probes:
+    startup: {periodSeconds: 5, failureThreshold: 30}
+    readiness: {periodSeconds: 5, timeoutSeconds: 3}
+    liveness: {periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 6}
+  preStopSegundos: 5          # 3.2: espera sair dos endpoints antes do SIGTERM
+  hpaComportamento:           # 3.7
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - {type: Percent, value: 100, periodSeconds: 15}
+        - {type: Pods, value: 4, periodSeconds: 15}
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
+      policies:
+        - {type: Percent, value: 50, periodSeconds: 60}
+
+contas:
+  image: {repository: tipsbank-api-contas, tag: v1.2.0, digest: "sha256:f99c96cedcf83921d77b89419fee5936c6fca6a383897b4361cdc6ac9d01146c"}
+  replicas: 2                 # usado so com hpa.enabled=false
+  hpa: {enabled: true, minReplicas: 2, maxReplicas: 10, metrica: cpu, alvo: 70}
+  resources: {}               # vazio = apiPadrao.resources
+  config: {LOG_LEVEL: INFO, DB_POOL_SIZE: "3", DB_MAX_OVERFLOW: "2"}
+  # /contas/admin com Basic Auth (2.2). Senha gerada; usuario abaixo.
+  admin: {usuario: admin}
+
+transacoes:
+  image: {repository: tipsbank-api-transacoes, tag: v1.2.0, digest: "sha256:4e9c9d06fe2db5784ebb22754ad8114f9ef747abb58a861e5d40d4fcf87f1341"}
+  replicas: 3
+  hpa: {enabled: true, minReplicas: 3, maxReplicas: 15, metrica: cpu-container, alvo: 70}
+  resources: {}
+  config: {LOG_LEVEL: INFO, DB_POOL_SIZE: "3", DB_MAX_OVERFLOW: "2", APP_VERSION: v1}
+  # 3.2: rollout sem derrubar trafego
+  estrategia: {maxSurge: 1, maxUnavailable: 0}
+  revisionHistoryLimit: 5
+  # 2.2: affinity por cookie
+  cookieAfinidade: TIPSBANK_TX
+  # 1.5: sidecar que le o arquivo de log da app
+  logForwarder:
+    image: {repository: mirror/busybox, tag: "1.37", digest: "sha256:66a6306db78bf2dbf3487f293aa8d6990d8e506fdffab9cc43fe422becf886e4"}
+    resources:
+      requests: {cpu: 10m, memory: 16Mi}
+      limits: {cpu: 50m, memory: 32Mi}
+  # 2.4: canary v2 (90/10 + header X-Canary: true)
+  canary:
+    enabled: true
+    peso: 10
+    replicas: 1
+    image: {repository: tipsbank-api-transacoes, tag: v2.2.0, digest: "sha256:b0d43d2056718a35488c544f7dd96c988a991e4ce8d040ac13f4d1247a36d5ed"}
+
+auditoria:
+  image: {repository: tipsbank-auditoria, tag: v1.0.0, digest: "sha256:64768d4d27788fe6e390ffb27e1cca5ae068a79a1779e98eb6702ba1ab2af3b2"}
+  replicas: 2
+  hpa: {enabled: true, minReplicas: 2, maxReplicas: 6, metrica: memory, alvo: 75}
+  resources: {}
+  config: {DATA_DIR: /data, LOG_LEVEL: INFO}
+  armazenamento: 1Gi
+  # complemento 4.4: /eventos somente leitura pelo Ingress (porteiro libera GET/HEAD)
+  porteiro:
+    replicas: 2
+    resources:
+      requests: {cpu: 10m, memory: 16Mi}
+      limits: {cpu: 100m, memory: 32Mi}
+
+web:
+  image: {repository: tipsbank-web, tag: v1.0.0, digest: "sha256:852f48826838c0de6a5dd73880ef13c151464f6f26bdc2ae90f5d9423b966ded"}
+  uid: 101
+  replicas: 2
+  hpa: {enabled: true, minReplicas: 2, maxReplicas: 6, metrica: cpu, alvo: 70}
+  resources:
+    requests: {cpu: 25m, memory: 32Mi}
+    limits: {cpu: 200m, memory: 64Mi}
+  rateLimitRps: 50            # 2.2
+
+postgres:
+  image: {repository: mirror/postgres, tag: 16-alpine, digest: "sha256:ac838714b7d794185a866e5a6b479b954e7d8a070568aa0acac6fe07c3070bf5"}
+  usuarioAdmin: tipsbank      # superusuario: so DBA, so via kubectl exec (rede rejeitada no pg_hba)
+  banco: tipsbank
+  maxConnections: 150
+  armazenamento: 2Gi
+  storageClassName: ""        # "" = StorageClass default do cluster
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {cpu: "1", memory: 1Gi}
+  # 3.3: primary isolado no node com taint compliance=strict
+  nodeDedicado: {enabled: true, chave: compliance, valor: strict}
+  replica:
+    enabled: true
+  # senhas: vazias = geradas (e reaproveitadas nos upgrades). --set para fixar.
+  senhas: {admin: "", replicacao: "", contas: "", transacoes: ""}
+
+# NFS da auditoria (templates/nfs/).
+#   interno: servidor NFSv4 em StatefulSet no proprio cluster (imagem tipsbank-nfs, root+privileged
+#            por PolicyException nominal), dados num PVC no node dedicado.
+#   externo: so o PV apontando para um servidor existente (VM da 1.6, EFS no EKS).
+nfs:
+  modo: interno
+  image: {repository: tipsbank-nfs, tag: v1.0.1, digest: "sha256:6db1c58940e4227083c8f6c63fb2d29bdad5fd248eda368ecde76fc5a9cf5aa9"}   # v1.0.1: sem NFSv2 (kernel dos nodes nao tem)
+  # IP FIXO do Service: quem monta o NFS e o kubelet do node, que nao usa o DNS do cluster
+  clusterIP: 10.96.20.49
+  armazenamento: 2Gi
+  uidAnonimo: 65532           # all_squash: todo cliente grava como este uid (igual a VM da 1.6)
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {cpu: 500m, memory: 256Mi}
+  externo: {servidor: 192.168.122.13, caminho: /srv/nfs/auditoria}
+
+loadtest:
+  enabled: true
+  image: {repository: tipsbank-locust, tag: v1.0.0, digest: "sha256:c8d86e15ea84482902844a6c247aa11ae5ee93de5755fe84da486f06781d330c"}
+  resources:
+    requests: {cpu: 250m, memory: 256Mi}
+    limits: {cpu: "1", memory: 512Mi}
+  usuario: admin              # Basic Auth da UI (senha gerada)
+
+monitoring:
+  serviceMonitors: true
+  regrasSlo: true
+  dashboard: true
+  nodeAgent:
+    enabled: true
+    image: {repository: mirror/busybox, tag: "1.37", digest: "sha256:66a6306db78bf2dbf3487f293aa8d6990d8e506fdffab9cc43fe422becf886e4"}
+
+# Perfis humanos (4.4). Os certificados sao gerados fora do chart (infra/rbac/gerar-usuario.sh):
+# o chart so cria Roles e bindings para os usuarios (CN do certificado).
+rbac:
+  enabled: true
+  usuarios:
+    operadorContas: operador-contas
+    operadorTransacoes: operador-transacoes
+    auditor: auditor-global
+    sre: sre
+
+# Policies Kyverno (4.1-4.3). Cluster-scoped: uma instalacao do chart por cluster.
+policies:
+  enabled: true
+  failureAction: Enforce
+  # kube-system fica em Audit; kyverno, excluido (4.1)
+  namespacesAudit: [kube-system]
+  namespacesExcluidos: [kyverno]
+  registriesConfiaveis: [ghcr.io/jlui70/, quay.io/jetstack/, registry.k8s.io/, gcr.io/distroless/]
+  envPermitidos: [producao, homologacao, desenvolvimento]
+  # helm uninstall do app NAO desliga a seguranca do cluster
+  manterNoUninstall: true

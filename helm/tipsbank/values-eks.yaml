@@ -1,0 +1,22 @@
+# Diferencas do EKS (2.3), por cima de values-prod.yaml:
+#   helm install tipsbank ... -f values-prod.yaml -f values-eks.yaml
+# Antes eram feitas por sed (infra/eks/ingress-eks.sh); aqui viram values.
+# NAO testado na 4.5 (o teste de cluster limpo foi no kubeadm); revisar ao recriar o EKS.
+global:
+  dominio: tipsbank.devopsproject.com.br
+  clusterIssuer: ""           # um certificado Let's Encrypt so, como default do controller (2.3)
+  tlsSecretPorHost: false
+
+rede:
+  # no EKS o control plane chega pelos ENIs da VPC e os pods usam IPs da VPC (VPC CNI, sem tunel)
+  controlPlane: [192.168.0.0/16]
+  nodes: [192.168.0.0/16]
+
+postgres:
+  nodeDedicado: {enabled: false}   # o nodegroup da 2.3 nao tem o taint compliance=strict
+  storageClassName: gp3
+
+nfs:
+  # sem NFS de kernel nos nodes gerenciados: a auditoria aponta para um EFS (criar antes)
+  modo: externo
+  externo: {servidor: "fs-XXXXXXXX.efs.us-east-1.amazonaws.com", caminho: /}

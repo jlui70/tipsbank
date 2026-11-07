@@ -1,0 +1,26 @@
+{{- /* Namespaces do TipsBank. tipsbank-monitoring e kyverno sao da plataforma (nao criados aqui). */ -}}
+{{- $ns := .Values.namespaces -}}
+{{- $lista := list (dict "nome" $ns.contas "area" "contas") (dict "nome" $ns.transacoes "area" "transacoes")
+                   (dict "nome" $ns.auditoria "area" "auditoria") (dict "nome" $ns.web "area" "web") }}
+{{- if .Values.loadtest.enabled }}
+{{- $lista = append $lista (dict "nome" $ns.loadtest "area" "loadtest") }}
+{{- end }}
+{{- if eq .Values.nfs.modo "interno" }}
+{{- $lista = append $lista (dict "nome" $ns.nfs "area" "nfs") }}
+{{- end }}
+{{- range $lista }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .nome }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "namespace") | nindent 4 }}
+    tipsbank.io/area: {{ .area }}
+    # 4.3: as NetworkPolicies deste namespace vem do chart; o Generate do Kyverno nao gera as dele
+    tipsbank.io/netpol: gerenciada-no-git
+  {{- if $.Values.namespaces.manterNoUninstall }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
+{{- end }}

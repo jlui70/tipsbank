@@ -1,0 +1,22 @@
+apiVersion: v2
+name: tipsbank
+description: >-
+  TipsBank (desafio final DK8s 2025 LinuxTips) - umbrella com app (contas, transacoes,
+  auditoria, web), Postgres primary/replica, NFS da auditoria, Ingress, HPA, NetworkPolicy,
+  RBAC, monitoring (ServiceMonitor, PrometheusRule, dashboard) e policies Kyverno.
+type: application
+version: 1.0.0
+appVersion: "1.2.0"
+kubeVersion: ">=1.33.0-0"
+keywords: [banco, kubernetes, kyverno, compliance]
+home: https://github.com/jlui70/tipsbank
+icon: https://github.com/jlui70.png
+sources: [https://github.com/jlui70/tipsbank]
+maintainers:
+  - name: jlui70
+    url: https://github.com/jlui70
+annotations:
+  # Pre-requisitos (plataforma, instalados por infra/plataforma/instalar.sh):
+  # ingress-nginx, cert-manager (+ ClusterIssuer), kube-prometheus-stack, Kyverno,
+  # metrics-server e StorageClass default.
+  tipsbank.io/pre-requisitos: "ingress-nginx, cert-manager, kube-prometheus-stack, kyverno, metrics-server, storageclass"

@@ -1,0 +1,101 @@
+{{- if .Values.postgres.replica.enabled }}
+{{- $ns := .Values.namespaces.contas -}}
+{{- $pg := .Values.postgres -}}
+{{- $img := include "tipsbank.imagem" (dict "root" $ "img" $pg.image) -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-replica
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "postgres-replica") | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "tipsbank.selector" (dict "root" $ "componente" "postgres-replica") | nindent 4 }}
+  ports:
+    - {name: postgres, port: 5432, targetPort: postgres}
+---
+# 3.3: replica streaming (pg_basebackup -R), nunca no mesmo node do primary
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-replica
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "postgres-replica") | nindent 4 }}
+    {{- include "tipsbank.labelsDono" (dict "root" $ "app" "postgres-replica" "team" "contas") | nindent 4 }}
+    role: db
+spec:
+  serviceName: postgres-replica
+  replicas: 1                  # 1 slot de replicacao no primary (postgres_replica_0)
+  selector:
+    matchLabels:
+      {{- include "tipsbank.selector" (dict "root" $ "componente" "postgres-replica") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tipsbank.labels" (dict "root" $ "componente" "postgres-replica") | nindent 8 }}
+        role: db
+    spec:
+      serviceAccountName: postgres
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "tipsbank.podSecurityContext" (dict "uid" 70 "fsGroup" true) | nindent 8 }}
+      {{- if $pg.nodeDedicado.enabled }}
+      tolerations:
+        - {key: {{ $pg.nodeDedicado.chave }}, operator: Equal, value: {{ $pg.nodeDedicado.valor }}, effect: NoSchedule}
+      {{- end }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector: {matchLabels: {app.kubernetes.io/name: postgres-primary}}
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: basebackup
+          image: {{ $img }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              if [ -s "$PGDATA/PG_VERSION" ]; then
+                echo "PGDATA ja inicializado: pulando o pg_basebackup"; exit 0
+              fi
+              exec pg_basebackup -h postgres-primary-0.postgres-primary.{{ $ns }}.svc.cluster.local \
+                -U replicator -D "$PGDATA" -R -X stream -S postgres_replica_0 -P -v
+          env:
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+            - name: PGPASSWORD
+              valueFrom: {secretKeyRef: {name: postgres-credentials, key: REPLICATION_PASSWORD}}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+          securityContext:
+            {{- include "tipsbank.containerSecurityContext" (dict "uid" 70) | nindent 12 }}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+      containers:
+        - name: postgres
+          image: {{ $img }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          args: ["-c", "max_connections={{ $pg.maxConnections }}"]
+          ports:
+            - {name: postgres, containerPort: 5432}
+          env:
+            {{- include "tipsbank.postgres.envSecret" (dict "nome" "POSTGRES_USER") | nindent 12 }}
+            {{- include "tipsbank.postgres.envSecret" (dict "nome" "POSTGRES_DB") | nindent 12 }}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: run, mountPath: /var/run/postgresql}
+            - {name: tmp, mountPath: /tmp}
+          securityContext:
+            {{- include "tipsbank.containerSecurityContext" (dict "uid" 70) | nindent 12 }}
+          {{- include "tipsbank.postgres.probes" . | nindent 10 }}
+          resources:
+            {{- toYaml $pg.resources | nindent 12 }}
+      volumes:
+        {{- include "tipsbank.postgres.volumesRuntime" . | nindent 8 }}
+  {{- include "tipsbank.postgres.pvc" . | nindent 2 }}
+{{- end }}

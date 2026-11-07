@@ -1,0 +1,100 @@
+{{- /* Complemento 4.4: POST /eventos negado pelo Ingress. O ingress-nginx nao filtra metodo sem
+       server-snippet (CVE-2025-1974), entao /eventos usa auth-url para este porteiro: a imagem
+       tipsbank-web (assinada) com outro nginx.conf; GET/HEAD = 200, resto = 403. Fail-closed. */ -}}
+{{- $ns := .Values.namespaces.auditoria -}}
+{{- $p := .Values.auditoria.porteiro -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auditoria-porteiro-conf
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "auditoria-porteiro") | nindent 4 }}
+data:
+  nginx.conf: |
+    {{- .Files.Get "files/porteiro-nginx.conf" | nindent 4 }}
+---
+{{ include "tipsbank.serviceaccount" (dict "root" $ "ns" $ns "nome" "auditoria-porteiro") }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auditoria-porteiro
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "auditoria-porteiro") | nindent 4 }}
+    {{- include "tipsbank.labelsDono" (dict "root" $ "app" "auditoria-porteiro" "team" "auditoria") | nindent 4 }}
+spec:
+  replicas: {{ $p.replicas }}
+  revisionHistoryLimit: 5
+  strategy:
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels:
+      {{- include "tipsbank.selector" (dict "root" $ "componente" "auditoria-porteiro") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tipsbank.labels" (dict "root" $ "componente" "auditoria-porteiro") | nindent 8 }}
+      annotations:
+        checksum/config: {{ .Files.Get "files/porteiro-nginx.conf" | sha256sum | trunc 12 }}
+    spec:
+      serviceAccountName: auditoria-porteiro
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "tipsbank.podSecurityContext" (dict "uid" .Values.web.uid) | nindent 8 }}
+      affinity:
+        {{- include "tipsbank.antiAffinity" (dict "componente" "auditoria-porteiro") | nindent 8 }}
+      containers:
+        - name: app
+          image: {{ include "tipsbank.imagem" (dict "root" $ "img" .Values.web.image) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - {name: http, containerPort: 8080}
+          volumeMounts:
+            - {name: nginx-conf, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+          securityContext:
+            {{- include "tipsbank.containerSecurityContext" (dict "uid" .Values.web.uid) | nindent 12 }}
+          lifecycle:
+            preStop:
+              sleep: {seconds: {{ .Values.apiPadrao.preStopSegundos }}}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          resources:
+            {{- toYaml $p.resources | nindent 12 }}
+      volumes:
+        - name: nginx-conf
+          configMap: {name: auditoria-porteiro-conf}
+        - name: tmp
+          emptyDir: {sizeLimit: 10Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auditoria-porteiro
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "auditoria-porteiro") | nindent 4 }}
+spec:
+  selector:
+    {{- include "tipsbank.selector" (dict "root" $ "componente" "auditoria-porteiro") | nindent 4 }}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: auditoria-porteiro
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "auditoria-porteiro") | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "tipsbank.selector" (dict "root" $ "componente" "auditoria-porteiro") | nindent 6 }}

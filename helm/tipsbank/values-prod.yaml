@@ -1,0 +1,34 @@
+# Producao: valores do desafio (o que roda hoje no lab kubeadm).
+# helm install tipsbank oci://ghcr.io/jlui70/charts/tipsbank --version 1.0.0 -n tipsbank --create-namespace -f values-prod.yaml
+global:
+  env: producao
+
+contas:
+  image: {tag: v1.2.0, digest: "sha256:f99c96cedcf83921d77b89419fee5936c6fca6a383897b4361cdc6ac9d01146c"}
+  hpa: {enabled: true, minReplicas: 2, maxReplicas: 10}
+
+transacoes:
+  image: {tag: v1.2.0, digest: "sha256:4e9c9d06fe2db5784ebb22754ad8114f9ef747abb58a861e5d40d4fcf87f1341"}
+  hpa: {enabled: true, minReplicas: 3, maxReplicas: 15}
+  canary:
+    enabled: true
+    peso: 10
+    image: {tag: v2.2.0, digest: "sha256:b0d43d2056718a35488c544f7dd96c988a991e4ce8d040ac13f4d1247a36d5ed"}
+
+auditoria:
+  hpa: {enabled: true, minReplicas: 2, maxReplicas: 6}
+
+web:
+  hpa: {enabled: true, minReplicas: 2, maxReplicas: 6}
+
+postgres:
+  replica: {enabled: true}
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {cpu: "1", memory: 1Gi}
+
+namespaces:
+  manterNoUninstall: true
+
+policies:
+  failureAction: Enforce

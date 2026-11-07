@@ -27,8 +27,9 @@ for c in background reports; do
 done
 kubectl -n kyverno rollout status deploy --timeout=180s
 
-# Excecoes ANTES das policies: senao, entre um apply e outro, o helper do
-# local-path e o ingress-nginx ficam bloqueados (PVC e Ingress parados).
+# Excecoes dos componentes de PLATAFORMA (helper do local-path, ingress-nginx).
+# 4.5: as ClusterPolicies sao do chart helm/tipsbank (templates/policies/), que tambem traz a
+# excecao do NFS. infra/kyverno/policies/ fica como registro das etapas 4.1-4.3; para usar o
+# Kyverno SEM o chart: kubectl apply -f "$DIR/policies/" (depois das excecoes).
 kubectl apply -f "$DIR/exceptions/"
-kubectl apply -f "$DIR/policies/"
 kubectl get cpol

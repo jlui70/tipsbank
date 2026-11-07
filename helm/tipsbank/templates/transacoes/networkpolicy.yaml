@@ -1,0 +1,64 @@
+{{- $ns := .Values.namespaces.transacoes -}}
+{{- $n := .Values.namespaces -}}
+{{ include "tipsbank.netpolBase" (dict "root" $ "ns" $ns) }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-transacoes-ingress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "networkpolicy") | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: api-transacoes}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- include "tipsbank.de" (dict "ns" $n.ingress "app" "ingress-nginx") | nindent 8 }}
+        {{- include "tipsbank.de" (dict "ns" $n.monitoring "app" "prometheus") | nindent 8 }}
+        {{- if .Values.loadtest.enabled }}
+        {{- include "tipsbank.de" (dict "ns" $n.loadtest "app" "locust") | nindent 8 }}
+        {{- end }}
+      ports:
+        - {protocol: TCP, port: 8080}
+---
+# transacoes -> api-contas e auditoria (8080) e Postgres primary (5432)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-transacoes-egress-interno
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "networkpolicy") | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: api-transacoes}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        {{- include "tipsbank.de" (dict "ns" $n.contas "app" "api-contas") | nindent 8 }}
+        {{- include "tipsbank.de" (dict "ns" $n.auditoria "app" "auditoria") | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: 8080}
+    - to:
+        {{- include "tipsbank.de" (dict "ns" $n.contas "app" "postgres-primary") | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: 5432}
+---
+# 2.5: saida externa so na 443, nunca para redes internas nem para o metadata (169.254.169.254)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-transacoes-egress-externo
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "networkpolicy") | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: api-transacoes}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: {{ .Values.rede.saidaExterna.cidr }}
+            except: {{ toYaml .Values.rede.saidaExterna.exceto | nindent 14 }}
+      ports:
+        - {protocol: TCP, port: 443}

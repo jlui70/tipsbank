@@ -1,0 +1,14 @@
+{{- /* Scripts do primeiro boot (initdb), em ordem alfabetica:
+       00-replicacao.sh (3.3) -> init.sql (schema + seed) -> roles-app.sh (usuarios por API, 4.4) */ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: {{ .Values.namespaces.contas }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "postgres") | nindent 4 }}
+data:
+  {{- range $arquivo, $_ := .Files.Glob "files/sql/*" }}
+  {{ base $arquivo }}: |
+    {{- $.Files.Get $arquivo | nindent 4 }}
+  {{- end }}

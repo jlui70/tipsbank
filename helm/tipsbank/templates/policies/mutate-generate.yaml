@@ -1,0 +1,80 @@
+{{- /* 4.2 (Mutate) e 4.3 (Generate). As variaveis do Kyverno ({{ "{{" }} ... }}) sao escapadas
+       para o Helm nao interpreta-las. */ -}}
+{{- if .Values.policies.enabled }}
+{{- $excluidos := .Values.policies.namespacesExcluidos -}}
+# 4.2: injeta runAsNonRoot/readOnlyRootFilesystem/allowPrivilegeEscalation=false quando ausentes.
+# So Pod, so CREATE, sem autogen (nao reescreve template de Deployment = sem rollout surpresa).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+{{ include "tipsbank.policy.meta" (dict "root" $ "nome" "mutate-security-context" "titulo" "Injetar securityContext seguro" "extras" (dict "pod-policies.kyverno.io/autogen-controllers" "none")) }}
+spec:
+  rules:
+    {{- range $r := list (dict "regra" "containers" "campo" "containers") (dict "regra" "init-containers" "campo" "initContainers") }}
+    - name: {{ $r.regra }}
+      {{- include "tipsbank.policy.matchPod" (dict "root" $ "operacoes" (list "CREATE")) | nindent 6 }}
+      {{- if eq $r.campo "initContainers" }}
+      preconditions:
+        all:
+          - key: "{{ "{{" }} length(request.object.spec.initContainers || `[]`) }}"
+            operator: GreaterThan
+            value: 0
+      {{- end }}
+      mutate:
+        foreach:
+          - list: request.object.spec.{{ $r.campo }}
+            patchStrategicMerge:
+              spec:
+                {{ $r.campo }}:
+                  - name: "{{ "{{" }} element.name }}"
+                    securityContext:
+                      +(runAsNonRoot): true
+                      +(readOnlyRootFilesystem): true
+                      +(allowPrivilegeEscalation): false
+    {{- end }}
+---
+# 4.3: todo namespace NOVO nasce zero-trust (default-deny + DNS). synchronize: recria se apagarem.
+# Opt-out so pela label tipsbank.io/netpol=gerenciada-no-git (namespaces com NetPol versionada).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+{{ include "tipsbank.policy.meta" (dict "root" $ "nome" "generate-default-deny-netpol" "titulo" "NetworkPolicy default-deny em namespace novo" "assunto" "Namespace, NetworkPolicy") }}
+spec:
+  generateExisting: false
+  rules:
+    {{- range $r := list (dict "regra" "default-deny" "nome" "generated-default-deny") (dict "regra" "allow-dns" "nome" "generated-allow-dns") }}
+    - name: {{ $r.regra }}
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+      exclude:
+        any:
+          - resources:
+              names: {{ concat (list "kube-system" "kube-public" "kube-node-lease" "default") $excluidos | uniq | toJson }}
+          - resources:
+              selector:
+                matchLabels: {tipsbank.io/netpol: gerenciada-no-git}
+      generate:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        name: {{ $r.nome }}
+        namespace: "{{ "{{" }} request.object.metadata.name }}"
+        synchronize: true
+        data:
+          metadata:
+            labels: {app.kubernetes.io/managed-by: kyverno, team: plataforma}
+          spec:
+            podSelector: {}
+            {{- if eq $r.regra "default-deny" }}
+            policyTypes: [Ingress, Egress]
+            {{- else }}
+            policyTypes: [Egress]
+            egress:
+              - to:
+                  - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+                    podSelector: {matchLabels: {k8s-app: kube-dns}}
+                ports:
+                  - {protocol: UDP, port: 53}
+                  - {protocol: TCP, port: 53}
+            {{- end }}
+    {{- end }}
+{{- end }}

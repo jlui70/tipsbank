@@ -1,0 +1,170 @@
+{{- /* NFS da auditoria DENTRO do cluster (modo interno). Servidor NFSv4 de kernel: exige root +
+       privileged (mount do nfsd), o que e uma excecao formal as policies (policyexception.yaml).
+       Controles compensatorios: namespace proprio, so a porta 2049 e so a partir dos nodes
+       (NetPol + /etc/exports), all_squash para o uid 65532, raiz read-only, imagem propria
+       (Alpine, Trivy 0 HIGH/CRITICAL, assinada), node de dados dedicado. */ -}}
+{{- if eq .Values.nfs.modo "interno" }}
+{{- $ns := .Values.namespaces.nfs -}}
+{{- $f := .Values.nfs -}}
+{{- $opcoes := printf "rw,sync,fsid=0,no_subtree_check,all_squash,anonuid=%v,anongid=%v" $f.uidAnonimo $f.uidAnonimo -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nfs-exports
+  namespace: {{ $ns }}
+  {{- if $.Values.namespaces.manterNoUninstall }}
+  annotations:
+    # o servidor NFS fica no uninstall (como os dados): se ele cair antes dos pods clientes, o
+    # umount de NFS "hard" trava e o namespace da auditoria nao termina de apagar (achado na 4.5)
+    helm.sh/resource-policy: keep
+  {{- end }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "nfs-server") | nindent 4 }}
+data:
+  # so os nodes (kubelet) montam; ninguem mais, nem pod
+  exports: |
+    /exports {{ range .Values.rede.nodes }}{{ . }}({{ $opcoes }}) {{ end }}
+---
+{{ include "tipsbank.serviceaccount" (dict "root" $ "ns" $ns "nome" "nfs-server") }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nfs-server
+  namespace: {{ $ns }}
+  {{- if $.Values.namespaces.manterNoUninstall }}
+  annotations:
+    # o servidor NFS fica no uninstall (como os dados): se ele cair antes dos pods clientes, o
+    # umount de NFS "hard" trava e o namespace da auditoria nao termina de apagar (achado na 4.5)
+    helm.sh/resource-policy: keep
+  {{- end }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "nfs-server") | nindent 4 }}
+spec:
+  # IP FIXO: o PV aponta para ele (o kubelet monta pela rede do node, sem DNS do cluster)
+  clusterIP: {{ $f.clusterIP }}
+  selector:
+    {{- include "tipsbank.selector" (dict "root" $ "componente" "nfs-server") | nindent 4 }}
+  ports:
+    - {name: nfs, port: 2049, targetPort: nfs, protocol: TCP}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nfs-server
+  namespace: {{ $ns }}
+  {{- if $.Values.namespaces.manterNoUninstall }}
+  annotations:
+    # o servidor NFS fica no uninstall (como os dados): se ele cair antes dos pods clientes, o
+    # umount de NFS "hard" trava e o namespace da auditoria nao termina de apagar (achado na 4.5)
+    helm.sh/resource-policy: keep
+  {{- end }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "nfs-server") | nindent 4 }}
+    {{- include "tipsbank.labelsDono" (dict "root" $ "app" "nfs-server" "team" "auditoria") | nindent 4 }}
+spec:
+  serviceName: nfs-server
+  replicas: 1                    # um servidor por volume (o NFS de kernel nao e clusterizavel)
+  selector:
+    matchLabels:
+      {{- include "tipsbank.selector" (dict "root" $ "componente" "nfs-server") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tipsbank.labels" (dict "root" $ "componente" "nfs-server") | nindent 8 }}
+      annotations:
+        checksum/exports: {{ printf "%v%s" .Values.rede.nodes $opcoes | sha256sum | trunc 12 }}
+    spec:
+      serviceAccountName: nfs-server
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      {{- if .Values.postgres.nodeDedicado.enabled }}
+      # node de dados (o mesmo do Postgres primary, 3.3)
+      tolerations:
+        - {key: {{ .Values.postgres.nodeDedicado.chave }}, operator: Equal, value: {{ .Values.postgres.nodeDedicado.valor }}, effect: NoSchedule}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: {{ .Values.postgres.nodeDedicado.chave }}, operator: In, values: [{{ .Values.postgres.nodeDedicado.valor }}]}
+      {{- end }}
+      securityContext:
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: nfs
+          image: {{ include "tipsbank.imagem" (dict "root" $ "img" $f.image) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - {name: EXPORT_DIR, value: /exports}
+            - {name: ANON_UID, value: {{ $f.uidAnonimo | quote }}}
+          ports:
+            - {name: nfs, containerPort: 2049, protocol: TCP}
+          securityContext:
+            runAsUser: 0                     # EXCECAO (policyexception.yaml): nfsd de kernel
+            runAsNonRoot: false
+            privileged: true                 # EXCECAO: mount -t nfsd
+            allowPrivilegeEscalation: true   # obrigatorio junto com privileged
+            readOnlyRootFilesystem: true     # /etc/exports vem do ConfigMap; estado em emptyDir
+          readinessProbe:
+            tcpSocket: {port: nfs}
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: {port: nfs}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            {{- toYaml $f.resources | nindent 12 }}
+          volumeMounts:
+            - {name: dados, mountPath: /exports}
+            - {name: exports, mountPath: /etc/exports, subPath: exports, readOnly: true}
+            - {name: estado, mountPath: /var/lib/nfs}
+            - {name: run, mountPath: /run}
+      volumes:
+        - name: exports
+          configMap: {name: nfs-exports}
+        - name: estado
+          emptyDir: {sizeLimit: 10Mi}
+        - name: run
+          emptyDir: {sizeLimit: 10Mi}
+  volumeClaimTemplates:
+    - metadata:
+        name: dados
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.postgres.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests: {storage: {{ $f.armazenamento }}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "networkpolicy") | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]       # o servidor NFS nao fala com ninguem (nem DNS)
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nfs-ingress-nodes
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "networkpolicy") | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: nfs-server}}
+  policyTypes: [Ingress]
+  ingress:
+    # quem monta e o kubelet: chega com o IP do node ou do tunel IPIP dele. Nenhum pod.
+    - from:
+        {{- range .Values.rede.nodes }}
+        - ipBlock: {cidr: {{ . }}}
+        {{- end }}
+      ports:
+        - {protocol: TCP, port: 2049}
+{{- end }}

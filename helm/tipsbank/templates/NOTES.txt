@@ -1,0 +1,30 @@
+TipsBank {{ .Chart.AppVersion }} (chart {{ .Chart.Version }}) instalado na release "{{ .Release.Name }}" - ambiente: {{ .Values.global.env }}
+
+Acesso:
+  SPA ............ https://app.{{ .Values.global.dominio }}/
+  APIs ........... https://api.{{ .Values.global.dominio }}/{contas,transacoes,auditoria}/...
+{{- if .Values.loadtest.enabled }}
+  Locust ......... https://locust.{{ .Values.global.dominio }}/   (Basic Auth)
+{{- end }}
+
+Acompanhar a subida:
+  kubectl get pods -A -l app.kubernetes.io/instance={{ .Release.Name }} --watch
+
+Senhas geradas na instalacao (reaproveitadas nos upgrades; nunca ficam no values.yaml):
+  Basic Auth /contas/admin:
+    kubectl -n {{ .Values.namespaces.contas }} get secret contas-admin-basic-auth -o jsonpath='{.data.senha}' | base64 -d; echo
+{{- if .Values.loadtest.enabled }}
+  Basic Auth Locust:
+    kubectl -n {{ .Values.namespaces.loadtest }} get secret loadtest-basic-auth -o jsonpath='{.data.senha}' | base64 -d; echo
+{{- end }}
+  Superusuario do Postgres (so DBA, so via kubectl exec):
+    kubectl -n {{ .Values.namespaces.contas }} exec -it postgres-primary-0 -- psql -U {{ .Values.postgres.usuarioAdmin }} -d {{ .Values.postgres.banco }}
+
+{{- if .Values.namespaces.manterNoUninstall }}
+
+ATENCAO: helm uninstall mantem os namespaces (e os dados do Postgres e da auditoria), as
+policies Kyverno, o servidor NFS e o PV da auditoria (helm.sh/resource-policy: keep).
+Limpeza total, NESTA ORDEM (o NFS por ultimo: sem servidor, o umount dos pods clientes trava):
+  kubectl delete ns {{ .Values.namespaces.auditoria }} --wait
+  kubectl delete ns {{ .Values.namespaces.contas }} {{ .Values.namespaces.transacoes }} {{ .Values.namespaces.web }}{{ if .Values.loadtest.enabled }} {{ .Values.namespaces.loadtest }}{{ end }}{{ if eq .Values.nfs.modo "interno" }} {{ .Values.namespaces.nfs }}{{ end }}
+{{- end }}

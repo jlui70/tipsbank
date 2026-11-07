@@ -1,0 +1,136 @@
+{{- $ns := .Values.namespaces.web -}}
+{{- $w := .Values.web -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-nginx-conf
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "web") | nindent 4 }}
+data:
+  nginx.conf: |
+    {{- .Files.Get "files/web-nginx.conf" | nindent 4 }}
+---
+{{ include "tipsbank.serviceaccount" (dict "root" $ "ns" $ns "nome" "web") }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "web") | nindent 4 }}
+spec:
+  selector:
+    {{- include "tipsbank.selector" (dict "root" $ "componente" "web") | nindent 4 }}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "web") | nindent 4 }}
+    {{- include "tipsbank.labelsDono" (dict "root" $ "app" "web" "team" "web") | nindent 4 }}
+    role: frontend
+spec:
+  {{- if not $w.hpa.enabled }}
+  replicas: {{ $w.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels:
+      {{- include "tipsbank.selector" (dict "root" $ "componente" "web") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tipsbank.labels" (dict "root" $ "componente" "web") | nindent 8 }}
+        role: frontend
+      annotations:
+        checksum/config: {{ .Files.Get "files/web-nginx.conf" | sha256sum | trunc 12 }}
+    spec:
+      serviceAccountName: web
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "tipsbank.podSecurityContext" (dict "uid" $w.uid) | nindent 8 }}
+      affinity:
+        {{- include "tipsbank.antiAffinity" (dict "componente" "web") | nindent 8 }}
+      containers:
+        - name: app
+          image: {{ include "tipsbank.imagem" (dict "root" $ "img" $w.image) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - {name: http, containerPort: 8080}
+          volumeMounts:
+            - {name: nginx-conf, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+          securityContext:
+            {{- include "tipsbank.containerSecurityContext" (dict "uid" $w.uid) | nindent 12 }}
+          lifecycle:
+            preStop:
+              sleep: {seconds: {{ .Values.apiPadrao.preStopSegundos }}}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          resources:
+            {{- toYaml $w.resources | nindent 12 }}
+      volumes:
+        - name: nginx-conf
+          configMap: {name: web-nginx-conf}
+        - name: tmp
+          emptyDir: {}
+---
+{{ include "tipsbank.api.hpa" (dict "root" $ "ns" $ns "nome" "web" "cfg" $w) }}
+---
+# 2.2: TLS + rate limit (limit-req 429 configurado no controller)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "web") | nindent 4 }}
+  annotations:
+    {{- include "tipsbank.ingressTlsAnotacoes" . | nindent 4 }}
+    nginx.ingress.kubernetes.io/limit-rps: {{ $w.rateLimitRps | quote }}
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "1"
+spec:
+  ingressClassName: {{ .Values.global.ingressClassName }}
+  tls:
+    - hosts: [app.{{ .Values.global.dominio }}]
+      {{- if .Values.global.tlsSecretPorHost }}
+      secretName: app-tipsbank-tls
+      {{- end }}
+  rules:
+    - host: app.{{ .Values.global.dominio }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: {service: {name: web, port: {number: 8080}}}
+---
+{{ include "tipsbank.netpolBase" (dict "root" $ "ns" $ns) }}
+---
+# web so recebe do Ingress Controller (Ingress puro, 2.1) e so sai para o DNS
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-ingress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "networkpolicy") | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: web}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- include "tipsbank.de" (dict "ns" .Values.namespaces.ingress "app" "ingress-nginx") | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: 8080}

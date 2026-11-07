@@ -1,0 +1,82 @@
+{{- $ns := .Values.namespaces.contas -}}
+{{- $pg := .Values.postgres -}}
+{{- $img := include "tipsbank.imagem" (dict "root" $ "img" $pg.image) -}}
+{{ include "tipsbank.serviceaccount" (dict "root" $ "ns" $ns "nome" "postgres") }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-primary
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "postgres-primary") | nindent 4 }}
+spec:
+  clusterIP: None          # headless: postgres-primary-0.postgres-primary...
+  selector:
+    {{- include "tipsbank.selector" (dict "root" $ "componente" "postgres-primary") | nindent 4 }}
+  ports:
+    - {name: postgres, port: 5432, targetPort: postgres}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-primary
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "postgres-primary") | nindent 4 }}
+    {{- include "tipsbank.labelsDono" (dict "root" $ "app" "postgres-primary" "team" "contas") | nindent 4 }}
+    role: db
+spec:
+  serviceName: postgres-primary
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "tipsbank.selector" (dict "root" $ "componente" "postgres-primary") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tipsbank.labels" (dict "root" $ "componente" "postgres-primary") | nindent 8 }}
+        role: db
+    spec:
+      serviceAccountName: postgres
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "tipsbank.podSecurityContext" (dict "uid" 70 "fsGroup" true) | nindent 8 }}
+      {{- if $pg.nodeDedicado.enabled }}
+      # 3.3: so no node de dados (taint + label compliance=strict)
+      tolerations:
+        - {key: {{ $pg.nodeDedicado.chave }}, operator: Equal, value: {{ $pg.nodeDedicado.valor }}, effect: NoSchedule}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: {{ $pg.nodeDedicado.chave }}, operator: In, values: [{{ $pg.nodeDedicado.valor }}]}
+      {{- end }}
+      containers:
+        - name: postgres
+          image: {{ $img }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          args: ["-c", "max_connections={{ $pg.maxConnections }}"]
+          ports:
+            - {name: postgres, containerPort: 5432}
+          env:
+            {{- range list "POSTGRES_USER" "POSTGRES_PASSWORD" "POSTGRES_DB" "REPLICATION_PASSWORD" "CONTAS_DB_PASSWORD" "TRANSACOES_DB_PASSWORD" }}
+            {{- include "tipsbank.postgres.envSecret" (dict "nome" .) | nindent 12 }}
+            {{- end }}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d, readOnly: true}
+            - {name: run, mountPath: /var/run/postgresql}
+            - {name: tmp, mountPath: /tmp}
+          securityContext:
+            {{- include "tipsbank.containerSecurityContext" (dict "uid" 70) | nindent 12 }}
+          {{- include "tipsbank.postgres.probes" . | nindent 10 }}
+          resources:
+            {{- toYaml $pg.resources | nindent 12 }}
+      volumes:
+        - name: init
+          configMap: {name: postgres-init, defaultMode: 0555}
+        {{- include "tipsbank.postgres.volumesRuntime" . | nindent 8 }}
+  {{- include "tipsbank.postgres.pvc" . | nindent 2 }}

@@ -1,0 +1,40 @@
+{{- $ns := .Values.namespaces.auditoria -}}
+{{- $n := .Values.namespaces -}}
+{{ include "tipsbank.netpolBase" (dict "root" $ "ns" $ns) }}
+---
+# auditoria recebe: Ingress (so leitura), api-transacoes (grava eventos) e Prometheus.
+# O mount NFS e feito pelo kubelet (rede do node), nao pelo pod: nao precisa de egress 2049 (2.5).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: auditoria-ingress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "networkpolicy") | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: auditoria}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- include "tipsbank.de" (dict "ns" $n.ingress "app" "ingress-nginx") | nindent 8 }}
+        {{- include "tipsbank.de" (dict "ns" $n.transacoes "app" "api-transacoes") | nindent 8 }}
+        {{- include "tipsbank.de" (dict "ns" $n.monitoring "app" "prometheus") | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: 8080}
+---
+# porteiro: so o ingress-nginx (sub-requisicao auth-url); nao fala com ninguem
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: porteiro-ingress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "networkpolicy") | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: auditoria-porteiro}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- include "tipsbank.de" (dict "ns" $n.ingress "app" "ingress-nginx") | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: 8080}

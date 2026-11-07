@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Gera infra/monitoring/secrets.yaml (Grafana + Basic Auth do Prometheus/Alertmanager e, desde a 3.7, do Locust) a partir do *.example.
+# Gera infra/monitoring/secrets.yaml (Grafana + Basic Auth do Prometheus/Alertmanager) a partir do *.example.
+# (4.5: o Basic Auth do Locust passou para o chart helm/tipsbank, senha gerada no helm install.)
 # secrets.yaml e .senhas ficam no .gitignore. Reaproveita as senhas já geradas; --force gera novas.
 set -euo pipefail
 DIR=$(cd "$(dirname "$0")" && pwd)

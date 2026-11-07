@@ -1,0 +1,61 @@
+{{- $ns := .Values.namespaces.transacoes -}}
+{{- $t := .Values.transacoes -}}
+{{ include "tipsbank.serviceaccount" (dict "root" $ "ns" $ns "nome" "api-transacoes") }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: transacoes-config
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "api-transacoes") | nindent 4 }}
+data:
+  {{- toYaml $t.config | nindent 2 }}
+  CONTAS_URL: http://api-contas.{{ .Values.namespaces.contas }}.svc.cluster.local:8080
+  AUDITORIA_URL: http://auditoria.{{ .Values.namespaces.auditoria }}.svc.cluster.local:8080
+---
+# 1.5: logging da app em JSON no stdout E em arquivo (lido pelo sidecar)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: transacoes-log-config
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "api-transacoes") | nindent 4 }}
+data:
+  log-config.json: |
+    {{- .Files.Get "files/transacoes-log-config.json" | nindent 4 }}
+---
+{{ include "tipsbank.api.service" (dict "root" $ "ns" $ns "nome" "api-transacoes" "componente" "api-transacoes" "job" "api-transacoes"
+     "seletor" (dict "app.kubernetes.io/name" "api-transacoes" "app.kubernetes.io/instance" .Release.Name "version" "v1")) }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-transacoes
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "api-transacoes") | nindent 4 }}
+    {{- include "tipsbank.labelsDono" (dict "root" $ "app" "api-transacoes" "team" "transacoes") | nindent 4 }}
+    role: app
+    version: v1
+spec:
+  {{- if not $t.hpa.enabled }}
+  replicas: {{ $t.replicas }}
+  {{- end }}
+  revisionHistoryLimit: {{ $t.revisionHistoryLimit }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:                       # 3.2: nunca derruba um pod antes do novo ficar Ready
+      {{- toYaml $t.estrategia | nindent 6 }}
+  selector:
+    matchLabels:
+      {{- include "tipsbank.selector" (dict "root" $ "componente" "api-transacoes") | nindent 6 }}
+      version: v1
+  template:
+    {{- include "tipsbank.transacoes.pod" (dict "root" $ "versao" "v1" "img" $t.image) | nindent 4 }}
+---
+{{ include "tipsbank.api.hpa" (dict "root" $ "ns" $ns "nome" "api-transacoes" "cfg" $t) }}
+---
+{{- /* um ServiceMonitor para v1 e v2 (mesmo job); a label version vira label das series */}}
+{{ include "tipsbank.api.servicemonitor" (dict "root" $ "ns" $ns "nome" "api-transacoes" "job" "api-transacoes" "podTargetLabels" (list "version")) }}

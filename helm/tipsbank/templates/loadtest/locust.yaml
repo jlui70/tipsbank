@@ -1,0 +1,150 @@
+{{- /* 3.7: Locust em modo standalone + UI com Basic Auth */ -}}
+{{- if .Values.loadtest.enabled }}
+{{- $ns := .Values.namespaces.loadtest -}}
+{{- $l := .Values.loadtest -}}
+{{- $n := .Values.namespaces -}}
+{{ include "tipsbank.serviceaccount" (dict "root" $ "ns" $ns "nome" "locust") }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: locust
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "locust") | nindent 4 }}
+    {{- include "tipsbank.labelsDono" (dict "root" $ "app" "locust" "team" "plataforma") | nindent 4 }}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "tipsbank.selector" (dict "root" $ "componente" "locust") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tipsbank.labels" (dict "root" $ "componente" "locust") | nindent 8 }}
+    spec:
+      serviceAccountName: locust
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "tipsbank.podSecurityContext" (dict "uid" 1000) | nindent 8 }}
+      containers:
+        - name: locust
+          image: {{ include "tipsbank.imagem" (dict "root" $ "img" $l.image) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            - {name: LOCUST_HOST, value: "http://api-transacoes.{{ $n.transacoes }}:8080"}
+            - {name: CONTAS_URL, value: "http://api-contas.{{ $n.contas }}:8080"}
+          ports:
+            - {name: web, containerPort: 8089}
+          readinessProbe:
+            httpGet: {path: /, port: web}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /, port: web}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            {{- toYaml $l.resources | nindent 12 }}
+          securityContext:
+            {{- include "tipsbank.containerSecurityContext" (dict "uid" 1000) | nindent 12 }}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: locust
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "locust") | nindent 4 }}
+spec:
+  selector:
+    {{- include "tipsbank.selector" (dict "root" $ "componente" "locust") | nindent 4 }}
+  ports:
+    - {name: web, port: 8089, targetPort: web}
+---
+{{- $senha := include "tipsbank.senha" (dict "root" $ "ns" $ns "secret" "loadtest-basic-auth" "chave" "senha") }}
+{{- $existente := lookup "v1" "Secret" $ns "loadtest-basic-auth" }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: loadtest-basic-auth
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "locust") | nindent 4 }}
+type: Opaque
+data:
+  usuario: {{ $l.usuario | b64enc }}
+  senha: {{ $senha | b64enc }}
+  {{- if and $existente $existente.data (hasKey $existente.data "auth") }}
+  auth: {{ index $existente.data "auth" }}
+  {{- else }}
+  auth: {{ htpasswd $l.usuario $senha | b64enc }}
+  {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: locust
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "locust") | nindent 4 }}
+  annotations:
+    {{- include "tipsbank.ingressTlsAnotacoes" . | nindent 4 }}
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: loadtest-basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "TipsBank - teste de carga"
+spec:
+  ingressClassName: {{ .Values.global.ingressClassName }}
+  tls:
+    - hosts: [locust.{{ .Values.global.dominio }}]
+      {{- if .Values.global.tlsSecretPorHost }}
+      secretName: locust-tipsbank-tls
+      {{- end }}
+  rules:
+    - host: locust.{{ .Values.global.dominio }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: {service: {name: locust, port: {number: 8089}}}
+---
+{{ include "tipsbank.netpolBase" (dict "root" $ "ns" $ns) }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: locust-ingress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "networkpolicy") | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: locust}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- include "tipsbank.de" (dict "ns" $n.ingress "app" "ingress-nginx") | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: 8089}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: locust-egress-apis
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "networkpolicy") | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: locust}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        {{- include "tipsbank.de" (dict "ns" $n.transacoes "app" "api-transacoes") | nindent 8 }}
+        {{- include "tipsbank.de" (dict "ns" $n.contas "app" "api-contas") | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: 8080}
+{{- end }}

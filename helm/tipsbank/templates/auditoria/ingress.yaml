@@ -1,0 +1,37 @@
+{{- $ns := .Values.namespaces.auditoria -}}
+{{- $d := .Values.global.dominio -}}
+{{- /* 2.2: hash por X-Cliente. Balanceamento e por Service (upstream): TODOS os Ingress que usam
+       o Service auditoria precisam da mesma anotacao, senao um sobrescreve o outro. */ -}}
+{{- $hash := dict "nginx.ingress.kubernetes.io/upstream-hash-by" "$http_x_cliente" -}}
+{{ include "tipsbank.api.ingress" (dict "root" $ "ns" $ns "nome" "auditoria" "servico" "auditoria" "prefixo" "auditoria" "anotacoes" $hash) }}
+{{- /* Complemento 4.4: /eventos somente leitura (porteiro). Path mais longo vence. */}}
+{{- range $h := list (dict "nome" "auditoria-eventos-leitura" "host" (printf "api.%s" $d) "path" "/auditoria/(eventos.*)" "tls" "api-tipsbank-tls")
+                     (dict "nome" "auditoria-spa-eventos-leitura" "host" (printf "app.%s" $d) "path" "/api/auditoria/(eventos.*)" "tls" "app-tipsbank-tls") }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $h.nome }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tipsbank.labels" (dict "root" $ "componente" "auditoria") | nindent 4 }}
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$1
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$http_x_cliente"
+    nginx.ingress.kubernetes.io/auth-url: "http://auditoria-porteiro.{{ $ns }}.svc.cluster.local:8080/auth"
+spec:
+  ingressClassName: {{ $.Values.global.ingressClassName }}
+  tls:
+    - hosts: [{{ $h.host }}]
+      {{- if $.Values.global.tlsSecretPorHost }}
+      secretName: {{ $h.tls }}
+      {{- end }}
+  rules:
+    - host: {{ $h.host }}
+      http:
+        paths:
+          - path: {{ $h.path }}
+            pathType: ImplementationSpecific
+            backend: {service: {name: auditoria, port: {number: 8080}}}
+{{- end }}

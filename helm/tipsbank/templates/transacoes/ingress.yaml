@@ -1,0 +1,7 @@
+{{- /* 2.1/2.2: rotas da api-transacoes; afinidade por cookie no host api (session-cookie-path) */ -}}
+{{ include "tipsbank.api.ingress" (dict "root" $ "ns" .Values.namespaces.transacoes "nome" "api-transacoes" "servico" "api-transacoes" "prefixo" "transacoes"
+     "anotacoesApi" (dict
+        "nginx.ingress.kubernetes.io/affinity" "cookie"
+        "nginx.ingress.kubernetes.io/session-cookie-name" .Values.transacoes.cookieAfinidade
+        "nginx.ingress.kubernetes.io/session-cookie-max-age" "3600"
+        "nginx.ingress.kubernetes.io/session-cookie-path" "/transacoes")) }}

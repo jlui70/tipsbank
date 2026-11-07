@@ -1,0 +1,161 @@
+{{- /* 4.1-4.3: policies Validate (CEL). Mesmas regras de infra/kyverno/policies/, parametrizadas. */ -}}
+{{- if .Values.policies.enabled }}
+{{- $p := .Values.policies -}}
+# 4.1: nenhum container como root (uid 0 explicito ou sem garantia de nao-root)
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+{{ include "tipsbank.policy.meta" (dict "root" $ "nome" "disallow-root-user" "titulo" "Proibir execucao como root") }}
+spec:
+  background: true
+  rules:
+    - name: proibir-runasuser-0
+      {{- include "tipsbank.policy.matchPod" (dict "root" $) | nindent 6 }}
+      validate:
+        {{- include "tipsbank.policy.acao" $ | nindent 8 }}
+        cel:
+          variables:
+            {{- include "tipsbank.policy.celContainers" . | nindent 12 }}
+            - name: podUid
+              expression: object.spec.?securityContext.?runAsUser
+          expressions:
+            - expression: >-
+                variables.containers.all(c,
+                  c.?securityContext.?runAsUser.orValue(variables.podUid.orValue(1)) != 0)
+              messageExpression: >-
+                'runAsUser: 0 proibido (TipsBank compliance). Containers: '
+                + variables.containers.filter(c,
+                    c.?securityContext.?runAsUser.orValue(variables.podUid.orValue(1)) == 0)
+                  .map(c, c.name).join(', ')
+    - name: exigir-nao-root
+      {{- include "tipsbank.policy.matchPod" (dict "root" $) | nindent 6 }}
+      validate:
+        {{- include "tipsbank.policy.acao" $ | nindent 8 }}
+        cel:
+          variables:
+            {{- include "tipsbank.policy.celContainers" . | nindent 12 }}
+            - name: podUid
+              expression: object.spec.?securityContext.?runAsUser
+            - name: podNonRoot
+              expression: object.spec.?securityContext.?runAsNonRoot.orValue(false)
+            - name: semGarantia
+              expression: >-
+                variables.containers.filter(c,
+                  !(c.?securityContext.?runAsUser.orValue(variables.podUid.orValue(0)) > 0
+                    || c.?securityContext.?runAsNonRoot.orValue(variables.podNonRoot)))
+                .map(c, c.name)
+          expressions:
+            - expression: size(variables.semGarantia) == 0
+              messageExpression: >-
+                'Container sem garantia de nao-root: defina securityContext.runAsUser > 0
+                ou runAsNonRoot: true (TipsBank compliance). Containers: '
+                + variables.semGarantia.join(', ')
+---
+# 4.1: imagem com tag ou digest, nunca :latest
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+{{ include "tipsbank.policy.meta" (dict "root" $ "nome" "disallow-latest-tag" "titulo" "Proibir tag latest") }}
+spec:
+  background: true
+  rules:
+    - name: exigir-tag-sem-latest
+      {{- include "tipsbank.policy.matchPod" (dict "root" $) | nindent 6 }}
+      validate:
+        {{- include "tipsbank.policy.acao" $ | nindent 8 }}
+        cel:
+          variables:
+            {{- include "tipsbank.policy.celContainers" . | nindent 12 }}
+            - name: ruins
+              expression: >-
+                variables.containers.filter(c,
+                  !(c.image.matches('^[^@]+@sha256:[a-f0-9]{64}$')
+                    || c.image.matches('^[^@]*:[^/@:]+(@sha256:[a-f0-9]{64})?$'))
+                  || c.image.matches(':latest(@sha256:[a-f0-9]{64})?$'))
+                .map(c, c.name + '=' + c.image)
+          expressions:
+            - expression: size(variables.ruins) == 0
+              messageExpression: >-
+                'Imagem sem tag ou com :latest e proibida (TipsBank compliance): '
+                + variables.ruins.join(', ')
+---
+# 4.1: todo workload com dono (app, team, env)
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+{{ include "tipsbank.policy.meta" (dict "root" $ "nome" "require-labels" "titulo" "Exigir labels app, team e env" "severidade" "medium" "assunto" "Deployment, StatefulSet, DaemonSet") }}
+spec:
+  background: true
+  rules:
+    - name: exigir-app-team-env
+      {{- include "tipsbank.policy.matchPod" (dict "root" $ "kinds" (list "Deployment" "StatefulSet" "DaemonSet")) | nindent 6 }}
+      validate:
+        {{- include "tipsbank.policy.acao" $ | nindent 8 }}
+        cel:
+          variables:
+            - name: labels
+              expression: object.metadata.?labels.orValue({})
+            - name: faltando
+              expression: >-
+                ['app', 'team', 'env'].filter(k, !(k in variables.labels) || variables.labels[k] == '')
+          expressions:
+            - expression: size(variables.faltando) == 0
+              messageExpression: >-
+                'Labels obrigatorias ausentes (TipsBank compliance): ' + variables.faltando.join(', ')
+            - expression: >-
+                !('env' in variables.labels) || variables.labels['env'] in {{ $p.envPermitidos | toJson | replace "\"" "'" }}
+              message: "env deve ser um de: {{ join ", " $p.envPermitidos }}"
+---
+# 4.2: proibe desligar o securityContext seguro (o mutate so preenche o que falta)
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+{{ include "tipsbank.policy.meta" (dict "root" $ "nome" "disallow-security-context-optout" "titulo" "Proibir desligar o securityContext seguro") }}
+spec:
+  background: true
+  rules:
+    - name: proibir-optout
+      {{- include "tipsbank.policy.matchPod" (dict "root" $) | nindent 6 }}
+      validate:
+        {{- include "tipsbank.policy.acao" $ | nindent 8 }}
+        cel:
+          variables:
+            {{- include "tipsbank.policy.celContainers" . | nindent 12 }}
+            - name: ruins
+              expression: >-
+                variables.containers.filter(c,
+                  c.?securityContext.?readOnlyRootFilesystem.orValue(true) == false
+                  || c.?securityContext.?allowPrivilegeEscalation.orValue(false) == true
+                  || c.?securityContext.?runAsNonRoot.orValue(true) == false
+                  || c.?securityContext.?privileged.orValue(false) == true)
+                .map(c, c.name)
+          expressions:
+            - expression: size(variables.ruins) == 0
+              messageExpression: >-
+                'Opt-out do securityContext seguro exige PolicyException (TipsBank compliance):
+                readOnlyRootFilesystem false, allowPrivilegeEscalation true, runAsNonRoot false
+                ou privileged true em: ' + variables.ruins.join(', ')
+---
+# 4.3: so registries confiaveis (allowlist do auditor)
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+{{ include "tipsbank.policy.meta" (dict "root" $ "nome" "restrict-image-registries" "titulo" "Restringir registries de imagem") }}
+spec:
+  background: true
+  rules:
+    - name: registries-confiaveis
+      {{- include "tipsbank.policy.matchPod" (dict "root" $) | nindent 6 }}
+      validate:
+        {{- include "tipsbank.policy.acao" $ | nindent 8 }}
+        cel:
+          variables:
+            - name: confiaveis
+              expression: {{ $p.registriesConfiaveis | toJson | replace "\"" "'" | quote }}
+            {{- include "tipsbank.policy.celContainers" . | nindent 12 }}
+            - name: fora
+              expression: >-
+                variables.containers.filter(c,
+                  !variables.confiaveis.exists(r, c.image.startsWith(r)))
+                .map(c, c.name + '=' + c.image)
+          expressions:
+            - expression: size(variables.fora) == 0
+              messageExpression: >-
+                'Registry nao confiavel (TipsBank compliance; permitidos: {{ join ", " $p.registriesConfiaveis }}): '
+                + variables.fora.join(', ')
+{{- end }}

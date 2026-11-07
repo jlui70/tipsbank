@@ -1,0 +1,44 @@
+# Desenvolvimento: menos replicas e recursos, sem replica do banco, sem canary.
+# helm install tipsbank oci://ghcr.io/jlui70/charts/tipsbank --version 1.0.0 -n tipsbank --create-namespace -f values-dev.yaml
+global:
+  env: desenvolvimento
+
+apiPadrao:
+  resources:
+    requests: {cpu: 50m, memory: 96Mi}
+    limits: {cpu: 300m, memory: 192Mi}
+
+contas:
+  hpa: {enabled: false}
+  replicas: 1
+
+transacoes:
+  hpa: {enabled: false}
+  replicas: 1
+  canary: {enabled: false}
+
+auditoria:
+  hpa: {enabled: false}
+  replicas: 1
+  porteiro: {replicas: 1}
+
+web:
+  hpa: {enabled: false}
+  replicas: 1
+
+postgres:
+  replica: {enabled: false}
+  nodeDedicado: {enabled: false}      # dev nao tem node de dados separado
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+
+loadtest:
+  enabled: false
+
+namespaces:
+  # dev: helm uninstall limpa tudo (inclusive dados)
+  manterNoUninstall: false
+
+policies:
+  manterNoUninstall: false
